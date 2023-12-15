@@ -1,8 +1,8 @@
-Install Required Packages:
+#Install Required Packages:
 Ensure you have the necessary Python packages installed. You can install them using the following command:
 pip install lightkurve numpy
 
-Data Download:
+#Data Download:
 Go to MAST.
 Navigate to MAST catalogs -> TESS CTL v8.01 -> Advanced Search.
 Refine your search based on criteria like temperature and distance.
@@ -12,7 +12,7 @@ Run the code to download the TESS target pixel file.
 
 
 
-Downloader Helper:
+#Downloader Helper:
 The downloader helper script allows you to fetch additional data from MAST for a specific product group ID. To use this helper:
 
 Update the product_group_id variable with the desired product group ID.
