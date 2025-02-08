@@ -1,0 +1,4 @@
+lightkurve
+numpy
+matplotlib
+streamlit
