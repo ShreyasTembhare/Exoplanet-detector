@@ -20,16 +20,20 @@ class ExportManager:
             filename = f"{target_name}_{timestamp}"
             
             if format == 'csv':
-                return self._export_csv(results, filename)
+                export_path = self._export_csv(results, filename)
             elif format == 'json':
-                return self._export_json(results, filename)
+                export_path = self._export_json(results, filename)
             elif format == 'pdf':
-                return self._export_pdf(results, filename)
+                export_path = self._export_pdf(results, filename)
             elif format == 'png':
-                return self._export_png(results, filename)
+                export_path = self._export_png(results, filename)
             else:
                 self.logger.error(f"Unsupported export format: {format}")
                 return None
+                
+            self.logger.info(f"Export completed successfully")
+            self.logger.info(f"Exported to: {export_path}")
+            return export_path
                 
         except Exception as e:
             self.logger.error(f"Failed to export results: {e}")
