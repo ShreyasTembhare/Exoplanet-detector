@@ -115,6 +115,7 @@ class ExoplanetDatabase:
                 
                 conn.commit()
                 logging.info("Database initialized successfully")
+                logging.info(f"Database file: {self.db_path}")
                 
         except Exception as e:
             logging.error(f"Database initialization failed: {e}")
