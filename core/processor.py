@@ -170,7 +170,7 @@ class ResilientProcessor:
             else:
                 raise Exception("No data found for target")
         except Exception as e:
-            self.logger.error(f"Data acquisition failed for {target_name}: {e}")
+            self.logger.error(f"Data acquisition failed for target {target_name}: {e}")
             raise
     
     def _clean_lightcurve(self, lc):
