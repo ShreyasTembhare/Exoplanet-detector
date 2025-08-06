@@ -28,6 +28,8 @@ class DataQualityAssessor:
             # Overall score
             quality_scores['overall_score'] = self._calculate_overall_score(quality_scores)
             
+            self.logger.info("Quality assessment completed")
+            self.logger.info(f"Overall quality score: {quality_scores['overall_score']:.3f}")
             return quality_scores
             
         except Exception as e:
