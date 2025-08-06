@@ -7,21 +7,12 @@ import pandas as pd
 from shortlist import get_shortlist, get_shortlist_stats
 from analysis_pipeline import AnalysisPipeline
 
-def test_shortlist():
-    """Test the shortlist functionality."""
-    print("Testing Star Shortlist Module...")
-    
-    # Get shortlist
+def test_shortlist_creation():
+    """Test that shortlist creation works correctly."""
     df = get_shortlist(force_refresh=True)
-    print(f"Generated shortlist with {len(df)} stars")
-    
-    if not df.empty:
-        print("\nFirst 5 stars:")
-        print(df.head())
-    
-    # Get statistics
-    stats = get_shortlist_stats()
-    print(f"\nShortlist statistics: {stats}")
+    assert isinstance(df, pd.DataFrame)
+    assert len(df) > 0
+    print(f"✓ Shortlist creation test passed - {len(df)} stars found")
 
 def test_analysis_pipeline():
     """Test the analysis pipeline."""
@@ -55,7 +46,7 @@ def test_analysis_pipeline():
 if __name__ == "__main__":
     print("=== Star Shortlist & Analysis Test ===\n")
     
-    test_shortlist()
+    test_shortlist_creation()
     test_analysis_pipeline()
     
     print("\n=== Test Complete ===")
