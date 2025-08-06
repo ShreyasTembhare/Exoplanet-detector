@@ -136,7 +136,8 @@ class MLModelManager:
             if model_path.exists() and scaler_path.exists():
                 self.models[model_name] = joblib.load(model_path)
                 self.scalers[model_name] = joblib.load(scaler_path)
-                self.logger.info(f"Model {model_name} loaded successfully")
+                self.logger.info("ML model loaded successfully")
+                self.logger.info(f"Model confidence threshold: {self.confidence_threshold}")
                 return True
             else:
                 self.logger.warning(f"Model {model_name} not found")
