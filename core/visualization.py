@@ -26,6 +26,26 @@ class VisualizationManager:
             self.logger.error(f"Failed to create {plot_type} plot: {e}")
             return None
     
+    def create_multiple_plots(self, results, plot_types=None):
+        """Create multiple plots for comprehensive visualization."""
+        try:
+            if plot_types is None:
+                plot_types = ['transit', 'periodogram', 'phase_fold']
+            
+            plots = {}
+            for plot_type in plot_types:
+                plot = self.create_publication_ready_plot(results, plot_type)
+                if plot is not None:
+                    plots[plot_type] = plot
+            
+            self.logger.info("Plot generation completed")
+            self.logger.info(f"Generated {len(plots)} plots")
+            return plots
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create multiple plots: {e}")
+            return {}
+    
     def _create_transit_plot(self, results):
         """Create transit light curve plot."""
         try:
