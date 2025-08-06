@@ -248,4 +248,4 @@ if __name__ == "__main__":
     print(f"Shortlist statistics: {stats}")
     
     validation = validate_star_data(df)
-    print(f"Data validation: {validation}") 
+    print(f"Data validation results: {validation}") 
