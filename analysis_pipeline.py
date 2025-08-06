@@ -311,4 +311,5 @@ if __name__ == "__main__":
     print(f"Found {len(candidates)} candidates")
     
     stats = pipeline.get_candidate_stats()
-    print(f"Candidate statistics: {stats}") 
+    print(f"Candidate statistics: {stats}")
+    print(f"Analysis pipeline completed successfully!") 
