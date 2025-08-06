@@ -232,7 +232,7 @@ def validate_config():
     if PROCESSING_CONFIG['timeout'] <= 0:
         errors.append("timeout must be positive")
     
-    # Validate quality thresholds
+    # Validate quality thresholds (all should be between 0 and 1)
     for key, value in QUALITY_THRESHOLDS.items():
         if not 0 <= value <= 1:
             errors.append(f"{key} must be between 0 and 1")
