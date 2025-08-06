@@ -12,6 +12,8 @@ class CacheManager:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
         self.logger = logging.getLogger(__name__)
+        self.logger.info("Cache system initialized")
+        self.logger.info(f"Cache directory: {self.cache_dir}")
         self.cache_expiry_hours = 24
     
     def _get_cache_key(self, *args, **kwargs):
