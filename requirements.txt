@@ -1,4 +1,28 @@
-lightkurve
-numpy
-matplotlib
-streamlit
+# Core dependencies for exoplanet detection pipeline
+lightkurve>=2.0.0
+astropy>=5.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+
+# Visualization (optional)
+matplotlib>=3.5.0
+plotly>=5.0.0
+seaborn>=0.11.0
+
+# Scientific computing
+scikit-learn>=1.0.0
+joblib>=1.1.0
+
+# Transit modeling (optional)
+batman-package>=2.4.0
+
+# Astronomical databases (optional)
+astroquery>=0.4.0
+
+# Web interface (for app.py)
+streamlit>=1.28.0
+requests>=2.25.0
+
+# Additional utilities
+tqdm>=4.64.0
