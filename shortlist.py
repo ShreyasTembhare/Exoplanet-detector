@@ -80,6 +80,47 @@ def query_tess_catalog(max_stars=1000):
         # Return empty DataFrame with correct columns
         return pd.DataFrame(columns=['ID', 'Tmag', 'Teff', 'Radius', 'CDPP4_0'])
 
+def filter_stars_by_criteria(df, tmag_max=12, teff_min=3000, teff_max=6500, radius_max=1.5):
+    """
+    Filter stars by specific criteria for exoplanet detection.
+    
+    Args:
+        df (pandas.DataFrame): Input DataFrame with star data
+        tmag_max (float): Maximum T magnitude (brightness)
+        teff_min (float): Minimum effective temperature (K)
+        teff_max (float): Maximum effective temperature (K)
+        radius_max (float): Maximum stellar radius (solar radii)
+        
+    Returns:
+        pandas.DataFrame: Filtered DataFrame
+    """
+    if df.empty:
+        logger.warning("Input DataFrame is empty")
+        return df
+    
+    # Apply filters
+    filtered_df = df.copy()
+    
+    # Filter by T magnitude (brighter stars)
+    if 'Tmag' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Tmag'] <= tmag_max]
+        logger.info(f"Filtered by Tmag <= {tmag_max}: {len(filtered_df)} stars remaining")
+    
+    # Filter by effective temperature
+    if 'Teff' in filtered_df.columns:
+        filtered_df = filtered_df[
+            (filtered_df['Teff'] >= teff_min) & 
+            (filtered_df['Teff'] <= teff_max)
+        ]
+        logger.info(f"Filtered by Teff {teff_min}-{teff_max}K: {len(filtered_df)} stars remaining")
+    
+    # Filter by stellar radius
+    if 'Radius' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Radius'] <= radius_max]
+        logger.info(f"Filtered by Radius <= {radius_max}R☉: {len(filtered_df)} stars remaining")
+    
+    return filtered_df
+
 def get_shortlist(force_refresh=False):
     """
     Get the star shortlist DataFrame.
@@ -106,6 +147,9 @@ def get_shortlist(force_refresh=False):
     # Generate new shortlist
     logger.info("Generating new star shortlist...")
     df = query_tess_catalog()
+    
+    # Apply additional filtering
+    df = filter_stars_by_criteria(df)
     
     if not df.empty:
         # Save to CSV
@@ -134,7 +178,11 @@ def get_shortlist_stats():
             'avg_tmag': 0,
             'avg_teff': 0,
             'avg_radius': 0,
-            'avg_cdpp': 0
+            'avg_cdpp': 0,
+            'min_tmag': 0,
+            'max_tmag': 0,
+            'min_teff': 0,
+            'max_teff': 0
         }
     
     stats = {
@@ -142,10 +190,52 @@ def get_shortlist_stats():
         'avg_tmag': df['Tmag'].mean() if 'Tmag' in df.columns else 0,
         'avg_teff': df['Teff'].mean() if 'Teff' in df.columns else 0,
         'avg_radius': df['Radius'].mean() if 'Radius' in df.columns else 0,
-        'avg_cdpp': df['CDPP4_0'].mean() if 'CDPP4_0' in df.columns else 0
+        'avg_cdpp': df['CDPP4_0'].mean() if 'CDPP4_0' in df.columns else 0,
+        'min_tmag': df['Tmag'].min() if 'Tmag' in df.columns else 0,
+        'max_tmag': df['Tmag'].max() if 'Tmag' in df.columns else 0,
+        'min_teff': df['Teff'].min() if 'Teff' in df.columns else 0,
+        'max_teff': df['Teff'].max() if 'Teff' in df.columns else 0
     }
     
     return stats
+
+def validate_star_data(df):
+    """
+    Validate star data for quality and completeness.
+    
+    Args:
+        df (pandas.DataFrame): Star data to validate
+        
+    Returns:
+        dict: Validation results
+    """
+    validation = {
+        'total_stars': len(df),
+        'missing_tmag': 0,
+        'missing_teff': 0,
+        'missing_radius': 0,
+        'invalid_tmag': 0,
+        'invalid_teff': 0,
+        'invalid_radius': 0
+    }
+    
+    if df.empty:
+        return validation
+    
+    # Check for missing values
+    if 'Tmag' in df.columns:
+        validation['missing_tmag'] = df['Tmag'].isna().sum()
+        validation['invalid_tmag'] = len(df[(df['Tmag'] < 0) | (df['Tmag'] > 20)])
+    
+    if 'Teff' in df.columns:
+        validation['missing_teff'] = df['Teff'].isna().sum()
+        validation['invalid_teff'] = len(df[(df['Teff'] < 1000) | (df['Teff'] > 10000)])
+    
+    if 'Radius' in df.columns:
+        validation['missing_radius'] = df['Radius'].isna().sum()
+        validation['invalid_radius'] = len(df[(df['Radius'] < 0) | (df['Radius'] > 10)])
+    
+    return validation
 
 if __name__ == "__main__":
     # Test the module
@@ -155,4 +245,7 @@ if __name__ == "__main__":
     print(df.head())
     
     stats = get_shortlist_stats()
-    print(f"Shortlist statistics: {stats}") 
+    print(f"Shortlist statistics: {stats}")
+    
+    validation = validate_star_data(df)
+    print(f"Data validation: {validation}") 
