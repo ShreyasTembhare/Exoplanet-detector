@@ -1,0 +1,35 @@
+# Pipeline cache (Phase 1/2/3 .npz)
+cache/
+
+# TESS Hunter
+processed_stars.txt
+candidates/
+hunter_timings.csv
+
+# Training data (auto-built)
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.log
+
+# Model checkpoints (optional)
+models/checkpoints/
+*.pth
+*.pt
