@@ -69,7 +69,8 @@ def predict(result: dict, checkpoint_path: str = None):
     if not path.exists():
         logger.warning(f"Checkpoint not found: {path}; skipping prediction")
         return None
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from device_util import get_device
+    device = get_device()
     model = load_checkpoint(checkpoint_path, device=device, strict=False)
     x = make_two_channel(result["global_view"], result["local_view"])
     x = torch.from_numpy(x).float().unsqueeze(0).to(device)

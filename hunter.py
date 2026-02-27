@@ -124,36 +124,37 @@ def _get_sector_target_list(sector: int, limit: int, tic_list_path: str = None):
         tics = [_normalize_tic(t) for t in lines]
         return list(dict.fromkeys(tics))[:limit]
 
-    import lightkurve as lk
+    # Primary: query MAST for all timeseries observations in this sector
     try:
-        search = lk.search_lightcurve(mission="TESS", sector=sector, limit=limit)
-    except (TypeError, Exception) as e:
-        logger.warning("Sector-only search failed (%s); use --tic-list with a file of TIC IDs per line.", e)
-        return []
-    if search is None or len(search) == 0:
-        return []
+        from astroquery.mast import Observations
+        logger.info("Querying MAST for sector %d timeseries observations...", sector)
+        obs = Observations.query_criteria(
+            obs_collection="TESS",
+            sequence_number=sector,
+            dataproduct_type="timeseries",
+        )
+        if obs is not None and len(obs) > 0:
+            col = "target_name" if "target_name" in obs.colnames else obs.colnames[0]
+            tics = [_normalize_tic(str(n)) for n in obs[col]]
+            unique = list(dict.fromkeys(t for t in tics if t))
+            logger.info("MAST returned %d unique TICs for sector %d", len(unique), sector)
+            return unique[:limit]
+    except Exception as e:
+        logger.warning("MAST query failed (%s); trying lightkurve fallback.", e)
+
+    # Fallback: lightkurve (requires a target, so try a wide-field search)
     try:
-        if hasattr(search, "table") and search.table is not None:
+        import lightkurve as lk
+        search = lk.search_lightcurve("TESS", mission="TESS", sector=sector)
+        if search is not None and len(search) > 0 and hasattr(search, "table"):
             col = "target_name" if "target_name" in search.table.colnames else search.table.colnames[0]
-            names = search.table[col]
-            tics = [_normalize_tic(n) for n in names]
-            return list(dict.fromkeys(tics))[:limit]
-    except Exception:
-        pass
-    try:
-        seen = set()
-        out = []
-        for row in search:
-            name = getattr(row, "target_name", None) or getattr(row, "targetid", None) or str(row)
-            tic = _normalize_tic(name)
-            if tic and tic not in seen:
-                seen.add(tic)
-                out.append(tic)
-            if len(out) >= limit:
-                break
-        return out
-    except Exception:
-        return []
+            tics = [_normalize_tic(str(n)) for n in search.table[col]]
+            return list(dict.fromkeys(t for t in tics if t))[:limit]
+    except Exception as e:
+        logger.warning("lightkurve fallback also failed (%s).", e)
+
+    logger.error("Could not fetch targets for sector %d. Provide --tic-list.", sector)
+    return []
 
 
 def _save_candidate_plot(time, flux, best_period, epoch, tic_id: str, prob_planet: float, candidate_dir: str):
@@ -211,7 +212,8 @@ def _load_model(checkpoint_path: str):
     if not path.exists():
         logger.warning("Checkpoint not found: %s; candidates will not use AI.", path)
         return None, None
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from device_util import get_device
+    device = get_device()
     try:
         model = load_checkpoint(checkpoint_path, device=device, strict=False)
         return model, device
@@ -236,6 +238,33 @@ def _predict(model, device, global_view, local_view, centroid_offset, checkpoint
         logits = model(x, centroid_offset=co)
         probs = torch.softmax(logits, dim=1)
     return probs[0, 1].item()
+
+
+def _predict_batch(model, device, items):
+    """
+    Run batched inference on a list of dicts with keys
+    'global_view', 'local_view', 'centroid_offset'.
+    Returns list of prob_planet floats (or None per item if model is None).
+    """
+    if model is None:
+        return [None] * len(items)
+    try:
+        import torch
+        from models.resnet1d import make_two_channel
+    except ImportError:
+        return [None] * len(items)
+    xs, cos = [], []
+    for item in items:
+        gv, lv, co = item["global_view"], item["local_view"], item["centroid_offset"]
+        co_val = float(co) if co == co and co is not None else 0.0
+        xs.append(make_two_channel(gv, lv))
+        cos.append(co_val)
+    x = torch.from_numpy(np.stack(xs, axis=0)).float().to(device)
+    co = torch.tensor(cos, device=device, dtype=torch.float32)
+    with torch.inference_mode():
+        logits = model(x, centroid_offset=co)
+        probs = torch.softmax(logits, dim=1)
+    return [probs[i, 1].item() for i in range(len(items))]
 
 
 def _should_skip_stage(progress: dict, tic_norm: str, stage: str) -> bool:
@@ -264,6 +293,8 @@ def main():
     parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
     parser.add_argument("--tic-list", type=str, default=None,
                         help="File with one TIC ID per line (fallback if sector search fails)")
+    parser.add_argument("--infer-batch-size", type=int, default=32,
+                        help="Batch size for AI inference (default 32)")
     args = parser.parse_args()
 
     log_file = args.log_file
@@ -292,6 +323,60 @@ def main():
         with open(timings_csv, "w") as f:
             f.write("TIC_ID,PHASE1_MS,PHASE2_MS,PHASE3_MS,PREDICT_MS,TOTAL_MS,STATUS\n")
 
+    infer_batch_size = args.infer_batch_size
+    predict_queue = []
+
+    def _flush_predict_queue():
+        """Run batched inference on queued items and finalize each star."""
+        nonlocal completed_count
+        if not predict_queue:
+            return
+        t0 = _time.time()
+        probs = _predict_batch(model, device, predict_queue)
+        batch_ms = (_time.time() - t0) * 1000
+        per_item_ms = batch_ms / len(predict_queue) if predict_queue else 0
+
+        for item, prob_planet in zip(predict_queue, probs):
+            item["timings"]["predict"] = per_item_ms
+            tic_norm_q = item["tic_norm"]
+            tic_id_q = item["tic_id"]
+            best_period_q = item["best_period"]
+
+            if prob_planet is None:
+                status_q = "CLEARED"
+            elif prob_planet >= args.threshold:
+                status_q = f"CANDIDATE ({prob_planet:.2f})"
+                plot_path = _save_candidate_plot(
+                    item["time_arr"], item["flux_arr"], best_period_q,
+                    item["epoch"], tic_id_q, prob_planet, candidate_dir,
+                )
+                _save_candidate_evidence(
+                    candidate_dir, tic_id_q, best_period_q, prob_planet,
+                    item["max_power"] or 0.0, item["centroid_offset"] or 0.0, plot_path,
+                )
+            else:
+                status_q = "CLEARED"
+
+            total_ms = (_time.time() - item["tic_start"]) * 1000
+            _append_log_atomic(log_file, tic_norm_q, STAGE_DONE, status_q, best_period=best_period_q)
+            progress[tic_norm_q] = {"last_stage": STAGE_DONE, "status": status_q}
+            t = item["timings"]
+            logger.info("  -> %s [%.0f ms total: p1=%.0f p2=%.0f p3=%.0f pred=%.0f]",
+                         status_q, total_ms, t["phase1"], t["phase2"], t["phase3"], t["predict"])
+
+            with open(timings_csv, "a") as f:
+                f.write(f"{tic_norm_q},{t['phase1']:.0f},{t['phase2']:.0f},"
+                        f"{t['phase3']:.0f},{t['predict']:.0f},{total_ms:.0f},{status_q}\n")
+
+            completed_count += 1
+            elapsed_hours = (_time.time() - hunt_start) / 3600
+            if elapsed_hours > 0:
+                rate = completed_count / elapsed_hours
+                logger.info("  Throughput: %.1f stars/hour (%d done in %.1f h)", rate, completed_count, elapsed_hours)
+
+        predict_queue.clear()
+        gc.collect()
+
     for i, tic_raw in enumerate(target_list):
         tic_id = tic_raw if tic_raw.upper().startswith("TIC") else f"TIC {tic_raw}"
         tic_norm = _normalize_tic(tic_id)
@@ -300,7 +385,6 @@ def main():
             continue
 
         logger.info("[%s/%s] Processing %s...", i + 1, total, tic_id)
-        status = None
         time_arr, flux_arr = None, None
         best_period, epoch, max_power = None, None, None
         global_view, local_view, centroid_offset = None, None, None
@@ -364,55 +448,32 @@ def main():
                     tic_id=tic_id, sector=sector_label, tpf=None, use_cache=True,
                 )
 
-            # --- Predict ---
-            t0 = _time.time()
-            prob_planet = _predict(model, device, global_view, local_view, centroid_offset, args.checkpoint)
-            timings["predict"] = (_time.time() - t0) * 1000
-
-            if prob_planet is None:
-                status = "CLEARED"
-            elif prob_planet >= args.threshold:
-                status = f"CANDIDATE ({prob_planet:.2f})"
-                plot_path = _save_candidate_plot(
-                    time_arr, flux_arr, best_period, epoch, tic_id, prob_planet, candidate_dir
-                )
-                _save_candidate_evidence(
-                    candidate_dir, tic_id, best_period, prob_planet,
-                    max_power or 0.0, centroid_offset or 0.0, plot_path,
-                )
-            else:
-                status = "CLEARED"
+            # --- Queue for batched prediction ---
+            predict_queue.append({
+                "tic_norm": tic_norm, "tic_id": tic_id,
+                "time_arr": time_arr, "flux_arr": flux_arr,
+                "best_period": best_period, "epoch": epoch,
+                "max_power": max_power,
+                "global_view": global_view, "local_view": local_view,
+                "centroid_offset": centroid_offset,
+                "timings": timings, "tic_start": tic_start,
+            })
+            if len(predict_queue) >= infer_batch_size:
+                _flush_predict_queue()
 
         except Exception as e:
             status = f"ERROR: {str(e)}"
             logger.exception("Failed for %s", tic_id)
+            total_ms = (_time.time() - tic_start) * 1000
+            _append_log_atomic(log_file, tic_norm, STAGE_DONE, status, best_period=best_period)
+            progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
+            logger.info("  -> %s [%.0f ms]", status, total_ms)
+            with open(timings_csv, "a") as f:
+                f.write(f"{tic_norm},{timings['phase1']:.0f},{timings['phase2']:.0f},"
+                        f"{timings['phase3']:.0f},0,{total_ms:.0f},{status}\n")
+            completed_count += 1
 
-        if status is None:
-            status = "ERROR: No status"
-
-        total_ms = (_time.time() - tic_start) * 1000
-        _append_log_atomic(log_file, tic_norm, STAGE_DONE, status, best_period=best_period)
-        progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
-        logger.info("  -> %s [%.0f ms total: p1=%.0f p2=%.0f p3=%.0f pred=%.0f]",
-                     status, total_ms,
-                     timings["phase1"], timings["phase2"], timings["phase3"], timings["predict"])
-
-        with open(timings_csv, "a") as f:
-            f.write(f"{tic_norm},{timings['phase1']:.0f},{timings['phase2']:.0f},"
-                    f"{timings['phase3']:.0f},{timings['predict']:.0f},{total_ms:.0f},{status}\n")
-
-        completed_count += 1
-        elapsed_hours = (_time.time() - hunt_start) / 3600
-        if elapsed_hours > 0:
-            rate = completed_count / elapsed_hours
-            logger.info("  Throughput: %.1f stars/hour (%d done in %.1f h)", rate, completed_count, elapsed_hours)
-
-        try:
-            del time_arr, flux_arr
-        except NameError:
-            pass
-        gc.collect()
-
+    _flush_predict_queue()
     logger.info("Hunter run complete. Processed %d stars.", completed_count)
 
 

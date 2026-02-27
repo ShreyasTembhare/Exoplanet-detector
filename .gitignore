@@ -3,8 +3,12 @@ cache/
 
 # TESS Hunter
 processed_stars.txt
+processed_stars_s*.txt
 candidates/
 hunter_timings.csv
+
+# Autopilot
+autopilot_state.json
 
 # Training data (auto-built)
 data/

@@ -209,7 +209,8 @@ def load_checkpoint(
     if not TORCH_AVAILABLE:
         raise RuntimeError("PyTorch required")
     if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from device_util import get_device
+        device = get_device()
     if model is None:
         model = ResNet1DClassifier(use_centroid=True)
 

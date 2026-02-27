@@ -43,22 +43,49 @@ from models.resnet1d import (
 # Dataset
 # ---------------------------------------------------------------------------
 
+def augment_sample(global_arr: np.ndarray, local_arr: np.ndarray):
+    """Apply random augmentations to a single (global, local) pair."""
+    rng = np.random
+    if rng.random() < 0.5:
+        global_arr = global_arr + rng.normal(0, 0.002, size=global_arr.shape).astype(np.float32)
+        local_arr = local_arr + rng.normal(0, 0.002, size=local_arr.shape).astype(np.float32)
+    if rng.random() < 0.3:
+        shift_g = rng.randint(-len(global_arr) // 20, len(global_arr) // 20 + 1)
+        shift_l = rng.randint(-len(local_arr) // 20, len(local_arr) // 20 + 1)
+        global_arr = np.roll(global_arr, shift_g)
+        local_arr = np.roll(local_arr, shift_l)
+    if rng.random() < 0.3:
+        mask_len = rng.randint(len(global_arr) // 50, len(global_arr) // 20 + 1)
+        start = rng.randint(0, len(global_arr) - mask_len)
+        global_arr[start:start + mask_len] = 0.0
+    if rng.random() < 0.3:
+        scale = rng.uniform(0.95, 1.05)
+        global_arr = global_arr * scale
+        local_arr = local_arr * scale
+    return global_arr, local_arr
+
+
 class LightCurveDataset(Dataset):
     """Dataset of (global_view, local_view, centroid_offset, label)."""
 
-    def __init__(self, global_views, local_views, centroid_offsets, labels):
+    def __init__(self, global_views, local_views, centroid_offsets, labels, augment=False):
         self.global_views = np.asarray(global_views, dtype=np.float32)
         self.local_views = np.asarray(local_views, dtype=np.float32)
         self.centroid_offsets = np.asarray(centroid_offsets, dtype=np.float32)
         self.labels = np.asarray(labels, dtype=np.int64)
         assert len(self.global_views) == len(self.labels)
         self.centroid_offsets = np.nan_to_num(self.centroid_offsets, nan=0.0)
+        self.augment = augment
 
     def __len__(self):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        x = make_two_channel(self.global_views[idx], self.local_views[idx])
+        g = self.global_views[idx].copy()
+        l = self.local_views[idx].copy()
+        if self.augment:
+            g, l = augment_sample(g, l)
+        x = make_two_channel(g, l)
         x = torch.from_numpy(x).unsqueeze(0)
         co = torch.tensor(self.centroid_offsets[idx], dtype=torch.float32)
         y = torch.tensor(self.labels[idx], dtype=torch.long)
@@ -180,7 +207,7 @@ def build_labeled_dataset_from_archive(
 # Training helpers
 # ---------------------------------------------------------------------------
 
-def train_epoch(model, loader, criterion, optimizer, device, scaler=None):
+def train_epoch(model, loader, criterion, optimizer, device, scaler=None, amp_device_type=None):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
     for x, co, y in loader:
@@ -188,13 +215,17 @@ def train_epoch(model, loader, criterion, optimizer, device, scaler=None):
         co = co.to(device)
         y = y.to(device)
         optimizer.zero_grad()
-        if scaler is not None:
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
+        if amp_device_type is not None:
+            with torch.autocast(device_type=amp_device_type, dtype=torch.float16):
                 logits = model(x, centroid_offset=co)
                 loss = criterion(logits, y)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
         else:
             logits = model(x, centroid_offset=co)
             loss = criterion(logits, y)
@@ -337,14 +368,22 @@ def main():
         centroid_offsets = np.random.rand(n).astype(np.float32)
         labels = (np.random.rand(n) > 0.5).astype(np.int64)
 
-    dataset = LightCurveDataset(global_views, local_views, centroid_offsets, labels)
-    n_val = max(1, len(dataset) // 5)
-    n_train = len(dataset) - n_val
-    train_ds, val_ds = torch.utils.data.random_split(dataset, [n_train, n_val])
+    n_total = len(labels) if hasattr(labels, '__len__') else len(global_views)
+    n_val = max(1, n_total // 5)
+    n_train = n_total - n_val
+    indices = np.random.permutation(n_total)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    gv, lv = np.asarray(global_views, dtype=np.float32), np.asarray(local_views, dtype=np.float32)
+    co_all = np.asarray(centroid_offsets, dtype=np.float32)
+    lb = np.asarray(labels, dtype=np.int64)
+    train_ds = LightCurveDataset(gv[train_idx], lv[train_idx], co_all[train_idx], lb[train_idx], augment=True)
+    val_ds = LightCurveDataset(gv[val_idx], lv[val_idx], co_all[val_idx], lb[val_idx], augment=False)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from device_util import get_device, get_amp_config
+    device = get_device()
     logger.info("Device: %s", device)
 
     # ---- Model ----
@@ -356,7 +395,9 @@ def main():
     logger.info("Model parameters: %s", f"{count_parameters(model):,}")
 
     criterion = nn.CrossEntropyLoss()
-    scaler = torch.GradScaler("cuda") if (args.amp and device.type == "cuda") else None
+    amp_cfg = get_amp_config(device)
+    scaler = torch.GradScaler(device.type) if (args.amp and amp_cfg["enabled"] and amp_cfg["use_scaler"]) else None
+    amp_device_type = amp_cfg["device_type"] if (args.amp and amp_cfg["enabled"]) else None
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     best_f1 = -1.0
@@ -372,7 +413,7 @@ def main():
         logger.info("=== Stage 1: frozen backbone for %d epochs ===", stage1_epochs)
         for epoch in range(stage1_epochs):
             t0 = _time.time()
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler)
+            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_device_type)
             val_loss, val_acc, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
             m = compute_metrics(probs, lbls, preds)
             elapsed = _time.time() - t0
@@ -407,7 +448,7 @@ def main():
 
     for epoch in range(remaining_epochs):
         t0 = _time.time()
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_device_type)
         val_loss, val_acc, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
         m = compute_metrics(probs, lbls, preds)
         scheduler.step(m["f1"])
