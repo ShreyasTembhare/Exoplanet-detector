@@ -1,250 +1,157 @@
-# Advanced Exoplanet Detector
+# TESS Exoplanet Detector (GPU BLS + ResNet-1D)
 
-A professional, modular exoplanet detection tool with advanced analysis capabilities, built with clean architecture and comprehensive features.
-
-## Features
-
-### Core Detection
-- **Light Curve Analysis**: Advanced transit detection using BLS and Lomb-Scargle periodograms
-- **Multi-mission Support**: Kepler, TESS, and K2 data processing
-- **Quality Assessment**: Comprehensive data quality evaluation
-- **False Positive Analysis**: Robust candidate validation
-- **Star Shortlist & Analysis**: Automated TESS catalog querying and batch analysis pipeline
-
-### Advanced Analysis
-- **Transit Modeling**: Analytical and numerical transit fitting
-- **Stellar Characterization**: Stellar property estimation
-- **Machine Learning**: ML-based candidate classification
-- **Performance Monitoring**: Real-time performance tracking
-
-### Professional Features
-- **Modular Architecture**: Clean, maintainable code structure
-- **Database Integration**: SQLite persistence for results and history
-- **Caching System**: Intelligent result caching for efficiency
-- **Export Capabilities**: Multiple format export (CSV, JSON, PNG, PDF)
-- **Community Features**: Annotation and sharing system
-- **Educational Tools**: Interactive tutorials and learning materials
+TESS-only exoplanet detection pipeline: Phase 1 (preprocess), Phase 2 (GPU BLS periodogram), Phase 3 (folded views + centroid vetting), Phase 4 (ResNet-1D classifier). Caching at each phase so reruns resume from the last cached stage.
 
 ## Architecture
 
-The application follows a professional modular architecture:
+- **Phase 1 (CPU):** TESS light curves via lightkurve; Savitzky-Golay flatten (`window_length=101`); 3-sigma sigma-clipping.
+- **Phase 2 (GPU):** Two-pass BLS periodogram (coarse 2000 periods -> refine 3000 around peak) with JAX or NumPy fallback. Auto-selects backend based on cadence count. Optional downsampling for very long light curves.
+- **Phase 3:** Fold on best period -> global view (2048 bins), local transit view (256 bins); centroid offset from TPF (optional).
+- **Phase 4:** ResNet-1D classifier: two channels (global + local), centroid scalar; binary: Confirmed Planet vs False Positive. Supports loading pretrained checkpoints with automatic key mapping.
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional: Install JAX with GPU support for faster BLS (see [JAX install](https://github.com/google/jax#installation)).
+
+## Usage
+
+### Run pipeline (single target)
+
+```bash
+python run_pipeline.py "TIC 441462736"
+python run_pipeline.py "TIC 441462736" --predict --checkpoint models/checkpoints/resnet1d.pt
+```
+
+Options: `--sector`, `--period-min`, `--period-max`, `--nperiods`, `--no-cache`, `--predict`, `--checkpoint`.
+
+Reruns use cached Phase 1/2/3 results when available.
+
+### Train / fine-tune classifier
+
+**From scratch (synthetic demo):**
+```bash
+python train_classifier.py --epochs 30 --out models/checkpoints/resnet1d.pt
+```
+
+**Fine-tune from pretrained checkpoint:**
+```bash
+python train_classifier.py --pretrained models/checkpoints/pretrained.pt --epochs 30 --freeze-epochs 5 --unfreeze-blocks 2 --finetune-lr 1e-4 --amp
+```
+
+**Auto-build labeled dataset from NASA Exoplanet Archive:**
+```bash
+python train_classifier.py --data auto --max-per-class 250 --epochs 30 --amp
+```
+
+**From your own CSV:**
+```bash
+python train_classifier.py --data path/to/features.csv --epochs 30 --out models/checkpoints/resnet1d.pt
+```
+
+CSV can have columns `global_0`..`global_2047`, `local_0`..`local_255`, `centroid_offset`, `label` (0=FP, 1=planet), or a `path` column pointing to `.npz` files.
+
+Training outputs:
+- Best checkpoint: `models/checkpoints/resnet1d.pt`
+- Metrics JSON: `models/checkpoints/resnet1d.metrics.json` (Precision, Recall, F1, ROC-AUC, PR-AUC, confusion matrix)
+
+**Fine-tuning strategy:**
+1. Stage 1 (freeze-epochs): backbone frozen, only classifier head trains at `--lr`.
+2. Stage 2: last N residual blocks unfrozen at `--finetune-lr` with LR scheduler and early stopping.
+3. Mixed precision (`--amp`) recommended for laptop GPUs with limited VRAM.
+
+### TESS Hunter (autonomous pipeline)
+
+Run a sector overnight: fetch stars, run Phase 1 -> BLS -> (pre-filter) -> Phase 3 -> ResNet-1D, log results, and save candidate plots + evidence JSON.
+
+```bash
+python hunter.py --sector 15 --limit 10000 --threshold 0.85
+```
+
+**Stage-level resume:** The hunter tracks progress per TIC at the phase level. If your laptop crashes or restarts, it resumes each TIC from the exact phase where it left off (not from scratch).
+
+**Progress log** (`processed_stars.txt`):
+```
+TIC_ID,LAST_STAGE,STATUS,BEST_PERIOD,UPDATED_AT,ERROR
+441462736,DONE,CLEARED,3.456789,2026-02-12T10:30:00+00:00,
+```
+
+Stages: `phase1` -> `phase2` -> `phase3` -> `predict` -> `DONE`.
+
+**Timing telemetry:** Per-TIC phase durations and rolling throughput (stars/hour) are logged to console and `hunter_timings.csv`.
+
+**Candidate evidence:** For each candidate, the hunter saves:
+- Folded scatter plot + binned view: `candidates/TIC_<id>_p<period>.png`
+- Sidecar JSON with model score, BLS power, centroid offset: `candidates/TIC_<id>_p<period>.json`
+
+**Options:** `--sector`, `--limit`, `--threshold`, `--bls-threshold`, `--checkpoint`, `--log-file`, `--candidate-dir`, `--tic-list`.
+
+### Python API
+
+```python
+from pipeline import run_phase1, run_phase2, run_phase3
+
+time, flux, flux_err, sector = run_phase1("441462736", use_cache=True)
+periods, power, best_period, epoch = run_phase2(time, flux, tic_id="441462736", sector=sector, use_cache=True)
+global_view, local_view, centroid_offset = run_phase3(time, flux, best_period, epoch, tic_id="441462736", sector=sector, use_cache=True)
+```
+
+## Tuning Guide
+
+| Parameter | Where | Default | Notes |
+|-----------|-------|---------|-------|
+| `--bls-threshold` | hunter.py | 0.001 | Lower = more stars pass to AI; calibrate from pilot run |
+| `--threshold` | hunter.py | 0.85 | Probability cutoff for "CANDIDATE" |
+| `coarse_nperiods` | bls_gpu.py | 2000 | More = slower coarse pass but less likely to miss peaks |
+| `refine_nperiods` | bls_gpu.py | 3000 | More = finer period resolution |
+| `downsample_limit` | bls_gpu.py | 80000 | Cadences above this are downsampled before BLS |
+| `--freeze-epochs` | train_classifier.py | 5 | Epochs with frozen backbone during fine-tuning |
+| `--patience` | train_classifier.py | 7 | Early stopping patience |
+
+## Project layout
 
 ```
 Exoplanet-detector/
-├── app.py                    # Main application entry point
-├── core/                     # Core functionality modules
-│   ├── database.py          # Database management
-│   ├── processor.py         # Resilient data processing
-│   ├── monitor.py           # Performance monitoring
-│   ├── cache.py             # Caching system
-│   ├── parallel.py          # Parallel processing
-│   ├── ml_manager.py        # Machine learning management
-│   ├── real_time.py         # Real-time monitoring
-│   ├── community.py         # Community features
-│   ├── educational.py       # Educational content
-│   ├── quality.py           # Data quality assessment
-│   ├── visualization.py     # Plot generation
-│   └── export.py            # Export functionality
-├── analysis/                 # Analysis modules
-│   ├── analyzer.py          # Main analysis engine
-│   ├── transit_modeling.py  # Transit modeling
-│   ├── false_positive.py    # False positive analysis
-│   ├── stellar_characterization.py  # Stellar analysis
-│   └── ml_predictor.py      # ML prediction
-├── ui/                      # User interface modules
-│   ├── interface.py         # Main Streamlit interface
-│   └── displays.py          # Result display management
-├── shortlist.py             # Star shortlist generation from TESS catalog
-├── analysis_pipeline.py     # Batch analysis and persistence pipeline
-└── requirements.txt          # Python dependencies
+├── pipeline/
+│   ├── __init__.py
+│   ├── cache_io.py          # Phase 1/2/3 get/set with atomic writes
+│   ├── phase1_preprocess.py
+│   ├── bls_gpu.py           # Two-pass BLS with auto backend policy
+│   └── fold_features.py
+├── models/
+│   └── resnet1d.py          # ResNet-1D + pretrained checkpoint adapter
+├── train_classifier.py      # Train / fine-tune with metrics
+├── run_pipeline.py
+├── hunter.py                # TESS Hunter with stage-level resume + telemetry
+├── processed_stars.txt      # Hunter progress log (created on first run)
+├── hunter_timings.csv       # Per-TIC timing telemetry (created on first run)
+├── candidates/              # Candidate plots + evidence JSON
+├── data/                    # Auto-built labeled datasets (created by --data auto)
+├── requirements.txt
+└── README.md
 ```
 
-## Quick Start
+Cache directory: `cache/` (phase1, phase2, phase3). Add `cache/` to `.gitignore` (already included).
 
-### Installation
+## Dependencies
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   cd Exoplanet-detector
-   ```
+- lightkurve, astropy, numpy, pandas, scipy
+- jax, jaxlib (optional; NumPy fallback for BLS)
+- torch (ResNet-1D)
+- astroquery (optional, for auto-building labeled datasets)
+- scikit-learn (optional, for ROC-AUC/PR-AUC metrics)
+- matplotlib (candidate plots)
+- tqdm
 
-2. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## References
 
-3. **Run the application**:
-   ```bash
-   streamlit run app.py
-   ```
-
-### Basic Usage
-
-1. Open the application in your web browser
-2. Enter a target name (e.g., "KIC 11442793")
-3. Select mission and analysis parameters
-4. Click "Start Analysis" to begin detection
-5. Review results and export as needed
-
-## Star Shortlist & Analysis
-
-The application includes an automated pipeline for discovering potential exoplanet host stars:
-
-### Star Shortlist Module
-- **TESS Catalog Querying**: Automatically queries the TESS Input Catalog for stars matching exoplanet host criteria
-- **Selection Criteria**: Tmag < 12, Radius < 1.5 R☉, 3000 K < Teff < 6500 K, CDPP4_0 < 100 ppm
-- **CSV Persistence**: Saves results to `star_shortlist.csv` for reuse
-
-### Analysis Pipeline
-- **SQLite Database**: Persistent storage in `candidates.db` with `candidates` table
-- **BLS Analysis**: Runs Box Least Squares with configurable parameters (0.5-20 days, 10,000 steps)
-- **Signal Detection**: Identifies candidates with BLS power ≥ 7.0
-- **Progress Tracking**: Real-time progress updates during batch analysis
-- **Duplicate Prevention**: Skips already analyzed stars to avoid redundant work
-
-### Usage
-1. Navigate to "Star Shortlist & Analysis" in the sidebar
-2. **Shortlist Tab**: Click "Refresh Shortlist" to query TESS catalog
-3. **Run Analysis Tab**: Configure parameters and click "Start Analysis"
-4. Monitor progress and review results in real-time
-5. Export candidates or clear database as needed
-
-## Analysis Types
-
-### Basic Analysis
-- Light curve preprocessing
-- BLS periodogram analysis
-- Basic transit detection
-- Quality assessment
-
-### Advanced Analysis
-- False positive analysis
-- Transit modeling
-- Stellar characterization
-- Confidence scoring
-
-### Comprehensive Analysis
-- All advanced features
-- Machine learning prediction
-- Multi-mission data fusion
-- Detailed reporting
-
-## Configuration
-
-### Analysis Parameters
-- **Period Range**: 0.1 - 100 days
-- **Data Quality**: good/medium/poor
-- **Detrending**: flatten/spline/polynomial
-- **Mission**: Kepler/TESS/K2
-
-### Database Configuration
-- **SQLite Database**: `exoplanet_detector.db`
-- **Cache Directory**: `cache/`
-- **Export Directory**: `exports/`
-- **Models Directory**: `models/`
-
-## Performance Features
-
-### Caching System
-- Intelligent result caching
-- Configurable cache expiration
-- Automatic cache cleanup
-
-### Performance Monitoring
-- Operation timing tracking
-- Error rate monitoring
-- Success rate metrics
-
-### Parallel Processing
-- Batch processing capabilities
-- Multi-threaded operations
-- Configurable worker pools
-
-## Development
-
-### Code Structure
-The application follows clean architecture principles:
-- **Separation of Concerns**: Each module has a specific responsibility
-- **Dependency Injection**: Components are loosely coupled
-- **Error Handling**: Comprehensive error handling and logging
-- **Testing**: Modular design enables easy testing
-
-### Adding New Features
-1. Create new module in appropriate directory
-2. Implement required interfaces
-3. Add to main application initialization
-4. Update documentation
-
-### Contributing
-1. Fork the repository
-2. Create a feature branch
-3. Implement your changes
-4. Add tests and documentation
-5. Submit a pull request
-
-## Scientific Background
-
-### Transit Detection
-- **BLS Algorithm**: Box Least Squares for periodic transit detection
-- **Lomb-Scargle**: Alternative periodogram method
-- **Signal Processing**: Advanced filtering and detrending
-
-### False Positive Analysis
-- **SNR Analysis**: Signal-to-noise ratio evaluation
-- **Transit Duration**: Duration vs period analysis
-- **Odd-Even Analysis**: Transit consistency checking
-- **Secondary Eclipse**: Secondary eclipse detection
-
-### Data Quality Assessment
-- **Completeness**: Data coverage analysis
-- **Noise Level**: Photometric noise evaluation
-- **Gap Analysis**: Data gap identification
-- **Systematic Errors**: Instrumental effect detection
-
-## Support
-
-### Documentation
-- Comprehensive inline documentation
-- API reference for all modules
-- Usage examples and tutorials
-
-### Community
-- GitHub Issues for bug reports
-- Discussion forum for questions
-- Contributing guidelines
-
-### Acknowledgments
-- NASA Exoplanet Archive for data access
-- LightKurve team for astronomical data processing
-- Streamlit team for the web framework
-- Scientific community for algorithms and methods
-
-## Recent Updates
-
-### Enhanced Star Shortlist Module
-- Added advanced star filtering functions
-- Implemented data quality assessment
-- Enhanced statistics with comprehensive metrics
-- Improved error handling and logging
-
-### Advanced Processing Pipeline
-- Added batch processing capabilities with parallel execution
-- Implemented performance monitoring and metrics tracking
-- Enhanced error handling with detailed performance reporting
-- Added timeout and retry mechanisms for robust processing
-
-### Performance Improvements
-- Thread-safe performance metrics collection
-- Memory-efficient batch processing
-- Optimized data structures and algorithms
-- Enhanced caching and resource management
+- BLS: Kovacs, Zucker & Mazeh (2002); Astropy BoxLeastSquares.
+- Centroid vetting: e.g. SSDataLab/vetting.
+- NASA TESS / lightkurve.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-**Built for the exoplanet discovery community**
-
+MIT (see LICENSE).
