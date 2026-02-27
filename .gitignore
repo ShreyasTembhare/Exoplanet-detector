@@ -10,6 +10,9 @@ hunter_timings.csv
 # Autopilot
 autopilot_state.json
 
+# Streamlit dashboard runtime
+.streamlit_tasks.json
+
 # Training data (auto-built)
 data/
 

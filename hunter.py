@@ -282,34 +282,27 @@ def _should_skip_stage(progress: dict, tic_norm: str, stage: str) -> bool:
         return False
 
 
-def main():
-    parser = argparse.ArgumentParser(description="TESS Hunter: autonomous sector pipeline with stage-level resume")
-    parser.add_argument("--sector", type=int, default=SECTOR_TO_HUNT)
-    parser.add_argument("--limit", type=int, default=TARGET_LIMIT)
-    parser.add_argument("--threshold", type=float, default=PROBABILITY_THRESHOLD)
-    parser.add_argument("--bls-threshold", type=float, default=BLS_THRESHOLD)
-    parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--log-file", type=str, default=LOG_FILE)
-    parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
-    parser.add_argument("--tic-list", type=str, default=None,
-                        help="File with one TIC ID per line (fallback if sector search fails)")
-    parser.add_argument("--infer-batch-size", type=int, default=32,
-                        help="Batch size for AI inference (default 32)")
-    args = parser.parse_args()
+def run_hunt(sector=SECTOR_TO_HUNT, limit=TARGET_LIMIT, threshold=PROBABILITY_THRESHOLD,
+             bls_threshold=BLS_THRESHOLD, checkpoint=DEFAULT_CHECKPOINT,
+             log_file=LOG_FILE, candidate_dir=CANDIDATE_DIR, tic_list=None,
+             infer_batch_size=32, period_min=1.0, period_max=15.0, nperiods=10000,
+             strategy_profile=None):
+    """Core hunt logic, callable without CLI arg parsing.
 
-    log_file = args.log_file
-    candidate_dir = args.candidate_dir
+    Returns dict with 'completed' count and 'candidates' list.
+    """
+    candidates_found = []
     _ensure_setup(log_file, candidate_dir)
     progress = _load_progress(log_file)
     logger.info("Loaded progress for %d TICs from %s", len(progress), log_file)
 
-    target_list = _get_sector_target_list(args.sector, args.limit, args.tic_list)
+    target_list = _get_sector_target_list(sector, limit, tic_list)
     if not target_list:
-        logger.error("No targets for sector %s. Check lightkurve API or provide a TIC list.", args.sector)
-        sys.exit(1)
-    logger.info("Sector %s: %d unique targets (limit %d)", args.sector, len(target_list), args.limit)
+        logger.error("No targets for sector %s.", sector)
+        return {"completed": 0, "candidates": candidates_found}
+    logger.info("Sector %s: %d unique targets (limit %d)", sector, len(target_list), limit)
 
-    model, device = _load_model(args.checkpoint)
+    model, device = _load_model(checkpoint)
     if model is None:
         logger.warning("Running without classifier; all BLS-pass stars will be logged as CLEARED.")
 
@@ -323,7 +316,6 @@ def main():
         with open(timings_csv, "w") as f:
             f.write("TIC_ID,PHASE1_MS,PHASE2_MS,PHASE3_MS,PREDICT_MS,TOTAL_MS,STATUS\n")
 
-    infer_batch_size = args.infer_batch_size
     predict_queue = []
 
     def _flush_predict_queue():
@@ -344,7 +336,7 @@ def main():
 
             if prob_planet is None:
                 status_q = "CLEARED"
-            elif prob_planet >= args.threshold:
+            elif prob_planet >= threshold:
                 status_q = f"CANDIDATE ({prob_planet:.2f})"
                 plot_path = _save_candidate_plot(
                     item["time_arr"], item["flux_arr"], best_period_q,
@@ -354,6 +346,10 @@ def main():
                     candidate_dir, tic_id_q, best_period_q, prob_planet,
                     item["max_power"] or 0.0, item["centroid_offset"] or 0.0, plot_path,
                 )
+                candidates_found.append({
+                    "tic_id": tic_id_q, "period": best_period_q,
+                    "prob_planet": prob_planet, "strategy_profile": strategy_profile,
+                })
             else:
                 status_q = "CLEARED"
 
@@ -395,7 +391,7 @@ def main():
             # --- Phase 1 ---
             if not _should_skip_stage(progress, tic_norm, "phase1"):
                 t0 = _time.time()
-                time_arr, flux_arr, flux_err, sector_label = run_phase1(tic_id, sector=args.sector, use_cache=True)
+                time_arr, flux_arr, flux_err, sector_label = run_phase1(tic_id, sector=sector, use_cache=True)
                 timings["phase1"] = (_time.time() - t0) * 1000
                 if time_arr is None or len(time_arr) < 50:
                     status = "ERROR: Empty or too short light curve"
@@ -405,22 +401,22 @@ def main():
                 _append_log_atomic(log_file, tic_norm, "phase1", "IN_PROGRESS")
                 progress[tic_norm] = {"last_stage": "phase1", "status": "IN_PROGRESS"}
             else:
-                time_arr, flux_arr, flux_err, sector_label = run_phase1(tic_id, sector=args.sector, use_cache=True)
+                time_arr, flux_arr, flux_err, sector_label = run_phase1(tic_id, sector=sector, use_cache=True)
 
             # --- Phase 2 (BLS) ---
             if not _should_skip_stage(progress, tic_norm, "phase2"):
                 t0 = _time.time()
                 periods, power, best_period, epoch = run_phase2(
                     time_arr, flux_arr, tic_id=tic_id, sector=sector_label,
-                    period_min=1.0, period_max=15.0, nperiods=10000, use_cache=True,
+                    period_min=period_min, period_max=period_max, nperiods=nperiods, use_cache=True,
                 )
                 timings["phase2"] = (_time.time() - t0) * 1000
                 max_power = float(np.max(power))
-                if max_power < args.bls_threshold:
+                if max_power < bls_threshold:
                     status = "NO_SIGNAL"
                     _append_log_atomic(log_file, tic_norm, STAGE_DONE, status, best_period=best_period)
                     progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
-                    logger.info("  -> %s (BLS power=%.6f < %.6f)", status, max_power, args.bls_threshold)
+                    logger.info("  -> %s (BLS power=%.6f < %.6f)", status, max_power, bls_threshold)
                     continue
                 _append_log_atomic(log_file, tic_norm, "phase2", "IN_PROGRESS", best_period=best_period)
                 progress[tic_norm] = {"last_stage": "phase2", "status": "IN_PROGRESS", "best_period": best_period}
@@ -428,7 +424,7 @@ def main():
                 cached_bp = progress.get(tic_norm, {}).get("best_period")
                 periods, power, best_period, epoch = run_phase2(
                     time_arr, flux_arr, tic_id=tic_id, sector=sector_label,
-                    period_min=1.0, period_max=15.0, nperiods=10000, use_cache=True,
+                    period_min=period_min, period_max=period_max, nperiods=nperiods, use_cache=True,
                 )
                 max_power = float(np.max(power))
 
@@ -475,6 +471,35 @@ def main():
 
     _flush_predict_queue()
     logger.info("Hunter run complete. Processed %d stars.", completed_count)
+    return {"completed": completed_count, "candidates": candidates_found}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="TESS Hunter: autonomous sector pipeline with stage-level resume")
+    parser.add_argument("--sector", type=int, default=SECTOR_TO_HUNT)
+    parser.add_argument("--limit", type=int, default=TARGET_LIMIT)
+    parser.add_argument("--threshold", type=float, default=PROBABILITY_THRESHOLD)
+    parser.add_argument("--bls-threshold", type=float, default=BLS_THRESHOLD)
+    parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--log-file", type=str, default=LOG_FILE)
+    parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
+    parser.add_argument("--tic-list", type=str, default=None,
+                        help="File with one TIC ID per line (fallback if sector search fails)")
+    parser.add_argument("--infer-batch-size", type=int, default=32,
+                        help="Batch size for AI inference (default 32)")
+    parser.add_argument("--period-min", type=float, default=1.0)
+    parser.add_argument("--period-max", type=float, default=15.0)
+    parser.add_argument("--nperiods", type=int, default=10000)
+    parser.add_argument("--strategy-profile", type=str, default=None)
+    args = parser.parse_args()
+    return run_hunt(
+        sector=args.sector, limit=args.limit, threshold=args.threshold,
+        bls_threshold=args.bls_threshold, checkpoint=args.checkpoint,
+        log_file=args.log_file, candidate_dir=args.candidate_dir,
+        tic_list=args.tic_list, infer_batch_size=args.infer_batch_size,
+        period_min=args.period_min, period_max=args.period_max,
+        nperiods=args.nperiods, strategy_profile=args.strategy_profile,
+    )
 
 
 if __name__ == "__main__":

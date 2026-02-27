@@ -151,34 +151,127 @@ def _cross_match_candidates(candidate_dir: str, known_tics: set):
 # ---------------------------------------------------------------------------
 
 def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
-                bls_threshold: float, candidate_dir: str):
-    """Run the hunter main() for a single sector by injecting sys.argv."""
+                bls_threshold: float, candidate_dir: str,
+                period_min: float = 1.0, period_max: float = 15.0,
+                nperiods: int = 10000, strategy_profile: str = None):
+    """Run the hunter on a single sector via the callable run_hunt() API."""
     log_file = f"processed_stars_s{sector:03d}.txt"
-    sys.argv = [
-        "hunter.py",
-        "--sector", str(sector),
-        "--limit", str(limit),
-        "--checkpoint", checkpoint,
-        "--threshold", str(threshold),
-        "--bls-threshold", str(bls_threshold),
-        "--log-file", log_file,
-        "--candidate-dir", candidate_dir,
-    ]
-
     try:
-        import importlib
-        import hunter as hunter_mod
-        importlib.reload(hunter_mod)
-        hunter_mod.main()
-    except SystemExit:
-        pass
+        from hunter import run_hunt
+        return run_hunt(
+            sector=sector, limit=limit, threshold=threshold,
+            bls_threshold=bls_threshold, checkpoint=checkpoint,
+            log_file=log_file, candidate_dir=candidate_dir,
+            period_min=period_min, period_max=period_max,
+            nperiods=nperiods, strategy_profile=strategy_profile,
+        )
     except Exception as e:
         logger.error("Sector %d failed: %s", sector, e)
+        return {"completed": 0, "candidates": []}
 
 
 # ---------------------------------------------------------------------------
 # Main autopilot loop
 # ---------------------------------------------------------------------------
+
+def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
+                  threshold=0.85, bls_threshold=0.001, checkpoint=DEFAULT_CHECKPOINT,
+                  max_per_class=250, train_epochs=30, candidate_dir=CANDIDATE_DIR,
+                  state_file=STATE_FILE, strategy_profile=None,
+                  period_min=1.0, period_max=15.0, nperiods=10000):
+    """Core autopilot logic, callable without CLI arg parsing.
+
+    Returns summary dict with sectors_done, total_candidates, elapsed_hours.
+    """
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    from device_util import print_hw_report
+    print_hw_report()
+
+    if not _bootstrap_model(checkpoint, max_per_class, train_epochs):
+        logger.error("Cannot proceed without a trained model. Exiting.")
+        return {"sectors_done": 0, "total_candidates": 0, "elapsed_hours": 0}
+
+    logger.info("Fetching known TOI list for cross-matching...")
+    known_tics = _load_toi_tics()
+    logger.info("Loaded %d known TOI TICs.", len(known_tics))
+
+    state = _load_state(state_file)
+    completed = set(state.get("completed_sectors", []))
+    os.makedirs(candidate_dir, exist_ok=True)
+
+    autopilot_start = _time.time()
+    sectors_done_this_run = 0
+    total_candidates = 0
+
+    logger.info("=" * 60)
+    logger.info("AUTOPILOT ENGAGED — sectors %d through %d", start_sector, end_sector)
+    logger.info("=" * 60)
+
+    for sector in range(start_sector, end_sector + 1):
+        if _shutdown_requested:
+            logger.info("Shutdown requested — stopping before sector %d.", sector)
+            break
+
+        if sector in completed:
+            logger.info("Sector %d already completed — skipping.", sector)
+            continue
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("SECTOR %d", sector)
+        logger.info("=" * 60)
+
+        state["current_sector"] = sector
+        _save_state(state_file, state)
+
+        sector_start = _time.time()
+        _run_sector(
+            sector=sector, limit=limit, checkpoint=checkpoint,
+            threshold=threshold, bls_threshold=bls_threshold,
+            candidate_dir=candidate_dir,
+            period_min=period_min, period_max=period_max,
+            nperiods=nperiods, strategy_profile=strategy_profile,
+        )
+        sector_elapsed = _time.time() - sector_start
+
+        known_count, new_count = _cross_match_candidates(candidate_dir, known_tics)
+        total_candidates += known_count + new_count
+
+        completed.add(sector)
+        state["completed_sectors"] = sorted(completed)
+        state["current_sector"] = None
+        _save_state(state_file, state)
+
+        sectors_done_this_run += 1
+        total_elapsed_h = (_time.time() - autopilot_start) / 3600
+
+        logger.info("")
+        logger.info("--- Sector %d Summary ---", sector)
+        logger.info("  Time: %.1f minutes", sector_elapsed / 60)
+        logger.info("  Candidates (cumulative): %d total (%d known TOIs, %d new)",
+                     known_count + new_count, known_count, new_count)
+        if new_count > 0:
+            logger.info("  *** %d NEW CANDIDATE(s) not in TOI list! Check candidates/ ***", new_count)
+        logger.info("  Sectors completed this run: %d (%.1f hours elapsed)",
+                     sectors_done_this_run, total_elapsed_h)
+        logger.info("-" * 40)
+
+    elapsed_hours = (_time.time() - autopilot_start) / 3600
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("AUTOPILOT COMPLETE")
+    logger.info("  Sectors processed this run: %d", sectors_done_this_run)
+    logger.info("  Total candidates found: %d", total_candidates)
+    logger.info("  Total time: %.1f hours", elapsed_hours)
+    logger.info("=" * 60)
+
+    return {
+        "sectors_done": sectors_done_this_run,
+        "total_candidates": total_candidates,
+        "elapsed_hours": round(elapsed_hours, 2),
+    }
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -201,95 +294,21 @@ def main():
                         help="Training epochs during bootstrap")
     parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
     parser.add_argument("--state-file", type=str, default=STATE_FILE)
+    parser.add_argument("--strategy-profile", type=str, default=None)
+    parser.add_argument("--period-min", type=float, default=1.0)
+    parser.add_argument("--period-max", type=float, default=15.0)
+    parser.add_argument("--nperiods", type=int, default=10000)
     args = parser.parse_args()
-
-    signal.signal(signal.SIGINT, _handle_sigint)
-
-    from device_util import print_hw_report
-    print_hw_report()
-
-    # --- Bootstrap model ---
-    if not _bootstrap_model(args.checkpoint, args.max_per_class, args.train_epochs):
-        logger.error("Cannot proceed without a trained model. Exiting.")
-        sys.exit(1)
-
-    # --- Load TOI list for cross-matching ---
-    logger.info("Fetching known TOI list for cross-matching...")
-    known_tics = _load_toi_tics()
-    logger.info("Loaded %d known TOI TICs.", len(known_tics))
-
-    # --- Sector loop ---
-    state = _load_state(args.state_file)
-    completed = set(state.get("completed_sectors", []))
-    os.makedirs(args.candidate_dir, exist_ok=True)
-
-    autopilot_start = _time.time()
-    sectors_done_this_run = 0
-    total_candidates = 0
-
-    logger.info("=" * 60)
-    logger.info("AUTOPILOT ENGAGED — sectors %d through %d", args.start_sector, args.end_sector)
-    logger.info("=" * 60)
-
-    for sector in range(args.start_sector, args.end_sector + 1):
-        if _shutdown_requested:
-            logger.info("Shutdown requested — stopping before sector %d.", sector)
-            break
-
-        if sector in completed:
-            logger.info("Sector %d already completed — skipping.", sector)
-            continue
-
-        logger.info("")
-        logger.info("=" * 60)
-        logger.info("SECTOR %d", sector)
-        logger.info("=" * 60)
-
-        state["current_sector"] = sector
-        _save_state(args.state_file, state)
-
-        sector_start = _time.time()
-        _run_sector(
-            sector=sector,
-            limit=args.limit,
-            checkpoint=args.checkpoint,
-            threshold=args.threshold,
-            bls_threshold=args.bls_threshold,
-            candidate_dir=args.candidate_dir,
-        )
-        sector_elapsed = _time.time() - sector_start
-
-        # Cross-match candidates
-        known_count, new_count = _cross_match_candidates(args.candidate_dir, known_tics)
-        total_candidates += known_count + new_count
-
-        # Mark sector done
-        completed.add(sector)
-        state["completed_sectors"] = sorted(completed)
-        state["current_sector"] = None
-        _save_state(args.state_file, state)
-
-        sectors_done_this_run += 1
-        total_elapsed_h = (_time.time() - autopilot_start) / 3600
-
-        logger.info("")
-        logger.info("--- Sector %d Summary ---", sector)
-        logger.info("  Time: %.1f minutes", sector_elapsed / 60)
-        logger.info("  Candidates (cumulative): %d total (%d known TOIs, %d new)",
-                     known_count + new_count, known_count, new_count)
-        if new_count > 0:
-            logger.info("  *** %d NEW CANDIDATE(s) not in TOI list! Check candidates/ ***", new_count)
-        logger.info("  Sectors completed this run: %d (%.1f hours elapsed)",
-                     sectors_done_this_run, total_elapsed_h)
-        logger.info("-" * 40)
-
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("AUTOPILOT COMPLETE")
-    logger.info("  Sectors processed this run: %d", sectors_done_this_run)
-    logger.info("  Total candidates found: %d", total_candidates)
-    logger.info("  Total time: %.1f hours", (_time.time() - autopilot_start) / 3600)
-    logger.info("=" * 60)
+    return run_autopilot(
+        start_sector=args.start_sector, end_sector=args.end_sector,
+        limit=args.limit, threshold=args.threshold,
+        bls_threshold=args.bls_threshold, checkpoint=args.checkpoint,
+        max_per_class=args.max_per_class, train_epochs=args.train_epochs,
+        candidate_dir=args.candidate_dir, state_file=args.state_file,
+        strategy_profile=args.strategy_profile,
+        period_min=args.period_min, period_max=args.period_max,
+        nperiods=args.nperiods,
+    )
 
 
 if __name__ == "__main__":

@@ -315,6 +315,175 @@ def unfreeze_last_n_blocks(model, n: int = 2):
 # Main
 # ---------------------------------------------------------------------------
 
+def run_train(data=None, pretrained=None, epochs=30, batch_size=32,
+              lr=1e-3, finetune_lr=1e-4, freeze_epochs=5, unfreeze_blocks=2,
+              out="models/checkpoints/resnet1d.pt", seed=42, patience=7,
+              amp=False, max_per_class=250, grad_accum=1):
+    """Core training logic, callable without CLI arg parsing.
+
+    Returns final metrics dict or None on failure.
+    """
+    if not TORCH_AVAILABLE:
+        logger.error("PyTorch is required. Install with: pip install torch")
+        return None
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # ---- Data ----
+    if data == "auto":
+        manifest = build_labeled_dataset_from_archive(max_per_class=max_per_class)
+        if manifest is None:
+            return None
+        global_views, local_views, centroid_offsets, labels = load_csv_data(manifest)
+    elif data is not None:
+        path = Path(data)
+        if path.suffix.lower() == ".csv":
+            global_views, local_views, centroid_offsets, labels = load_csv_data(str(path))
+        else:
+            logger.error("--data must be a CSV file or 'auto'")
+            return None
+    else:
+        logger.warning("No --data provided; using small synthetic dataset for demo.")
+        n = 200
+        global_views = [np.random.randn(2048).astype(np.float32) for _ in range(n)]
+        local_views = [np.random.randn(256).astype(np.float32) for _ in range(n)]
+        centroid_offsets = np.random.rand(n).astype(np.float32)
+        labels = (np.random.rand(n) > 0.5).astype(np.int64)
+
+    n_total = len(labels) if hasattr(labels, '__len__') else len(global_views)
+    n_val = max(1, n_total // 5)
+    n_train = n_total - n_val
+    indices = np.random.permutation(n_total)
+    train_idx, val_idx = indices[:n_train], indices[n_train:]
+
+    gv, lv = np.asarray(global_views, dtype=np.float32), np.asarray(local_views, dtype=np.float32)
+    co_all = np.asarray(centroid_offsets, dtype=np.float32)
+    lb = np.asarray(labels, dtype=np.int64)
+    train_ds = LightCurveDataset(gv[train_idx], lv[train_idx], co_all[train_idx], lb[train_idx], augment=True)
+    val_ds = LightCurveDataset(gv[val_idx], lv[val_idx], co_all[val_idx], lb[val_idx], augment=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=batch_size)
+
+    from device_util import get_device, get_amp_config
+    device = get_device()
+    logger.info("Device: %s", device)
+
+    # ---- Model ----
+    if pretrained:
+        model = load_checkpoint(pretrained, device=device, strict=False)
+        logger.info("Loaded pretrained checkpoint from %s", pretrained)
+    else:
+        model = ResNet1DClassifier(use_centroid=True).to(device)
+    logger.info("Model parameters: %s", f"{count_parameters(model):,}")
+
+    criterion = nn.CrossEntropyLoss()
+    amp_cfg = get_amp_config(device)
+    scaler = torch.GradScaler(device.type) if (amp and amp_cfg["enabled"] and amp_cfg["use_scaler"]) else None
+    amp_device_type = amp_cfg["device_type"] if (amp and amp_cfg["enabled"]) else None
+
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    best_f1 = -1.0
+    patience_counter = 0
+
+    # ---- Stage 1: frozen backbone (if fine-tuning) ----
+    stage1_epochs = freeze_epochs if pretrained else 0
+    if stage1_epochs > 0:
+        freeze_backbone(model)
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+        )
+        logger.info("=== Stage 1: frozen backbone for %d epochs ===", stage1_epochs)
+        for epoch in range(stage1_epochs):
+            t0 = _time.time()
+            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_device_type)
+            val_loss, val_acc, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
+            m = compute_metrics(probs, lbls, preds)
+            elapsed = _time.time() - t0
+            logger.info(
+                "S1 Epoch %d/%d [%.1fs] train_loss=%.4f train_acc=%.4f | "
+                "val_loss=%.4f val_acc=%.4f F1=%.4f P=%.4f R=%.4f",
+                epoch + 1, stage1_epochs, elapsed,
+                train_loss, train_acc, val_loss, val_acc,
+                m["f1"], m["precision"], m["recall"],
+            )
+            if m["f1"] > best_f1:
+                best_f1 = m["f1"]
+                _save_checkpoint(model, out, epoch, m)
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+    # ---- Stage 2: unfreeze last blocks ----
+    if pretrained:
+        unfreeze_last_n_blocks(model, unfreeze_blocks)
+    for param in model.parameters():
+        param.requires_grad = True
+    lr2 = finetune_lr if pretrained else lr
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr2
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+
+    remaining_epochs = epochs - stage1_epochs
+    logger.info("=== Stage 2: full training for %d epochs (lr=%.1e) ===", remaining_epochs, lr2)
+    patience_counter = 0
+
+    for epoch in range(remaining_epochs):
+        t0 = _time.time()
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_device_type)
+        val_loss, val_acc, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
+        m = compute_metrics(probs, lbls, preds)
+        scheduler.step(m["f1"])
+        elapsed = _time.time() - t0
+        extra = ""
+        if "roc_auc" in m:
+            extra = f" ROC-AUC={m['roc_auc']:.4f} PR-AUC={m['pr_auc']:.4f}"
+        logger.info(
+            "S2 Epoch %d/%d [%.1fs] train_loss=%.4f train_acc=%.4f | "
+            "val_loss=%.4f val_acc=%.4f F1=%.4f P=%.4f R=%.4f%s",
+            epoch + 1, remaining_epochs, elapsed,
+            train_loss, train_acc, val_loss, val_acc,
+            m["f1"], m["precision"], m["recall"], extra,
+        )
+        if m["f1"] > best_f1:
+            best_f1 = m["f1"]
+            _save_checkpoint(model, out, stage1_epochs + epoch, m)
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, patience)
+                break
+
+    # ---- Final evaluation ----
+    best_ckpt = torch.load(out, map_location=device, weights_only=False)
+    model.load_state_dict(best_ckpt["model"])
+    _, _, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
+    final_m = compute_metrics(probs, lbls, preds)
+    logger.info("=== Final metrics (best checkpoint) ===")
+    logger.info("  F1=%.4f  Precision=%.4f  Recall=%.4f", final_m["f1"], final_m["precision"], final_m["recall"])
+    if "roc_auc" in final_m:
+        logger.info("  ROC-AUC=%.4f  PR-AUC=%.4f", final_m["roc_auc"], final_m["pr_auc"])
+    cm = final_m["confusion_matrix"]
+    logger.info("  Confusion: TP=%d FP=%d FN=%d TN=%d", cm["tp"], cm["fp"], cm["fn"], cm["tn"])
+
+    metrics_path = Path(out).with_suffix(".metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(final_m, f, indent=2)
+    logger.info("Metrics saved to %s", metrics_path)
+    return final_m
+
+
+def _save_checkpoint(model, path, epoch, metrics):
+    torch.save({
+        "model": model.state_dict(),
+        "epoch": epoch,
+        "metrics": metrics,
+    }, path)
+    logger.info("Saved best checkpoint to %s (F1=%.4f)", path, metrics["f1"])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train / fine-tune ResNet-1D exoplanet classifier")
     parser.add_argument("--data", type=str, default=None,
@@ -339,165 +508,13 @@ def main():
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps (for small VRAM)")
     args = parser.parse_args()
-
-    if not TORCH_AVAILABLE:
-        logger.error("PyTorch is required. Install with: pip install torch")
-        sys.exit(1)
-
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-
-    # ---- Data ----
-    if args.data == "auto":
-        manifest = build_labeled_dataset_from_archive(max_per_class=args.max_per_class)
-        if manifest is None:
-            sys.exit(1)
-        global_views, local_views, centroid_offsets, labels = load_csv_data(manifest)
-    elif args.data is not None:
-        path = Path(args.data)
-        if path.suffix.lower() == ".csv":
-            global_views, local_views, centroid_offsets, labels = load_csv_data(str(path))
-        else:
-            logger.error("--data must be a CSV file or 'auto'")
-            sys.exit(1)
-    else:
-        logger.warning("No --data provided; using small synthetic dataset for demo.")
-        n = 200
-        global_views = [np.random.randn(2048).astype(np.float32) for _ in range(n)]
-        local_views = [np.random.randn(256).astype(np.float32) for _ in range(n)]
-        centroid_offsets = np.random.rand(n).astype(np.float32)
-        labels = (np.random.rand(n) > 0.5).astype(np.int64)
-
-    n_total = len(labels) if hasattr(labels, '__len__') else len(global_views)
-    n_val = max(1, n_total // 5)
-    n_train = n_total - n_val
-    indices = np.random.permutation(n_total)
-    train_idx, val_idx = indices[:n_train], indices[n_train:]
-
-    gv, lv = np.asarray(global_views, dtype=np.float32), np.asarray(local_views, dtype=np.float32)
-    co_all = np.asarray(centroid_offsets, dtype=np.float32)
-    lb = np.asarray(labels, dtype=np.int64)
-    train_ds = LightCurveDataset(gv[train_idx], lv[train_idx], co_all[train_idx], lb[train_idx], augment=True)
-    val_ds = LightCurveDataset(gv[val_idx], lv[val_idx], co_all[val_idx], lb[val_idx], augment=False)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size)
-
-    from device_util import get_device, get_amp_config
-    device = get_device()
-    logger.info("Device: %s", device)
-
-    # ---- Model ----
-    if args.pretrained:
-        model = load_checkpoint(args.pretrained, device=device, strict=False)
-        logger.info("Loaded pretrained checkpoint from %s", args.pretrained)
-    else:
-        model = ResNet1DClassifier(use_centroid=True).to(device)
-    logger.info("Model parameters: %s", f"{count_parameters(model):,}")
-
-    criterion = nn.CrossEntropyLoss()
-    amp_cfg = get_amp_config(device)
-    scaler = torch.GradScaler(device.type) if (args.amp and amp_cfg["enabled"] and amp_cfg["use_scaler"]) else None
-    amp_device_type = amp_cfg["device_type"] if (args.amp and amp_cfg["enabled"]) else None
-
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    best_f1 = -1.0
-    patience_counter = 0
-
-    # ---- Stage 1: frozen backbone (if fine-tuning) ----
-    stage1_epochs = args.freeze_epochs if args.pretrained else 0
-    if stage1_epochs > 0:
-        freeze_backbone(model)
-        optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
-        )
-        logger.info("=== Stage 1: frozen backbone for %d epochs ===", stage1_epochs)
-        for epoch in range(stage1_epochs):
-            t0 = _time.time()
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_device_type)
-            val_loss, val_acc, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
-            m = compute_metrics(probs, lbls, preds)
-            elapsed = _time.time() - t0
-            logger.info(
-                "S1 Epoch %d/%d [%.1fs] train_loss=%.4f train_acc=%.4f | "
-                "val_loss=%.4f val_acc=%.4f F1=%.4f P=%.4f R=%.4f",
-                epoch + 1, stage1_epochs, elapsed,
-                train_loss, train_acc, val_loss, val_acc,
-                m["f1"], m["precision"], m["recall"],
-            )
-            if m["f1"] > best_f1:
-                best_f1 = m["f1"]
-                _save_checkpoint(model, args.out, epoch, m)
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-    # ---- Stage 2: unfreeze last blocks ----
-    if args.pretrained:
-        unfreeze_last_n_blocks(model, args.unfreeze_blocks)
-    for param in model.parameters():
-        param.requires_grad = True
-    lr2 = args.finetune_lr if args.pretrained else args.lr
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr2
+    return run_train(
+        data=args.data, pretrained=args.pretrained, epochs=args.epochs,
+        batch_size=args.batch_size, lr=args.lr, finetune_lr=args.finetune_lr,
+        freeze_epochs=args.freeze_epochs, unfreeze_blocks=args.unfreeze_blocks,
+        out=args.out, seed=args.seed, patience=args.patience, amp=args.amp,
+        max_per_class=args.max_per_class, grad_accum=args.grad_accum,
     )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
-
-    remaining_epochs = args.epochs - stage1_epochs
-    logger.info("=== Stage 2: full training for %d epochs (lr=%.1e) ===", remaining_epochs, lr2)
-    patience_counter = 0
-
-    for epoch in range(remaining_epochs):
-        t0 = _time.time()
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device, scaler, amp_device_type)
-        val_loss, val_acc, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
-        m = compute_metrics(probs, lbls, preds)
-        scheduler.step(m["f1"])
-        elapsed = _time.time() - t0
-        extra = ""
-        if "roc_auc" in m:
-            extra = f" ROC-AUC={m['roc_auc']:.4f} PR-AUC={m['pr_auc']:.4f}"
-        logger.info(
-            "S2 Epoch %d/%d [%.1fs] train_loss=%.4f train_acc=%.4f | "
-            "val_loss=%.4f val_acc=%.4f F1=%.4f P=%.4f R=%.4f%s",
-            epoch + 1, remaining_epochs, elapsed,
-            train_loss, train_acc, val_loss, val_acc,
-            m["f1"], m["precision"], m["recall"], extra,
-        )
-        if m["f1"] > best_f1:
-            best_f1 = m["f1"]
-            _save_checkpoint(model, args.out, stage1_epochs + epoch, m)
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= args.patience:
-                logger.info("Early stopping at epoch %d (patience=%d)", epoch + 1, args.patience)
-                break
-
-    # ---- Final evaluation ----
-    best_ckpt = torch.load(args.out, map_location=device, weights_only=False)
-    model.load_state_dict(best_ckpt["model"])
-    _, _, probs, lbls, preds = evaluate(model, val_loader, criterion, device)
-    final_m = compute_metrics(probs, lbls, preds)
-    logger.info("=== Final metrics (best checkpoint) ===")
-    logger.info("  F1=%.4f  Precision=%.4f  Recall=%.4f", final_m["f1"], final_m["precision"], final_m["recall"])
-    if "roc_auc" in final_m:
-        logger.info("  ROC-AUC=%.4f  PR-AUC=%.4f", final_m["roc_auc"], final_m["pr_auc"])
-    cm = final_m["confusion_matrix"]
-    logger.info("  Confusion: TP=%d FP=%d FN=%d TN=%d", cm["tp"], cm["fp"], cm["fn"], cm["tn"])
-
-    metrics_path = Path(args.out).with_suffix(".metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(final_m, f, indent=2)
-    logger.info("Metrics saved to %s", metrics_path)
-
-
-def _save_checkpoint(model, path, epoch, metrics):
-    torch.save({
-        "model": model.state_dict(),
-        "epoch": epoch,
-        "metrics": metrics,
-    }, path)
-    logger.info("Saved best checkpoint to %s (F1=%.4f)", path, metrics["f1"])
 
 
 if __name__ == "__main__":

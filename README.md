@@ -8,10 +8,11 @@ Autonomous exoplanet detection pipeline for NASA TESS data. Preprocesses light c
 uv venv && source .venv/bin/activate
 uv pip install --native-tls -r requirements.txt
 
-# Fully autonomous — trains model, then hunts every sector
-python run.py autopilot
+# --- Streamlit Control Center (recommended) ---
+streamlit run app.py
 
-# Or step by step:
+# --- CLI (same functionality) ---
+python run.py autopilot                           # fully autonomous
 python run.py scan  "TIC 441462736"              # analyze one star
 python run.py hunt  --sector 15 --limit 100       # sweep a sector
 python run.py train --data auto --epochs 30       # train the classifier
@@ -62,6 +63,7 @@ python run.py scan "TIC 441462736" --predict
 
 ```bash
 python run.py hunt --sector 15 --limit 10000 --threshold 0.85
+python run.py hunt --sector 15 --strategy-profile ultra_short_period
 ```
 
 Stage-level resume: if your laptop crashes, each TIC resumes from its last completed phase.
@@ -86,12 +88,45 @@ periods, power, best_period, epoch = run_phase2(time, flux, tic_id="441462736", 
 global_view, local_view, centroid_offset = run_phase3(time, flux, best_period, epoch, tic_id="441462736", sector=sector, use_cache=True)
 ```
 
+### Service layer (programmatic access)
+
+```python
+from services import run_scan, ScanConfig
+
+result = run_scan(ScanConfig(tic_id="TIC 441462736", predict=True))
+print(result["best_period"], result.get("prediction"))
+```
+
+## Strategy Profiles
+
+Select a detection niche to tune BLS parameters, thresholds, and scoring heuristics. Available via `--strategy-profile` on CLI or the sidebar dropdown in the Streamlit dashboard.
+
+| Profile | Period Range | BLS Threshold | Best For |
+|---------|-------------|---------------|----------|
+| `balanced` | 1 – 15 d | 0.001 | General-purpose search |
+| `ultra_short_period` | 0.2 – 1 d | 0.002 | Hot, close-in planets |
+| `single_transit_long_period` | 10 – 100 d | 0.0005 | Single/few-transit events |
+| `low_snr_m_dwarf` | 0.5 – 20 d | 0.0003 | Faint M-dwarf hosts |
+
+## Streamlit Dashboard
+
+Launch the full control center:
+
+```bash
+streamlit run app.py
+```
+
+Tabs: **Scan** (single target), **Hunt** (sector sweep), **Train** (model training), **Autopilot** (autonomous multi-sector), **Candidates** (browse/rank/export), **Logs** (timing, state, task output).
+
+Long-running tasks (Hunt, Train, Autopilot) run as background processes. Progress is polled from state files. All strategy profiles are selectable from the sidebar.
+
 ## Tuning Guide
 
 | Parameter | Where | Default | Notes |
 |-----------|-------|---------|-------|
-| `--bls-threshold` | hunter / autopilot | 0.001 | Lower = more stars pass to AI |
-| `--threshold` | hunter / autopilot | 0.85 | Probability cutoff for "CANDIDATE" |
+| `--strategy-profile` | hunter / autopilot | balanced | Niche preset: balanced, ultra_short_period, single_transit_long_period, low_snr_m_dwarf |
+| `--bls-threshold` | hunter / autopilot | 0.001 | Lower = more stars pass to AI (overridden by profile) |
+| `--threshold` | hunter / autopilot | 0.85 | Probability cutoff for "CANDIDATE" (overridden by profile) |
 | `coarse_nperiods` | bls_gpu.py | 2000 | More = slower coarse pass but fewer missed peaks |
 | `refine_nperiods` | bls_gpu.py | 3000 | More = finer period resolution |
 | `downsample_limit` | bls_gpu.py | 80000 | Cadences above this are downsampled before BLS |
@@ -102,7 +137,10 @@ global_view, local_view, centroid_offset = run_phase3(time, flux, best_period, e
 
 ```
 Exoplanet-detector/
-├── run.py                   # Unified launcher (scan / hunt / train / autopilot)
+├── app.py                   # Streamlit dashboard (streamlit run app.py)
+├── services.py              # Orchestration service layer (typed configs + runners)
+├── strategy_profiles.py     # Niche detection strategy profiles + scoring
+├── run.py                   # Unified CLI launcher (scan / hunt / train / autopilot)
 ├── autopilot.py             # Multi-sector autonomous loop + TOI cross-matching
 ├── device_util.py           # Auto hardware detection (CUDA / MPS / CPU)
 ├── hunter.py                # Single-sector hunter with batched inference
@@ -131,6 +169,7 @@ Runtime artifacts (not committed): `cache/`, `candidates/`, `autopilot_state.jso
 - astroquery (MAST sector queries + NASA Exoplanet Archive)
 - scikit-learn (ROC-AUC / PR-AUC metrics)
 - matplotlib (candidate plots)
+- streamlit (web dashboard)
 - tqdm
 
 ## References

@@ -21,3 +21,6 @@ matplotlib>=3.5.0
 
 # Metrics (optional but recommended for training)
 scikit-learn>=1.0.0
+
+# Streamlit dashboard
+streamlit>=1.30.0
