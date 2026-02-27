@@ -1,28 +1,23 @@
-# Core dependencies for exoplanet detection pipeline
+# TESS exoplanet pipeline (Phase 1-4)
 lightkurve>=2.0.0
 astropy>=5.0.0
 numpy>=1.21.0
 pandas>=1.3.0
 scipy>=1.7.0
 
-# Visualization (optional)
-matplotlib>=3.5.0
-plotly>=5.0.0
-seaborn>=0.11.0
+# GPU BLS (optional; NumPy fallback if not installed)
+jax>=0.4.0
+jaxlib>=0.4.0
 
-# Scientific computing and machine learning
-scikit-learn>=1.0.0
-joblib>=1.1.0
+# ResNet-1D classifier
+torch>=1.12.0
 
-# Transit modeling (optional)
-batman-package>=2.4.0
-
-# Astronomical databases (optional)
+# Optional: labels / centroid vetting
 astroquery>=0.4.0
 
-# Web interface (for app.py)
-streamlit>=1.28.0
-requests>=2.25.0
-
-# Additional utilities
+# Utilities
 tqdm>=4.64.0
+matplotlib>=3.5.0
+
+# Metrics (optional but recommended for training)
+scikit-learn>=1.0.0
