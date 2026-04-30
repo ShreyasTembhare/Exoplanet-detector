@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install lightweight test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas scipy astropy pytest ruff
+          # Skip heavy deps (torch, jax, lightkurve) for unit tests; the test
+          # suite only needs them in optional codepaths and gracefully degrades.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Lint
+        run: |
+          ruff check . || true
+
+      - name: Run unit tests
+        run: |
+          python -m pytest tests/test_cache.py tests/test_bls.py tests/test_vetting.py -q

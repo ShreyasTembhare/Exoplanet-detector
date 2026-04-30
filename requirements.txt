@@ -1,26 +1,43 @@
-# TESS exoplanet pipeline (Phase 1-4)
+# TESS exoplanet pipeline (Phases 1-9)
 lightkurve>=2.0.0
 astropy>=5.0.0
 numpy>=1.21.0,<2.0.0
 pandas>=1.3.0
 scipy>=1.7.0
 
-# GPU BLS (optional; NumPy fallback if not installed)
+# GPU BLS (NumPy / Astropy fallback if absent)
 jax>=0.4.0
 jaxlib>=0.4.0
 
-# ResNet-1D classifier
-torch>=1.12.0
+# Optional CUDA BLS
+# cuvarbase>=0.2.0  # uncomment if you have a CUDA toolchain
 
-# Optional: labels / centroid vetting
+# ResNet-1D / two-tower classifier
+torch>=1.12.0
+einops>=0.6.0  # for transformer detector (Phase 7)
+
+# Phase 5: Transit Least Squares refiner
+transitleastsquares>=1.0.31
+
+# Phase 4 injection-recovery (synthetic transits)
+batman-package>=2.4.9
+
+# Catalog queries (TOI labels, TPF / centroid, Gaia)
 astroquery>=0.4.0
+
+# Optional pixel-level vetting (Phase 3)
+# tesscentroidvetting>=0.1.0  # uncomment if needed
 
 # Utilities
 tqdm>=4.64.0
 matplotlib>=3.5.0
 
-# Metrics (optional but recommended for training)
+# Metrics
 scikit-learn>=1.0.0
 
 # Streamlit dashboard
 streamlit>=1.30.0
+
+# Tests / lint (Phase 9)
+pytest>=7.0.0
+ruff>=0.1.0

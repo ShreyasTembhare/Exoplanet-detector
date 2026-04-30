@@ -1,182 +1,106 @@
-# TESS Exoplanet Detector (GPU BLS + ResNet-1D)
+# TESS Exoplanet Detector
 
-Autonomous exoplanet detection pipeline for NASA TESS data. Preprocesses light curves, runs GPU-accelerated BLS periodograms, extracts phase-folded features, and classifies candidates with a ResNet-1D neural network. Includes a fully autonomous **autopilot** mode that trains a model, sweeps all TESS sectors, and cross-matches discoveries against known catalogs.
+End-to-end TESS pipeline: download light curves, detrend, run BLS (and optionally TLS) periodograms, fold + vet candidates, classify with a two-tower ResNet-1D (and optionally an ExoMiner++-style multi-input vetter or a transformer detector for raw light curves), and export TFOP-compatible discovery packets.
 
-## Quick Start
+## Quick start
 
 ```bash
 uv venv && source .venv/bin/activate
 uv pip install --native-tls -r requirements.txt
 
-# --- Streamlit Control Center (recommended) ---
+# Streamlit dashboard
 streamlit run app.py
 
-# --- CLI (same functionality) ---
-python run.py autopilot                           # fully autonomous
-python run.py scan  "TIC 441462736"              # analyze one star
-python run.py hunt  --sector 15 --limit 100       # sweep a sector
-python run.py train --data auto --epochs 30       # train the classifier
+# CLI
+python run.py scan      "TIC 441462736" --predict
+python run.py hunt      --sector 15 --limit 100
+python run.py phunt     --sector 15 --limit 1000 --download-workers 8 --cpu-workers 4
+python run.py train     --data auto --epochs 30 --max-per-class 2500
+python run.py pretrain  mlm --epochs 10
+python run.py autopilot --start-sector 1 --end-sector 26
 ```
 
 Hardware is auto-detected: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
 
 ## Architecture
 
-- **Phase 1 (CPU):** TESS light curves via lightkurve; Savitzky-Golay flatten (`window_length=101`); 3-sigma sigma-clipping.
-- **Phase 2 (GPU):** Two-pass BLS periodogram (coarse 2000 periods -> refine 3000 around peak) with JAX or NumPy fallback. Auto-selects backend based on cadence count.
-- **Phase 3:** Fold on best period -> global view (2048 bins), local transit view (256 bins); centroid offset from TPF.
-- **Phase 4:** ResNet-1D classifier: two channels (global + local), centroid scalar; binary planet vs false positive.
+```
+[MAST / lightkurve] -> Phase 1: download + quality_bitmask + same-author stitch + cadence-aware Savitzky-Golay flatten + 3-sigma clip + TPF cache
+                    -> Prefilter: CDPP, Tmag, contamination, sector count
+                    -> Phase 2: GPU BLS (JAX-jit / cuvarbase / Astropy / NumPy backends), top-k peaks with NMS, SDE > 7 gate
+                    -> Phase 5: optional TLS refinement on BLS top peaks
+                    -> Phase 3: fold (global 2048 + local 256 + local-centered 128 + periodogram 1024) + centroid + difference image + vetting metrics (SDE, depth, duration, n_transits, odd/even, secondary, V/U, Gaia neighbors, TOI ephemeris match)
+                    -> Phase 4 model: TwoTowerResNet1D (1.07M params) -> binary planet/FP
+                    -> Phase 6 model: ExoMinerVetter (multi-input late-fusion, 1.3M params)
+                    -> Phase 7 model: TransformerDetector (per-cadence, period-agnostic; for single-transit + long-period discovery)
+                    -> Save candidates with full vetting JSON; export TFOP discovery packets
+```
 
-## Setup
+Self-supervised pretraining (Phase 8) of the two-tower or transformer encoders is supported via `python run.py pretrain {mlm,simclr}`.
+
+## Pipeline modules
+
+| Module | Purpose |
+|---|---|
+| [`pipeline/phase1_preprocess.py`](pipeline/phase1_preprocess.py) | Download + quality + same-author stitch + cadence-aware flatten + TPF |
+| [`pipeline/prefilter.py`](pipeline/prefilter.py) | Cheap O(N) gates on CDPP / magnitude / contamination |
+| [`pipeline/bls_gpu.py`](pipeline/bls_gpu.py) | Multi-backend BLS, top-k peaks, SDE |
+| [`pipeline/physical_priors.py`](pipeline/physical_priors.py) | Kepler-3rd-law adaptive transit duration grid |
+| [`pipeline/tls_refine.py`](pipeline/tls_refine.py) | Phase 5 Transit Least Squares refiner |
+| [`pipeline/fold_features.py`](pipeline/fold_features.py) | Global / local / local-centered / periodogram views |
+| [`pipeline/vetting.py`](pipeline/vetting.py) | Depth, duration, odd/even, secondary, V/U, centroid, Gaia, TOI match |
+| [`pipeline/centroid_vetting.py`](pipeline/centroid_vetting.py) | Optional `tesscentroidvetting` wrapper |
+| [`pipeline/cache_io.py`](pipeline/cache_io.py) | Atomic-write cache for all phases (correctness-fixed in Phase 0) |
+| [`models/resnet1d.py`](models/resnet1d.py) | TwoTowerResNet1D + legacy single-tower |
+| [`models/exominer.py`](models/exominer.py) | ExoMiner++-style multi-input vetter |
+| [`models/transformer_detector.py`](models/transformer_detector.py) | Encoder-only transformer for raw LC |
+| [`hunter.py`](hunter.py) | Sequential sector hunter, SDE-gated, TPF-aware |
+| [`parallel_hunter.py`](parallel_hunter.py) | Producer-consumer parallel hunter |
+| [`autopilot.py`](autopilot.py) | Multi-sector loop with TOI cross-match |
+| [`train_classifier.py`](train_classifier.py) | TOI-only labels, focal loss, sector-disjoint val, two-tower head |
+| [`pretrain_ssl.py`](pretrain_ssl.py) | Masked-modeling and SimCLR pretraining |
+| [`exports/tfop_packet.py`](exports/tfop_packet.py) | TFOP-compatible JSON exporter |
+
+## Strategy profiles
+
+| Profile | Period range | SDE gate | Best for |
+|---|---|---|---|
+| `balanced` | 0.5 – 15 d | 7.0 | General-purpose |
+| `ultra_short_period` | 0.2 – 1 d | 8.0 | Hot, close-in planets |
+| `single_transit_long_period` | 10 – 100 d | 6.0 | Few-transit / long-period |
+| `low_snr_m_dwarf` | 0.5 – 20 d | 6.0 | Faint M-dwarf hosts |
+
+## Tests
 
 ```bash
-uv venv && source .venv/bin/activate
-uv pip install --native-tls -r requirements.txt
+make test            # full pytest suite
+make smoke           # cache + BLS + vetting tests only
 ```
 
-Optional: Install JAX with GPU support for faster BLS (see [JAX install](https://github.com/google/jax#installation)).
-
-## Usage
-
-All commands go through `run.py`, which auto-detects hardware and prints a report at startup.
-
-### Autopilot (fully autonomous)
-
-Trains the model if needed, then sweeps all TESS sectors indefinitely. Survives restarts (resumes from where it left off). Cross-matches candidates against the NASA TOI list.
+## Reproducibility
 
 ```bash
-python run.py autopilot
-python run.py autopilot --start-sector 15
-python run.py autopilot --limit 100               # cap stars per sector (for testing)
+make bootstrap       # create venv + install deps
+make hunt            # one sector, sequential, low limit
+make phunt           # one sector, parallel, larger limit
+make train           # full TOI training run
+make autopilot       # autonomous multi-sector
 ```
 
-New candidates are saved to `candidates/` with plots and evidence JSON. Each candidate is tagged as `KNOWN` (matches a TOI) or `NEW_CANDIDATE`.
+## Recent changes (modernization plan)
 
-### Single target
+The pipeline was overhauled in 9 phases. Headline changes:
 
-```bash
-python run.py scan "TIC 441462736"
-python run.py scan "TIC 441462736" --predict
-```
-
-### Sector sweep
-
-```bash
-python run.py hunt --sector 15 --limit 10000 --threshold 0.85
-python run.py hunt --sector 15 --strategy-profile ultra_short_period
-```
-
-Stage-level resume: if your laptop crashes, each TIC resumes from its last completed phase.
-
-### Train / fine-tune classifier
-
-```bash
-python run.py train --data auto --max-per-class 250 --epochs 30 --amp
-python run.py train --pretrained models/checkpoints/pretrained.pt --epochs 30 --freeze-epochs 5
-python run.py train --data path/to/features.csv --epochs 30
-```
-
-Training includes data augmentation (Gaussian noise, phase jitter, random masking, amplitude scaling) applied automatically to the training split.
-
-### Python API
-
-```python
-from pipeline import run_phase1, run_phase2, run_phase3
-
-time, flux, flux_err, sector = run_phase1("441462736", use_cache=True)
-periods, power, best_period, epoch = run_phase2(time, flux, tic_id="441462736", sector=sector, use_cache=True)
-global_view, local_view, centroid_offset = run_phase3(time, flux, best_period, epoch, tic_id="441462736", sector=sector, use_cache=True)
-```
-
-### Service layer (programmatic access)
-
-```python
-from services import run_scan, ScanConfig
-
-result = run_scan(ScanConfig(tic_id="TIC 441462736", predict=True))
-print(result["best_period"], result.get("prediction"))
-```
-
-## Strategy Profiles
-
-Select a detection niche to tune BLS parameters, thresholds, and scoring heuristics. Available via `--strategy-profile` on CLI or the sidebar dropdown in the Streamlit dashboard.
-
-| Profile | Period Range | BLS Threshold | Best For |
-|---------|-------------|---------------|----------|
-| `balanced` | 1 – 15 d | 0.001 | General-purpose search |
-| `ultra_short_period` | 0.2 – 1 d | 0.002 | Hot, close-in planets |
-| `single_transit_long_period` | 10 – 100 d | 0.0005 | Single/few-transit events |
-| `low_snr_m_dwarf` | 0.5 – 20 d | 0.0003 | Faint M-dwarf hosts |
-
-## Streamlit Dashboard
-
-Launch the full control center:
-
-```bash
-streamlit run app.py
-```
-
-Tabs: **Scan** (single target), **Hunt** (sector sweep), **Train** (model training), **Autopilot** (autonomous multi-sector), **Candidates** (browse/rank/export), **Logs** (timing, state, task output).
-
-Long-running tasks (Hunt, Train, Autopilot) run as background processes. Progress is polled from state files. All strategy profiles are selectable from the sidebar.
-
-## Tuning Guide
-
-| Parameter | Where | Default | Notes |
-|-----------|-------|---------|-------|
-| `--strategy-profile` | hunter / autopilot | balanced | Niche preset: balanced, ultra_short_period, single_transit_long_period, low_snr_m_dwarf |
-| `--bls-threshold` | hunter / autopilot | 0.001 | Lower = more stars pass to AI (overridden by profile) |
-| `--threshold` | hunter / autopilot | 0.85 | Probability cutoff for "CANDIDATE" (overridden by profile) |
-| `coarse_nperiods` | bls_gpu.py | 2000 | More = slower coarse pass but fewer missed peaks |
-| `refine_nperiods` | bls_gpu.py | 3000 | More = finer period resolution |
-| `downsample_limit` | bls_gpu.py | 80000 | Cadences above this are downsampled before BLS |
-| `--freeze-epochs` | train_classifier.py | 5 | Epochs with frozen backbone during fine-tuning |
-| `--patience` | train_classifier.py | 7 | Early stopping patience |
-
-## Project Layout
-
-```
-Exoplanet-detector/
-├── app.py                   # Streamlit dashboard (streamlit run app.py)
-├── services.py              # Orchestration service layer (typed configs + runners)
-├── strategy_profiles.py     # Niche detection strategy profiles + scoring
-├── run.py                   # Unified CLI launcher (scan / hunt / train / autopilot)
-├── autopilot.py             # Multi-sector autonomous loop + TOI cross-matching
-├── device_util.py           # Auto hardware detection (CUDA / MPS / CPU)
-├── hunter.py                # Single-sector hunter with batched inference
-├── run_pipeline.py          # Single-target pipeline runner
-├── train_classifier.py      # Train / fine-tune with augmentation + metrics
-├── pipeline/
-│   ├── __init__.py
-│   ├── cache_io.py          # Phase 1/2/3 cache with atomic writes
-│   ├── phase1_preprocess.py
-│   ├── bls_gpu.py           # Two-pass BLS with JAX/NumPy auto backend
-│   └── fold_features.py
-├── models/
-│   └── resnet1d.py          # ResNet-1D classifier + checkpoint adapter
-├── candidates/              # Candidate plots + evidence JSON (created at runtime)
-├── requirements.txt
-└── README.md
-```
-
-Runtime artifacts (not committed): `cache/`, `candidates/`, `autopilot_state.json`, `processed_stars*.txt`, `hunter_timings.csv`, `data/`.
-
-## Dependencies
-
-- lightkurve, astropy, numpy, pandas, scipy
-- jax, jaxlib (optional; NumPy fallback for BLS)
-- torch (ResNet-1D; supports CUDA and MPS)
-- astroquery (MAST sector queries + NASA Exoplanet Archive)
-- scikit-learn (ROC-AUC / PR-AUC metrics)
-- matplotlib (candidate plots)
-- streamlit (web dashboard)
-- tqdm
-
-## References
-
-- BLS: Kovacs, Zucker & Mazeh (2002); Astropy BoxLeastSquares.
-- Centroid vetting: e.g. SSDataLab/vetting.
-- NASA TESS / lightkurve / MAST.
+- **Phase 0**: fixed a silent cache-write bug (every cache file was 0 bytes); BLS depth clamp; wrap-around fix; SDE gate replaces fixed power threshold; cadence-aware flatten; same-author stitching; flock-protected log; pytest + ruff suite.
+- **Phase 1**: BLS JAX-jit + chunked grids + float32, top-k peaks with harmonic NMS, Astropy oracle, cuvarbase optional backend, physical-prior duration grid.
+- **Phase 2**: parallel hunter (producer-consumer pipeline with download / GPU BLS / CPU folding / batched inference stages).
+- **Phase 3**: full vetting suite (centroid via TPF, odd/even, secondary, V/U, Gaia, ephemeris match) persisted to candidate JSON.
+- **Phase 4**: TOI-only labels, injection-recovery, focal loss, two-tower ResNet, sector-disjoint validation, Recall@FPR=1% as primary metric.
+- **Phase 5**: optional TLS second-stage refiner.
+- **Phase 6**: ExoMiner++-style multi-input vetter with periodogram + diff-image + scalar branches.
+- **Phase 7**: transformer detector for raw light curves (single-transit + long-period discovery path).
+- **Phase 8**: self-supervised pretraining (masked modeling + SimCLR).
+- **Phase 9**: pytest + GitHub CI + Streamlit Scan as background task + TFOP discovery packet exporter + Makefile.
 
 ## License
 
