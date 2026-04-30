@@ -1,4 +1,4 @@
-# Pipeline cache (Phase 1/2/3 .npz)
+# Pipeline cache (Phase 1/2/3 + TPF .npz)
 cache/
 
 # TESS Hunter
@@ -12,9 +12,14 @@ autopilot_state.json
 
 # Streamlit dashboard runtime
 .streamlit_tasks.json
+.task_*.log
+.scan_result.json
 
 # Training data (auto-built)
 data/
+
+# Discovery packet exports
+exports/discovery_packet*.json
 
 # Python
 __pycache__/
@@ -29,6 +34,8 @@ venv/
 .eggs/
 dist/
 build/
+.pytest_cache/
+.ruff_cache/
 
 # IDE / OS
 .idea/
