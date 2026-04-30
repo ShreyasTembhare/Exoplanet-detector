@@ -152,10 +152,35 @@ def _cross_match_candidates(candidate_dir: str, known_tics: set):
 def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
                 bls_threshold: float, sde_threshold: float, candidate_dir: str,
                 period_min: float = 0.5, period_max: float = 15.0,
-                nperiods: int = 10000, strategy_profile: str = None):
-    """Run the hunter on a single sector via the callable run_hunt() API."""
+                nperiods: int = 10000, strategy_profile: str = None,
+                parallel: bool = False, download_workers: int = 8,
+                cpu_workers: int = 4, bls_backend: str = None):
+    """Run the hunter on a single sector via the callable hunter API.
+
+    If ``parallel`` is True, dispatches to ``parallel_hunter.run_parallel_hunt``
+    (producer-consumer pipeline with parallel MAST downloads and CPU folding
+    workers); otherwise uses the sequential ``hunter.run_hunt``. Both write
+    the same ``processed_stars_sNNN.txt`` (flock-protected) and share the
+    Phase 1/2/3 cache, so resume keeps working across mode changes.
+    """
     log_file = f"processed_stars_s{sector:03d}.txt"
     try:
+        if parallel:
+            from hunter import _get_sector_target_list
+            from parallel_hunter import run_parallel_hunt
+            tics = _get_sector_target_list(sector, limit, None)
+            if not tics:
+                logger.error("No targets for sector %d.", sector)
+                return {"completed": 0, "candidates": []}
+            return run_parallel_hunt(
+                sector=sector, tics=tics,
+                period_min=period_min, period_max=period_max, nperiods=nperiods,
+                sde_threshold=sde_threshold, threshold=threshold,
+                checkpoint=checkpoint, candidate_dir=candidate_dir,
+                log_file=log_file,
+                download_workers=download_workers, cpu_workers=cpu_workers,
+                bls_backend=bls_backend,
+            )
         from hunter import run_hunt
         return run_hunt(
             sector=sector, limit=limit, threshold=threshold,
@@ -179,7 +204,9 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
                   checkpoint=DEFAULT_CHECKPOINT,
                   max_per_class=2500, train_epochs=30, candidate_dir=CANDIDATE_DIR,
                   state_file=STATE_FILE, strategy_profile=None,
-                  period_min=0.5, period_max=15.0, nperiods=10000):
+                  period_min=0.5, period_max=15.0, nperiods=10000,
+                  parallel=False, download_workers=8, cpu_workers=4,
+                  bls_backend=None):
     """Core autopilot logic, callable without CLI arg parsing.
 
     Returns summary dict with sectors_done, total_candidates, elapsed_hours.
@@ -207,6 +234,11 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
 
     logger.info("=" * 60)
     logger.info("AUTOPILOT ENGAGED — sectors %d through %d", start_sector, end_sector)
+    if parallel:
+        logger.info("Mode: PARALLEL (download_workers=%d, cpu_workers=%d)",
+                    download_workers, cpu_workers)
+    else:
+        logger.info("Mode: sequential")
     logger.info("=" * 60)
 
     for sector in range(start_sector, end_sector + 1):
@@ -234,6 +266,10 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
             candidate_dir=candidate_dir,
             period_min=period_min, period_max=period_max,
             nperiods=nperiods, strategy_profile=strategy_profile,
+            parallel=parallel,
+            download_workers=download_workers,
+            cpu_workers=cpu_workers,
+            bls_backend=bls_backend,
         )
         sector_elapsed = _time.time() - sector_start
 
@@ -302,6 +338,15 @@ def main():
     parser.add_argument("--period-min", type=float, default=0.5)
     parser.add_argument("--period-max", type=float, default=15.0)
     parser.add_argument("--nperiods", type=int, default=10000)
+    parser.add_argument("--parallel", action="store_true",
+                        help="Use the parallel hunter (producer-consumer pipeline) per sector.")
+    parser.add_argument("--download-workers", type=int, default=8,
+                        help="Parallel MAST download threads (only with --parallel).")
+    parser.add_argument("--cpu-workers", type=int, default=4,
+                        help="CPU folding/vetting workers (only with --parallel).")
+    parser.add_argument("--bls-backend", type=str, default=None,
+                        choices=[None, "jax", "numpy", "astropy", "cuvarbase"],
+                        help="BLS backend (only with --parallel; default: auto).")
     args = parser.parse_args()
     return run_autopilot(
         start_sector=args.start_sector, end_sector=args.end_sector,
@@ -313,6 +358,10 @@ def main():
         strategy_profile=args.strategy_profile,
         period_min=args.period_min, period_max=args.period_max,
         nperiods=args.nperiods,
+        parallel=args.parallel,
+        download_workers=args.download_workers,
+        cpu_workers=args.cpu_workers,
+        bls_backend=args.bls_backend,
     )
 
 

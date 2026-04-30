@@ -90,6 +90,10 @@ class AutopilotConfig:
     period_min: float = 0.5
     period_max: float = 15.0
     nperiods: int = 10000
+    parallel: bool = False
+    download_workers: int = 8
+    cpu_workers: int = 4
+    bls_backend: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +196,10 @@ def run_autopilot(config: AutopilotConfig) -> dict:
         period_min=config.period_min,
         period_max=config.period_max,
         nperiods=config.nperiods,
+        parallel=config.parallel,
+        download_workers=config.download_workers,
+        cpu_workers=config.cpu_workers,
+        bls_backend=config.bls_backend,
     )
 
 

@@ -282,6 +282,25 @@ with tab_hunt:
         hunt_bls = st.number_input("BLS power threshold", min_value=0.0, max_value=0.1,
                                     value=float(prof["bls_threshold"]), step=0.0001, format="%.4f", key="hunt_bls")
 
+    hunt_parallel = st.checkbox(
+        "Parallel hunter (faster)", value=True, key="hunt_par",
+        help="Producer-consumer pipeline: parallel MAST downloads, GPU-pinned BLS, "
+             "CPU folding workers, batched inference. Recommended for >100 stars.",
+    )
+    if hunt_parallel:
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            hunt_dl_workers = st.number_input(
+                "Download workers", min_value=1, max_value=32, value=8, key="hunt_dlw",
+            )
+        with pc2:
+            hunt_cpu_workers = st.number_input(
+                "CPU folding workers", min_value=1, max_value=16, value=4, key="hunt_cpuw",
+            )
+    else:
+        hunt_dl_workers = 8
+        hunt_cpu_workers = 4
+
     hunt_status = _task_status("hunt")
 
     if hunt_status["running"]:
@@ -313,19 +332,33 @@ with tab_hunt:
         st.rerun()
     else:
         if st.button("Start Hunt", type="primary", use_container_width=True):
+            verb = "phunt" if hunt_parallel else "hunt"
             cmd = [
-                sys.executable, str(ROOT / "run.py"), "hunt",
+                sys.executable, str(ROOT / "run.py"), verb,
                 "--sector", str(hunt_sector),
                 "--limit", str(hunt_limit),
                 "--threshold", str(hunt_threshold),
-                "--bls-threshold", str(hunt_bls),
                 "--checkpoint", checkpoint_path,
                 "--candidate-dir", candidate_dir,
                 "--period-min", str(prof["period_min"]),
                 "--period-max", str(prof["period_max"]),
                 "--nperiods", str(prof["nperiods"]),
-                "--strategy-profile", selected_profile,
             ]
+            sde_thresh = float(prof.get("sde_threshold", 7.0))
+            if hunt_parallel:
+                # parallel_hunter CLI: --sde-threshold + worker counts; no
+                # --bls-threshold or --strategy-profile.
+                cmd.extend([
+                    "--sde-threshold", str(sde_thresh),
+                    "--download-workers", str(int(hunt_dl_workers)),
+                    "--cpu-workers", str(int(hunt_cpu_workers)),
+                ])
+            else:
+                cmd.extend([
+                    "--bls-threshold", str(hunt_bls),
+                    "--sde-threshold", str(sde_thresh),
+                    "--strategy-profile", selected_profile,
+                ])
             _start_background_task("hunt", cmd)
             st.rerun()
 
@@ -439,6 +472,25 @@ with tab_autopilot:
     with col3:
         ap_limit = st.number_input("Stars per sector", min_value=1, max_value=100000, value=10000, key="ap_limit")
 
+    ap_parallel = st.checkbox(
+        "Parallel hunter per sector (recommended)", value=True, key="ap_par",
+        help="Use the producer-consumer pipeline for each sector. "
+             "Typically 5-10x faster than the sequential hunter on a multi-core machine.",
+    )
+    if ap_parallel:
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            ap_dl_workers = st.number_input(
+                "Download workers", min_value=1, max_value=32, value=8, key="ap_dlw",
+            )
+        with pc2:
+            ap_cpu_workers = st.number_input(
+                "CPU folding workers", min_value=1, max_value=16, value=4, key="ap_cpuw",
+            )
+    else:
+        ap_dl_workers = 8
+        ap_cpu_workers = 4
+
     ap_status = _task_status("autopilot")
 
     if ap_status["running"]:
@@ -486,7 +538,14 @@ with tab_autopilot:
                     "--period-min", str(prof["period_min"]),
                     "--period-max", str(prof["period_max"]),
                     "--nperiods", str(prof["nperiods"]),
+                    "--sde-threshold", str(float(prof.get("sde_threshold", 7.0))),
                 ]
+                if ap_parallel:
+                    cmd.extend([
+                        "--parallel",
+                        "--download-workers", str(int(ap_dl_workers)),
+                        "--cpu-workers", str(int(ap_cpu_workers)),
+                    ])
                 _start_background_task("autopilot", cmd)
                 st.rerun()
 
