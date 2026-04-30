@@ -32,12 +32,12 @@ _shutdown_requested = False
 
 
 def _handle_sigint(signum, frame):
+    """Signal-safe handler: only set a flag. Logging from inside a signal
+    handler is not async-signal-safe and can deadlock the logging lock."""
     global _shutdown_requested
     if _shutdown_requested:
-        logger.warning("Second interrupt — forcing exit.")
         sys.exit(1)
     _shutdown_requested = True
-    logger.info("Shutdown requested. Will finish current star and stop.")
 
 
 # ---------------------------------------------------------------------------
@@ -69,24 +69,23 @@ def _bootstrap_model(checkpoint: str, max_per_class: int = 250, epochs: int = 30
 
     logger.info("=" * 60)
     logger.info("NO MODEL FOUND — bootstrapping from NASA Exoplanet Archive")
-    logger.info("This downloads ~500 light curves and trains a classifier.")
+    logger.info("This downloads light curves and trains a classifier.")
     logger.info("It only happens once. Please be patient.")
     logger.info("=" * 60)
 
-    sys.argv = [
-        "train_classifier.py",
-        "--data", "auto",
-        "--max-per-class", str(max_per_class),
-        "--epochs", str(epochs),
-        "--out", checkpoint,
-        "--amp",
-    ]
+    from services import TrainConfig, run_train
 
     try:
-        from train_classifier import main as train_main
-        train_main()
-    except SystemExit:
-        pass
+        run_train(TrainConfig(
+            data="auto",
+            max_per_class=max_per_class,
+            epochs=epochs,
+            out=checkpoint,
+            amp=True,
+        ))
+    except Exception as exc:
+        logger.error("Bootstrap training failed: %s", exc)
+        return False
 
     if os.path.exists(checkpoint):
         logger.info("Bootstrap complete. Checkpoint saved to %s", checkpoint)
@@ -151,8 +150,8 @@ def _cross_match_candidates(candidate_dir: str, known_tics: set):
 # ---------------------------------------------------------------------------
 
 def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
-                bls_threshold: float, candidate_dir: str,
-                period_min: float = 1.0, period_max: float = 15.0,
+                bls_threshold: float, sde_threshold: float, candidate_dir: str,
+                period_min: float = 0.5, period_max: float = 15.0,
                 nperiods: int = 10000, strategy_profile: str = None):
     """Run the hunter on a single sector via the callable run_hunt() API."""
     log_file = f"processed_stars_s{sector:03d}.txt"
@@ -160,7 +159,8 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
         from hunter import run_hunt
         return run_hunt(
             sector=sector, limit=limit, threshold=threshold,
-            bls_threshold=bls_threshold, checkpoint=checkpoint,
+            bls_threshold=bls_threshold, sde_threshold=sde_threshold,
+            checkpoint=checkpoint,
             log_file=log_file, candidate_dir=candidate_dir,
             period_min=period_min, period_max=period_max,
             nperiods=nperiods, strategy_profile=strategy_profile,
@@ -175,10 +175,11 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
 # ---------------------------------------------------------------------------
 
 def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
-                  threshold=0.85, bls_threshold=0.001, checkpoint=DEFAULT_CHECKPOINT,
-                  max_per_class=250, train_epochs=30, candidate_dir=CANDIDATE_DIR,
+                  threshold=0.85, bls_threshold=0.0, sde_threshold=7.0,
+                  checkpoint=DEFAULT_CHECKPOINT,
+                  max_per_class=2500, train_epochs=30, candidate_dir=CANDIDATE_DIR,
                   state_file=STATE_FILE, strategy_profile=None,
-                  period_min=1.0, period_max=15.0, nperiods=10000):
+                  period_min=0.5, period_max=15.0, nperiods=10000):
     """Core autopilot logic, callable without CLI arg parsing.
 
     Returns summary dict with sectors_done, total_candidates, elapsed_hours.
@@ -229,6 +230,7 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
         _run_sector(
             sector=sector, limit=limit, checkpoint=checkpoint,
             threshold=threshold, bls_threshold=bls_threshold,
+            sde_threshold=sde_threshold,
             candidate_dir=candidate_dir,
             period_min=period_min, period_max=period_max,
             nperiods=nperiods, strategy_profile=strategy_profile,
@@ -285,24 +287,27 @@ def main():
                         help="Max stars per sector (default: 10000)")
     parser.add_argument("--threshold", type=float, default=0.85,
                         help="AI probability threshold for candidates")
-    parser.add_argument("--bls-threshold", type=float, default=0.001,
-                        help="BLS power threshold to pass to AI")
+    parser.add_argument("--bls-threshold", type=float, default=0.0,
+                        help="Legacy raw-power gate (default 0 = off).")
+    parser.add_argument("--sde-threshold", type=float, default=7.0,
+                        help="Signal Detection Efficiency gate (default 7).")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--max-per-class", type=int, default=250,
+    parser.add_argument("--max-per-class", type=int, default=2500,
                         help="Training samples per class during bootstrap")
     parser.add_argument("--train-epochs", type=int, default=30,
                         help="Training epochs during bootstrap")
     parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
     parser.add_argument("--state-file", type=str, default=STATE_FILE)
     parser.add_argument("--strategy-profile", type=str, default=None)
-    parser.add_argument("--period-min", type=float, default=1.0)
+    parser.add_argument("--period-min", type=float, default=0.5)
     parser.add_argument("--period-max", type=float, default=15.0)
     parser.add_argument("--nperiods", type=int, default=10000)
     args = parser.parse_args()
     return run_autopilot(
         start_sector=args.start_sector, end_sector=args.end_sector,
         limit=args.limit, threshold=args.threshold,
-        bls_threshold=args.bls_threshold, checkpoint=args.checkpoint,
+        bls_threshold=args.bls_threshold, sde_threshold=args.sde_threshold,
+        checkpoint=args.checkpoint,
         max_per_class=args.max_per_class, train_epochs=args.train_epochs,
         candidate_dir=args.candidate_dir, state_file=args.state_file,
         strategy_profile=args.strategy_profile,

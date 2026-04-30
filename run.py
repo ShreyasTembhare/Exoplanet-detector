@@ -35,10 +35,18 @@ def cmd_scan(argv):
 
 
 def cmd_hunt(argv):
-    """Run the autonomous sector hunter."""
+    """Run the autonomous sector hunter (sequential)."""
     _hw_report()
     sys.argv = ["hunter.py"] + argv
     from hunter import main
+    return main()
+
+
+def cmd_parallel_hunt(argv):
+    """Run the producer-consumer parallel sector hunter."""
+    _hw_report()
+    sys.argv = ["parallel_hunter.py"] + argv
+    from parallel_hunter import main
     return main()
 
 
@@ -54,6 +62,14 @@ def cmd_autopilot(argv):
     """Run fully autonomous multi-sector exoplanet hunting."""
     sys.argv = ["autopilot.py"] + argv
     from autopilot import main
+    return main()
+
+
+def cmd_pretrain(argv):
+    """Self-supervised pretraining (MLM or SimCLR)."""
+    _hw_report()
+    sys.argv = ["pretrain_ssl.py"] + argv
+    from pretrain_ssl import main
     return main()
 
 
@@ -80,12 +96,15 @@ def main():
     dispatch = {
         "scan": cmd_scan,
         "hunt": cmd_hunt,
+        "phunt": cmd_parallel_hunt,
+        "parallel-hunt": cmd_parallel_hunt,
         "train": cmd_train,
+        "pretrain": cmd_pretrain,
         "autopilot": cmd_autopilot,
     }
 
     if command not in dispatch:
-        print(f"Unknown command: {command!r}. Choose from: scan, hunt, train, autopilot")
+        print(f"Unknown command: {command!r}. Choose from: scan, hunt, phunt, train, pretrain, autopilot")
         sys.exit(1)
 
     return dispatch[command](remaining)

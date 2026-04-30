@@ -10,7 +10,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import streamlit as st
@@ -70,7 +70,7 @@ def _start_background_task(name: str, cmd: list):
     state = _load_task_state()
     state[name] = {
         "pid": proc.pid,
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "cmd": " ".join(cmd),
         "log": str(log_path),
     }
@@ -114,7 +114,7 @@ def _task_status(name: str) -> dict:
 # Sidebar: strategy profile + hardware
 # ---------------------------------------------------------------------------
 
-from strategy_profiles import PROFILES, DEFAULT_PROFILE, get_profile, profile_names
+from strategy_profiles import DEFAULT_PROFILE, PROFILES, get_profile, profile_names
 
 with st.sidebar:
     st.title("TESS Exoplanet Detector")
@@ -134,8 +134,9 @@ with st.sidebar:
     st.divider()
     st.subheader("Hardware")
     try:
-        from device_util import get_device, get_jax_backend
         import torch
+
+        from device_util import get_device, get_jax_backend
         dev = get_device()
         jax_be = get_jax_backend()
         st.text(f"PyTorch {torch.__version__}")
@@ -181,22 +182,39 @@ with tab_scan:
 
     scan_predict = st.checkbox("Run classifier prediction", value=True)
 
-    if st.button("Run Scan", type="primary", use_container_width=True):
-        with st.spinner("Running pipeline... this may take a few minutes."):
+    scan_status = _task_status("scan")
+    scan_result_path = ROOT / ".scan_result.json"
+
+    if scan_status["running"]:
+        st.warning(f"Scan running (PID {scan_status['pid']})")
+        if st.button("Stop Scan", type="secondary"):
+            _stop_background_task("scan")
+            st.rerun()
+        if scan_status["log_tail"]:
+            with st.expander("Scan log", expanded=True):
+                st.code(scan_status["log_tail"], language="text")
+        time.sleep(1)
+        st.rerun()
+    else:
+        if st.button("Run Scan", type="primary", use_container_width=True):
+            cmd = [
+                sys.executable, str(ROOT / "run.py"), "scan", tic_id,
+                "--period-min", str(scan_pmin),
+                "--period-max", str(scan_pmax),
+                "--nperiods", str(scan_nperiods),
+            ]
+            if scan_sector > 0:
+                cmd.extend(["--sector", str(scan_sector)])
+            if scan_predict:
+                cmd.append("--predict")
+                cmd.extend(["--checkpoint", checkpoint_path])
+            _start_background_task("scan", cmd)
+            st.rerun()
+        if scan_result_path.exists():
             try:
-                from services import run_scan, ScanConfig
-                cfg = ScanConfig(
-                    tic_id=tic_id,
-                    sector=scan_sector if scan_sector > 0 else None,
-                    period_min=scan_pmin, period_max=scan_pmax,
-                    nperiods=scan_nperiods, use_cache=True,
-                    predict=scan_predict, checkpoint=checkpoint_path,
-                )
-                result = run_scan(cfg)
-                st.session_state["scan_result"] = result
-                st.success("Scan complete!")
-            except Exception as e:
-                st.error(f"Scan failed: {e}")
+                st.session_state["scan_result"] = json.loads(scan_result_path.read_text())
+            except Exception:
+                pass
 
     if "scan_result" in st.session_state:
         res = st.session_state["scan_result"]
@@ -214,7 +232,6 @@ with tab_scan:
             m4.metric("Classification", label)
             m5.metric("P(planet)", f"{pred['prob_planet']:.3f}")
 
-        import numpy as np
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -522,14 +539,23 @@ with tab_candidates:
             centroid = c.get("centroid_offset", 0.0)
             if centroid is None:
                 centroid = 0.0
-            score = compute_candidate_score(prob, bls_power, centroid, selected_profile)
+            vetting = c.get("vetting", {}) or {}
+            score = compute_candidate_score(
+                prob, bls_power, centroid, selected_profile, vetting=vetting,
+            )
 
             rows.append({
                 "TIC": c.get("tic_id", "?"),
                 "Period (d)": round(c.get("best_period", 0), 4),
                 "P(planet)": round(prob, 3),
-                "BLS Power": round(bls_power, 6),
-                "Centroid": round(centroid, 3) if centroid == centroid else "N/A",
+                "SDE": round(c.get("sde", float("nan")), 2)
+                    if c.get("sde") is not None else float("nan"),
+                "Depth": round(vetting.get("depth", 0.0) or 0.0, 5),
+                "Dur (h)": round(vetting.get("duration_hours", 0.0) or 0.0, 2),
+                "Odd/Even": round(vetting.get("odd_even_ratio", 0.0) or 0.0, 2),
+                "Sec sig": round(vetting.get("secondary_significance", 0.0) or 0.0, 2),
+                "V/U": round(vetting.get("v_shape_score", 0.0) or 0.0, 2),
+                "Centroid": round(centroid, 3) if centroid == centroid else float("nan"),
                 "Score": score,
                 "Status": status,
                 "Profile": c.get("strategy_profile", "unknown"),
@@ -561,7 +587,11 @@ with tab_candidates:
             mc2.metric("New (not in TOI)", new_count)
             mc3.metric("Known TOIs", known_count)
 
-            display_cols = ["TIC", "Period (d)", "P(planet)", "BLS Power", "Score", "Status"]
+            display_cols = [
+                "TIC", "Period (d)", "P(planet)", "SDE",
+                "Depth", "Dur (h)", "Odd/Even", "Sec sig", "V/U",
+                "Centroid", "Score", "Status",
+            ]
             st.dataframe(
                 df[display_cols],
                 use_container_width=True,
@@ -589,9 +619,37 @@ with tab_candidates:
                     st.markdown(f"**TIC:** {row['TIC']}")
                     st.markdown(f"**Period:** {row['Period (d)']} d")
                     st.markdown(f"**P(planet):** {row['P(planet)']}")
-                    st.markdown(f"**BLS Power:** {row['BLS Power']}")
+                    st.markdown(f"**SDE:** {row.get('SDE', 'N/A')}")
+                    st.markdown(f"**Depth:** {row.get('Depth', 'N/A')}  **Duration:** {row.get('Dur (h)', 'N/A')} h")
+                    st.markdown(f"**Odd/Even:** {row.get('Odd/Even', 'N/A')}  **Sec sig:** {row.get('Sec sig', 'N/A')}  **V/U:** {row.get('V/U', 'N/A')}")
+                    st.markdown(f"**Centroid offset:** {row.get('Centroid', 'N/A')} px")
                     st.markdown(f"**Unified Score:** {row['Score']}")
                     st.markdown(f"**Status:** {row['Status']}")
+
+                    # Vetting checklist (green/yellow/red).
+                    def _badge(ok: bool, warn: bool) -> str:
+                        if ok:
+                            return "[PASS]"
+                        if warn:
+                            return "[WARN]"
+                        return "[FAIL]"
+
+                    sde_ok = (row.get("SDE", float("nan")) or 0) >= 7.0
+                    oer = row.get("Odd/Even", float("nan")) or 0
+                    oer_ok = oer > 0.8
+                    oer_warn = 0.5 < oer <= 0.8
+                    sec_sig = row.get("Sec sig", float("nan")) or 0
+                    sec_ok = sec_sig < 3.0
+                    sec_warn = 3.0 <= sec_sig < 5.0
+                    cen = row.get("Centroid", float("nan")) or 0
+                    cen_ok = cen < 1.0
+                    cen_warn = 1.0 <= cen < 2.0
+                    st.markdown(
+                        f"- SDE > 7  {_badge(sde_ok, False)}\n"
+                        f"- Odd/Even depth ratio  {_badge(oer_ok, oer_warn)}\n"
+                        f"- No strong secondary  {_badge(sec_ok, sec_warn)}\n"
+                        f"- Centroid offset  {_badge(cen_ok, cen_warn)}"
+                    )
 
                     json_path = row.get("_json_path", "")
                     if json_path and os.path.exists(json_path):
@@ -647,7 +705,7 @@ with tab_logs:
                 status_counts = df["STATUS"].value_counts()
                 st.bar_chart(status_counts)
                 st.dataframe(df, use_container_width=True)
-            except Exception as e:
+            except Exception:
                 st.code(log_path.read_text()[-5000:], language="text")
         else:
             st.info(f"No log file found at {log_path}")

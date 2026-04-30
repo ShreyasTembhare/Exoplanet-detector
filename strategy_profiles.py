@@ -5,17 +5,17 @@ Each profile tunes BLS search parameters, thresholds, and scoring
 heuristics to optimise for a specific class of planet discovery.
 """
 
-from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 PROFILES: Dict[str, dict] = {
     "balanced": {
         "label": "Balanced (Default)",
-        "description": "General-purpose search across standard period ranges.",
-        "period_min": 1.0,
+        "description": "General-purpose search; covers ultra-short to ~3-week periods.",
+        "period_min": 0.5,
         "period_max": 15.0,
         "nperiods": 10000,
-        "bls_threshold": 0.001,
+        "sde_threshold": 7.0,
+        "bls_threshold": 0.0,  # legacy raw-power gate retained at 0 (off)
         "probability_threshold": 0.85,
         "scoring_weights": {"prob_planet": 0.5, "bls_power": 0.25, "centroid": 0.15, "niche_bonus": 0.10},
     },
@@ -28,7 +28,8 @@ PROFILES: Dict[str, dict] = {
         "period_min": 0.2,
         "period_max": 1.0,
         "nperiods": 15000,
-        "bls_threshold": 0.002,
+        "sde_threshold": 8.0,
+        "bls_threshold": 0.0,
         "probability_threshold": 0.80,
         "scoring_weights": {"prob_planet": 0.45, "bls_power": 0.30, "centroid": 0.15, "niche_bonus": 0.10},
     },
@@ -41,7 +42,8 @@ PROFILES: Dict[str, dict] = {
         "period_min": 10.0,
         "period_max": 100.0,
         "nperiods": 8000,
-        "bls_threshold": 0.0005,
+        "sde_threshold": 6.0,
+        "bls_threshold": 0.0,
         "probability_threshold": 0.75,
         "scoring_weights": {"prob_planet": 0.40, "bls_power": 0.20, "centroid": 0.20, "niche_bonus": 0.20},
     },
@@ -49,12 +51,13 @@ PROFILES: Dict[str, dict] = {
         "label": "Low-SNR M-Dwarf Multi-Sector",
         "description": (
             "Optimised for faint M-dwarf hosts where transit depth is larger but "
-            "SNR is low. Uses a lower BLS gate and benefits from multi-sector stacking."
+            "SNR is low. Uses a lower SDE gate and benefits from multi-sector stacking."
         ),
         "period_min": 0.5,
         "period_max": 20.0,
         "nperiods": 12000,
-        "bls_threshold": 0.0003,
+        "sde_threshold": 6.0,
+        "bls_threshold": 0.0,
         "probability_threshold": 0.70,
         "scoring_weights": {"prob_planet": 0.40, "bls_power": 0.25, "centroid": 0.20, "niche_bonus": 0.15},
     },
@@ -82,7 +85,8 @@ def apply_profile_to_hunt_kwargs(profile_name: str, overrides: Optional[dict] = 
         "period_min": p["period_min"],
         "period_max": p["period_max"],
         "nperiods": p["nperiods"],
-        "bls_threshold": p["bls_threshold"],
+        "bls_threshold": p.get("bls_threshold", 0.0),
+        "sde_threshold": p.get("sde_threshold", 7.0),
         "threshold": p["probability_threshold"],
     }
     if overrides:
@@ -91,10 +95,15 @@ def apply_profile_to_hunt_kwargs(profile_name: str, overrides: Optional[dict] = 
 
 
 def compute_candidate_score(prob_planet: float, bls_power: float,
-                            centroid_offset: float, profile_name: str = "balanced") -> float:
+                            centroid_offset: float, profile_name: str = "balanced",
+                            vetting: Optional[dict] = None) -> float:
     """
     Unified candidate score combining model probability, BLS power,
     centroid offset, and a niche-specific bonus.
+
+    If ``vetting`` is provided, the score also penalises eclipsing-binary
+    indicators (low odd/even ratio, strong secondary eclipse, low V/U)
+    and contamination (centroid offset, Gaia neighbours).
 
     Returns a value in [0, 1] where higher is better.
     """
@@ -102,10 +111,12 @@ def compute_candidate_score(prob_planet: float, bls_power: float,
     w = p["scoring_weights"]
 
     prob_component = max(0.0, min(1.0, prob_planet))
-
     bls_norm = min(bls_power / 0.01, 1.0)
-
-    centroid_ok = max(0.0, 1.0 - centroid_offset / 5.0) if (centroid_offset == centroid_offset and centroid_offset is not None) else 0.5
+    centroid_ok = (
+        max(0.0, 1.0 - centroid_offset / 5.0)
+        if (centroid_offset == centroid_offset and centroid_offset is not None)
+        else 0.5
+    )
 
     niche_bonus = 0.0
     if profile_name == "ultra_short_period":
@@ -123,4 +134,27 @@ def compute_candidate_score(prob_planet: float, bls_power: float,
         + w["centroid"] * centroid_ok
         + w["niche_bonus"] * niche_bonus
     )
+
+    # Vetting penalties (multiplicative, in [0.3, 1.0]).
+    if vetting:
+        oer = vetting.get("odd_even_ratio")
+        if oer is not None and isinstance(oer, (int, float)) and oer == oer and oer > 0:
+            if oer < 0.5:
+                score *= 0.5
+            elif oer < 0.8:
+                score *= 0.85
+        sec_sig = vetting.get("secondary_significance")
+        if sec_sig is not None and isinstance(sec_sig, (int, float)) and sec_sig == sec_sig:
+            if sec_sig > 5.0:
+                score *= 0.4  # likely EB
+            elif sec_sig > 3.0:
+                score *= 0.7
+        v_shape = vetting.get("v_shape_score")
+        if v_shape is not None and isinstance(v_shape, (int, float)) and v_shape == v_shape:
+            if v_shape < 0.5:
+                score *= 0.7
+        gaia = vetting.get("gaia_neighbors_within_30arcsec", -1)
+        if isinstance(gaia, int) and gaia > 5:
+            score *= 0.85
+
     return round(min(score, 1.0), 4)

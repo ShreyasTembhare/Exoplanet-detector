@@ -6,9 +6,9 @@ the CLI (run.py) and the Streamlit dashboard (app.py) share the same
 execution path without sys.argv manipulation.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +25,10 @@ class ScanConfig:
     period_max: float = 20.0
     nperiods: int = 5000
     use_cache: bool = True
+    with_tpf: bool = True
     predict: bool = False
     checkpoint: Optional[str] = None
+    backend: Optional[str] = None  # jax|numpy|astropy|cuvarbase
 
 
 @dataclass
@@ -34,16 +36,19 @@ class HuntConfig:
     sector: int = 15
     limit: int = 10000
     threshold: float = 0.85
-    bls_threshold: float = 0.001
+    bls_threshold: float = 0.0
+    sde_threshold: float = 7.0
     checkpoint: str = "models/checkpoints/resnet1d.pt"
     log_file: str = "processed_stars.txt"
     candidate_dir: str = "candidates"
     tic_list: Optional[str] = None
     infer_batch_size: int = 32
-    period_min: float = 1.0
+    period_min: float = 0.5
     period_max: float = 15.0
     nperiods: int = 10000
     strategy_profile: str = "balanced"
+    with_tpf: bool = True
+    prefilter: bool = True
 
 
 @dataclass
@@ -60,8 +65,12 @@ class TrainConfig:
     seed: int = 42
     patience: int = 7
     amp: bool = False
-    max_per_class: int = 250
+    max_per_class: int = 2500
     grad_accum: int = 1
+    use_focal: bool = True
+    use_injection_recovery: bool = True
+    val_holdout_sectors: Optional[str] = None  # e.g. "21-26"
+    model_arch: str = "resnet1d"  # resnet1d | exominer | transformer
 
 
 @dataclass
@@ -70,14 +79,15 @@ class AutopilotConfig:
     end_sector: int = 100
     limit: int = 10000
     threshold: float = 0.85
-    bls_threshold: float = 0.001
+    bls_threshold: float = 0.0
+    sde_threshold: float = 7.0
     checkpoint: str = "models/checkpoints/resnet1d.pt"
-    max_per_class: int = 250
+    max_per_class: int = 2500
     train_epochs: int = 30
     candidate_dir: str = "candidates"
     state_file: str = "autopilot_state.json"
     strategy_profile: str = "balanced"
-    period_min: float = 1.0
+    period_min: float = 0.5
     period_max: float = 15.0
     nperiods: int = 10000
 
@@ -88,7 +98,7 @@ class AutopilotConfig:
 
 def run_scan(config: ScanConfig) -> dict:
     """Run the full pipeline on a single TIC target and optionally classify."""
-    from run_pipeline import run, predict
+    from run_pipeline import predict, run
 
     result = run(
         config.tic_id,
@@ -97,6 +107,8 @@ def run_scan(config: ScanConfig) -> dict:
         period_max=config.period_max,
         nperiods=config.nperiods,
         use_cache=config.use_cache,
+        with_tpf=config.with_tpf,
+        backend=config.backend,
     )
 
     if config.predict:
@@ -109,8 +121,8 @@ def run_scan(config: ScanConfig) -> dict:
 
 def run_hunt(config: HuntConfig) -> dict:
     """Run the sector hunter. Returns stats dict."""
-    from strategy_profiles import apply_profile_to_hunt_kwargs
     from hunter import run_hunt as _hunt
+    from strategy_profiles import apply_profile_to_hunt_kwargs
 
     profile_kw = apply_profile_to_hunt_kwargs(config.strategy_profile)
 
@@ -119,6 +131,7 @@ def run_hunt(config: HuntConfig) -> dict:
         limit=config.limit,
         threshold=profile_kw.get("threshold", config.threshold),
         bls_threshold=profile_kw.get("bls_threshold", config.bls_threshold),
+        sde_threshold=profile_kw.get("sde_threshold", config.sde_threshold),
         checkpoint=config.checkpoint,
         log_file=config.log_file,
         candidate_dir=config.candidate_dir,
@@ -128,6 +141,8 @@ def run_hunt(config: HuntConfig) -> dict:
         period_max=profile_kw.get("period_max", config.period_max),
         nperiods=profile_kw.get("nperiods", config.nperiods),
         strategy_profile=config.strategy_profile,
+        with_tpf=config.with_tpf,
+        prefilter=config.prefilter,
     )
 
 
@@ -150,6 +165,10 @@ def run_train(config: TrainConfig) -> dict:
         amp=config.amp,
         max_per_class=config.max_per_class,
         grad_accum=config.grad_accum,
+        use_focal=config.use_focal,
+        use_injection_recovery=config.use_injection_recovery,
+        val_holdout_sectors=config.val_holdout_sectors,
+        model_arch=config.model_arch,
     )
 
 
@@ -163,6 +182,7 @@ def run_autopilot(config: AutopilotConfig) -> dict:
         limit=config.limit,
         threshold=config.threshold,
         bls_threshold=config.bls_threshold,
+        sde_threshold=config.sde_threshold,
         checkpoint=config.checkpoint,
         max_per_class=config.max_per_class,
         train_epochs=config.train_epochs,
@@ -204,7 +224,8 @@ def load_candidates(candidate_dir: str = "candidates") -> list:
 
 def load_autopilot_state(state_file: str = "autopilot_state.json") -> dict:
     """Load persisted autopilot state."""
-    import json, os
+    import json
+    import os
     if not os.path.exists(state_file):
         return {"completed_sectors": [], "current_sector": None}
     with open(state_file) as f:
@@ -228,7 +249,8 @@ def load_hunt_progress(log_file: str = "processed_stars.txt"):
 
 def load_training_metrics(metrics_path: str = "models/checkpoints/resnet1d.metrics.json") -> Optional[dict]:
     """Load saved training metrics JSON."""
-    import json, os
+    import json
+    import os
     if not os.path.exists(metrics_path):
         return None
     with open(metrics_path) as f:
