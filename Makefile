@@ -1,4 +1,4 @@
-.PHONY: bootstrap test lint hunt phunt scan train pretrain autopilot clean smoke tool
+.PHONY: bootstrap test lint hunt phunt scan train pretrain autopilot clean smoke tool dev
 
 PY := .venv/bin/python
 
@@ -37,9 +37,14 @@ autopilot:
 smoke:
 	$(PY) -m pytest tests/test_cache.py tests/test_bls.py tests/test_vetting.py -q
 
+dev:
+	cd web && npm install
+	python3 -m tool --host 127.0.0.1 --port 8765 &
+	cd web && npm run dev
+
 tool:
 	cd web && npm install && npm run build
-	python3 -m tool --host 0.0.0.0 --port 8765
+	python3 -m tool --host 127.0.0.1 --port 8765
 
 clean:
 	rm -rf cache/phase1/*.npz cache/phase2/*.npz cache/phase3/*.npz \

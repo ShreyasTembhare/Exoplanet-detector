@@ -8,10 +8,12 @@ End-to-end TESS pipeline: download light curves, detrend, run BLS (and optionall
 uv venv && source .venv/bin/activate
 uv pip install --native-tls -r requirements.txt
 
-# Transit desk (API + UI on one port)
+# Local development: API on :8765, Vite on :5173
+make dev
+# then open http://localhost:5173
+
+# Built UI on one local port, after you want a single process
 make tool
-# or, after the UI has been built:
-python -m tool
 
 # CLI
 python run.py scan      "TIC 441462736" --predict
