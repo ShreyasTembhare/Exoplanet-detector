@@ -8,8 +8,10 @@ End-to-end TESS pipeline: download light curves, detrend, run BLS (and optionall
 uv venv && source .venv/bin/activate
 uv pip install --native-tls -r requirements.txt
 
-# Streamlit dashboard
-streamlit run app.py
+# Transit desk (API + UI on one port)
+make tool
+# or, after the UI has been built:
+python -m tool
 
 # CLI
 python run.py scan      "TIC 441462736" --predict
@@ -19,6 +21,8 @@ python run.py train     --data auto --epochs 30 --max-per-class 2500
 python run.py pretrain  mlm --epochs 10
 python run.py autopilot --start-sector 1 --end-sector 26
 ```
+
+The desk is the operator UI: rank a TIC table, start a search, review SDE-pass candidates, export one TFOP packet. Training, autopilot, and SSL pretrain stay on the CLI. A sector search needs MAST (`lightkurve` and `astroquery`). Without them the desk says so and writes no candidates.
 
 Hardware is auto-detected: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
 
@@ -100,7 +104,7 @@ The pipeline was overhauled in 9 phases. Headline changes:
 - **Phase 6**: ExoMiner++-style multi-input vetter with periodogram + diff-image + scalar branches.
 - **Phase 7**: transformer detector for raw light curves (single-transit + long-period discovery path).
 - **Phase 8**: self-supervised pretraining (masked modeling + SimCLR).
-- **Phase 9**: pytest + GitHub CI + Streamlit Scan as background task + TFOP discovery packet exporter + Makefile.
+- **Phase 9**: pytest + GitHub CI + TFOP discovery packet exporter + Makefile. The operator UI is the Transit desk (`make tool`), not Streamlit.
 
 ## License
 

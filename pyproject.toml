@@ -8,7 +8,6 @@ ignore = ["E501", "E741", "E731"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]
-"app.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

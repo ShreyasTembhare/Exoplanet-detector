@@ -10,6 +10,10 @@ hunter_timings.csv
 # Autopilot
 autopilot_state.json
 
+# Transit desk runtime
+var/
+web/node_modules/
+
 # Streamlit dashboard runtime
 .streamlit_tasks.json
 .task_*.log

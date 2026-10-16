@@ -1,9 +1,8 @@
 """
 Orchestration service layer for the TESS Exoplanet Detector.
 
-Provides typed config dataclasses and callable entry-points so both
-the CLI (run.py) and the Streamlit dashboard (app.py) share the same
-execution path without sys.argv manipulation.
+Typed configs and callables shared by the CLI (run.py) and the Transit
+desk. The desk calls these functions in-process. It does not shell out.
 """
 
 import logging
@@ -228,7 +227,7 @@ def run_autopilot(config: AutopilotConfig) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Candidate & state readers  (used by Streamlit dashboard)
+# Candidate & state readers
 # ---------------------------------------------------------------------------
 
 def load_candidates(candidate_dir: str = "candidates") -> list:
@@ -287,3 +286,158 @@ def load_training_metrics(metrics_path: str = "models/checkpoints/resnet1d.metri
         return None
     with open(metrics_path) as f:
         return json.load(f)
+
+
+def mast_requirement() -> dict:
+    """Whether a sector search can reach MAST.
+
+    A missing client is reported as a hard stop. The desk must not invent
+    targets or candidates when the catalog cannot be queried.
+    """
+    import importlib.util
+
+    missing = [name for name in ("lightkurve", "astroquery") if importlib.util.find_spec(name) is None]
+    if missing:
+        listed = " and ".join(missing) if len(missing) < 3 else ", ".join(missing)
+        verb = "is" if len(missing) == 1 else "are"
+        return {
+            "available": False,
+            "missing": missing,
+            "message": (
+                "This search needs MAST to list sector targets and download light curves. "
+                f"{listed} {verb} not installed, so no light curves were fetched and no candidates were written."
+            ),
+        }
+    return {
+        "available": True,
+        "missing": [],
+        "message": "MAST clients are installed. A sector search downloads light curves.",
+    }
+
+
+def run_local_lightcurve(
+    time,
+    flux,
+    tic_id: str,
+    candidate_dir: str,
+    *,
+    period_min: float = 0.5,
+    period_max: float = 15.0,
+    nperiods: int = 800,
+    sde_threshold: float = 7.0,
+    disposition: str = "",
+) -> dict:
+    """BLS and vetting on an operator-supplied curve. No MAST and no classifier.
+
+    A star is written only when the SDE gate passes. The result is labeled as
+    a local light curve, not as a MAST discovery.
+    """
+    import os
+
+    import numpy as np
+
+    from pipeline import run_phase2, run_phase3
+    from pipeline.hard_flags import hard_flag_reasons
+
+    time = np.asarray(time, dtype=np.float64)
+    flux = np.asarray(flux, dtype=np.float64)
+    finite = np.isfinite(time) & np.isfinite(flux)
+    time, flux = time[finite], flux[finite]
+    if len(time) < 30:
+        raise ValueError("Need at least 30 finite time, flux samples.")
+
+    os.makedirs(candidate_dir, exist_ok=True)
+    res = run_phase2(
+        time, flux, tic_id=str(tic_id), sector="local",
+        period_min=period_min, period_max=period_max, nperiods=int(nperiods),
+        use_cache=False, two_pass=True, return_result=True,
+    )
+    sde = float(res.sde) if res.sde == res.sde else float("nan")
+    period = float(res.best_period) if res.best_period == res.best_period else float("nan")
+    epoch = float(res.epoch) if res.epoch == res.epoch else float("nan")
+    if not (sde == sde and sde >= float(sde_threshold) and period == period and period > 0 and epoch == epoch):
+        return {
+            "saved": False,
+            "sde": None if sde != sde else sde,
+            "period_days": None if period != period else period,
+            "epoch_btjd": None if epoch != epoch else epoch,
+            "message": (
+                f"No SDE pass (SDE {sde:.2f} vs gate {float(sde_threshold):.1f}). "
+                "No candidate was written."
+            ) if sde == sde else "BLS did not return a finite SDE. No candidate was written.",
+        }
+
+    _global, _local, centroid, extras = run_phase3(
+        time, flux, period, epoch,
+        tic_id=str(tic_id), sector="local", use_cache=False,
+        bls_sde=sde, bls_periods=res.periods, bls_power=res.power,
+        skip_gaia=True,
+    )
+    vetting = dict(extras.get("vetting") or {})
+    flags = hard_flag_reasons(vetting)
+    vetting["hard_flags"] = flags
+    peaks = [
+        {
+            "period": float(p.period),
+            "epoch": float(p.epoch),
+            "power": float(p.power),
+            "sde": float(p.sde),
+        }
+        for p in (res.peaks or [])
+    ]
+    power = float(np.nanmax(res.power)) if len(res.power) else float("nan")
+    from hunter import _save_candidate_evidence, _save_candidate_plot
+
+    try:
+        plot_path = _save_candidate_plot(time, flux, period, epoch, str(tic_id), None, candidate_dir)
+    except Exception as exc:
+        logger.warning("Candidate plot skipped: %s", exc)
+        plot_path = ""
+    _save_candidate_evidence(
+        candidate_dir, str(tic_id), period, None, power, sde, centroid,
+        plot_path, vetting, peaks, "balanced", epoch=epoch,
+    )
+    safe = str(tic_id).replace(" ", "_").replace("/", "_")
+    json_path = os.path.join(candidate_dir, f"TIC_{safe}_p{period:.2f}.json")
+    import json
+    with open(json_path) as handle:
+        payload = json.load(handle)
+    disposition = (disposition or "").strip().upper()
+    if disposition in {"CP", "KP"}:
+        discovery = "KNOWN"
+    else:
+        discovery = "LOCAL_CURVE"
+    payload.update({
+        "source": "local_light_curve",
+        "discovery_status": discovery,
+        "status": "CANDIDATE_SDE",
+        "phase_curve": _phase_curve(time, flux, period, epoch),
+        "hard_flags": flags,
+    })
+    with open(json_path, "w") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+    return {
+        "saved": True,
+        "id": os.path.splitext(os.path.basename(json_path))[0],
+        "sde": sde,
+        "period_days": period,
+        "epoch_btjd": epoch,
+        "message": "SDE pass saved as a candidate. No classifier checkpoint was used.",
+        "path": json_path,
+    }
+
+
+def _phase_curve(time, flux, period: float, epoch: float, n_bins: int = 64) -> dict:
+    import numpy as np
+
+    phase = ((np.asarray(time, dtype=np.float64) - epoch) % period) / period
+    flux = np.asarray(flux, dtype=np.float64)
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    centers, values = [], []
+    for i in range(n_bins):
+        mask = (phase >= edges[i]) & (phase < edges[i + 1]) & np.isfinite(flux)
+        if not np.any(mask):
+            continue
+        centers.append(float((edges[i] + edges[i + 1]) / 2.0))
+        values.append(float(np.nanmedian(flux[mask])))
+    return {"phase": centers, "flux": values}
