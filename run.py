@@ -35,10 +35,16 @@ def cmd_scan(argv):
 
 
 def cmd_hunt(argv):
-    """Run the autonomous sector hunter (sequential)."""
+    """Sector search. Parallel hunt is the default; ``--sequential`` keeps hunter.py for debugging."""
     _hw_report()
-    sys.argv = ["hunter.py"] + argv
-    from hunter import main
+    sequential = "--sequential" in argv
+    argv = [a for a in argv if a != "--sequential"]
+    if sequential:
+        sys.argv = ["hunter.py"] + argv
+        from hunter import main
+        return main()
+    sys.argv = ["parallel_hunter.py"] + argv
+    from parallel_hunter import main
     return main()
 
 
@@ -82,7 +88,8 @@ def main():
             "\n"
             "Commands:\n"
             "  scan       Analyze a single TIC target        (e.g. run.py scan \"TIC 441462736\")\n"
-            "  hunt       Sweep a TESS sector autonomously   (e.g. run.py hunt --sector 15)\n"
+            "  hunt       Sweep a TESS sector (parallel)     (e.g. run.py hunt --sector 15)\n"
+            "             Add --sequential to use hunter.py for debugging.\n"
             "  train      Train / fine-tune the classifier   (e.g. run.py train --data auto)\n"
             "  autopilot  Run fully autonomous hunting        (e.g. run.py autopilot)\n"
             "\n"

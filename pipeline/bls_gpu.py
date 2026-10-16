@@ -303,23 +303,77 @@ _BACKEND_FNS = {
 }
 
 
-def _select_backend(n_cadences: int, requested: Optional[str] = None) -> str:
-    if requested is not None:
-        if requested == "cuvarbase" and not CUVARBASE_AVAILABLE:
-            logger.warning("cuvarbase not installed; using jax.")
-            return "jax" if JAX_AVAILABLE else "astropy"
-        if requested == "jax" and not JAX_AVAILABLE:
-            return "astropy"
-        return requested
+def _astropy_available() -> bool:
+    try:
+        import astropy.timeseries  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _fastest_backend() -> str:
+    """JAX when installed, otherwise Astropy, otherwise the NumPy loop.
+
+    Astropy remains the reference oracle: pass ``backend="astropy"`` in tests.
+    """
     if JAX_AVAILABLE:
         return "jax"
-    return "astropy"
+    if _astropy_available():
+        return "astropy"
+    return "numpy"
 
 
-def _downsample(time: np.ndarray, flux: np.ndarray, max_cadences: int) -> Tuple[np.ndarray, np.ndarray]:
-    if len(time) <= max_cadences:
+def _select_backend(n_cadences: int, requested: Optional[str] = None) -> str:
+    """Pick the fastest installed backend unless the caller names one."""
+    del n_cadences  # kept for call-site compatibility
+    if requested is None:
+        return _fastest_backend()
+    if requested == "cuvarbase" and not CUVARBASE_AVAILABLE:
+        logger.warning("cuvarbase not installed; using the fastest built-in backend.")
+        return _fastest_backend()
+    if requested == "jax" and not JAX_AVAILABLE:
+        logger.warning("jax not installed; using the fastest built-in backend.")
+        return _fastest_backend()
+    if requested == "astropy" and not _astropy_available():
+        logger.warning("astropy not installed; using the NumPy BLS loop.")
+        return "numpy"
+    return requested
+
+
+def _downsample(
+    time: np.ndarray,
+    flux: np.ndarray,
+    max_cadences: int,
+    min_duration_days: Optional[float] = None,
+    min_samples_in_transit: int = 3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Downsample only when the new cadence still resolves the shortest duration.
+
+    A blind cap (historically 80_000 samples) smears ultra-short transits on a
+    long baseline. If ``max_cadences`` would leave fewer than
+    ``min_samples_in_transit`` samples inside ``min_duration_days``, the cap is
+    raised so that box stays resolved.
+    """
+    time = np.asarray(time)
+    flux = np.asarray(flux)
+    n = int(len(time))
+    if n <= max_cadences:
         return time, flux
-    idx = np.round(np.linspace(0, len(time) - 1, max_cadences)).astype(int)
+    limit = int(max_cadences)
+    if (
+        min_duration_days is not None
+        and min_duration_days > 0
+        and n > 1
+        and min_samples_in_transit > 0
+    ):
+        span = float(np.nanmax(time) - np.nanmin(time))
+        if span > 0:
+            max_dt = float(min_duration_days) / float(min_samples_in_transit)
+            n_needed = int(np.ceil(span / max_dt)) + 1
+            limit = max(limit, min(n, n_needed))
+    if n <= limit:
+        return time, flux
+    idx = np.unique(np.round(np.linspace(0, n - 1, limit)).astype(int))
     return time[idx], flux[idx]
 
 
@@ -379,6 +433,108 @@ def _select_topk_peaks(
 # ---------------------------------------------------------------------------
 
 
+def _shortest_duration_days(
+    period_min: float,
+    duration_phase: Optional[float],
+    rho_star_solar: float,
+) -> float:
+    """Absolute length (days) of the shortest box the search will try."""
+    if duration_phase is not None:
+        return float(duration_phase) * float(period_min)
+    from .physical_priors import duration_phase_for_period
+
+    # 0.5× is the short edge of adaptive_duration_grid.
+    return 0.5 * duration_phase_for_period(float(period_min), rho_star_solar) * float(period_min)
+
+
+def _power_on_grid(
+    bls_fn,
+    time: np.ndarray,
+    flux: np.ndarray,
+    periods: np.ndarray,
+    duration_phase: Optional[float],
+    rho_star_solar: float,
+    n_durations: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(power, duration_phase_used)`` aligned with ``periods``.
+
+    A fixed ``duration_phase`` is one box for the whole grid (tests and the
+    Astropy reference). ``duration_phase is None`` calls
+    :func:`pipeline.physical_priors.adaptive_duration_grid` and scores about
+    3–4 durations per period (0.5–1.5× the stellar-density estimate), in
+    log-period bins so a short period and a long period do not share a width.
+    """
+    periods = np.asarray(periods, dtype=np.float64)
+    if len(periods) == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+    if duration_phase is not None:
+        _, power, _, _ = bls_fn(time, flux, periods, duration_phase=float(duration_phase))
+        power = np.maximum(np.asarray(power, dtype=np.float64), 0.0)
+        return power, np.full(len(periods), float(duration_phase))
+
+    from .physical_priors import adaptive_duration_grid, duration_phase_for_period
+
+    positive = periods[periods > 0]
+    pmin = float(np.min(positive))
+    pmax = float(np.max(positive))
+    n_dur = int(np.clip(n_durations, 1, 4))
+    rep_periods, dur_grid = adaptive_duration_grid(pmin, pmax, rho_star_solar, n=n_dur)
+    base0 = duration_phase_for_period(float(rep_periods[0]), rho_star_solar)
+    scales = np.asarray(dur_grid[0], dtype=np.float64) / max(base0, 1e-8)
+
+    log_span = np.log(pmax / max(pmin, 1e-8))
+    n_bins = int(np.clip(np.round(log_span / np.log(1.8)) if log_span > 0 else 1, 1, 8))
+    order = np.argsort(periods)
+    chunks = np.array_split(order, n_bins)
+    power = np.zeros(len(periods), dtype=np.float64)
+    used = np.full(len(periods), duration_phase_for_period(float(np.median(positive)), rho_star_solar))
+    for ch in chunks:
+        if len(ch) == 0:
+            continue
+        p_chunk = periods[ch]
+        p_med = float(np.median(p_chunk[p_chunk > 0])) if np.any(p_chunk > 0) else pmin
+        base = duration_phase_for_period(p_med, rho_star_solar)
+        best_pw = np.full(len(ch), -1.0)
+        best_d = np.full(len(ch), base)
+        for scale in scales:
+            dur = float(np.clip(base * float(scale), 0.005, 0.25))
+            _, pw, _, _ = bls_fn(time, flux, p_chunk, duration_phase=dur)
+            pw = np.maximum(np.asarray(pw, dtype=np.float64), 0.0)
+            better = pw > best_pw
+            best_pw = np.where(better, pw, best_pw)
+            best_d = np.where(better, dur, best_d)
+        power[ch] = best_pw
+        used[ch] = best_d
+    return power, used
+
+
+def _refine_period(
+    bls_fn,
+    time: np.ndarray,
+    flux: np.ndarray,
+    period_seed: float,
+    period_min: float,
+    period_max: float,
+    n_refine: int,
+    half_width: float,
+    duration_phase: Optional[float],
+    rho_star_solar: float,
+    n_durations: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fine grid around one coarse peak. Returns periods, power, durations."""
+    seed = float(period_seed)
+    lo = max(float(period_min), seed * (1.0 - half_width))
+    hi = min(float(period_max), seed * (1.0 + half_width))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        lo = max(float(period_min), seed * 0.99)
+        hi = min(float(period_max), max(lo * 1.01, seed * 1.01))
+    grid = np.linspace(lo, hi, max(int(n_refine), 2))
+    power, used = _power_on_grid(
+        bls_fn, time, flux, grid, duration_phase, rho_star_solar, n_durations,
+    )
+    return grid, power, used
+
+
 def compute_bls_periodogram(
     time: np.ndarray,
     flux: np.ndarray,
@@ -394,6 +550,7 @@ def compute_bls_periodogram(
     downsample_limit: int = 80000,
     topk: int = 5,
     rho_star_solar: Optional[float] = None,
+    n_durations: int = 4,
 ) -> BLSResult:
     """
     Compute BLS periodogram and return a :class:`BLSResult` with top-k peaks.
@@ -401,78 +558,115 @@ def compute_bls_periodogram(
     The previous signature returned a 4-tuple ``(periods, power, best_period, epoch)``;
     callers that still need that should use :func:`compute_bls_legacy`.
 
-    If ``duration_phase`` is None, an adaptive duration is chosen per pass
-    using Kepler's 3rd law (Phase 1 :mod:`physical_priors`). This is much
-    closer to physical reality than a fixed 0.05 across all periods.
+    If ``duration_phase`` is None, each period is scored at a few durations from
+    :func:`pipeline.physical_priors.adaptive_duration_grid` (about 3–4), not one
+    geometric-mean box for the whole grid.
+
+    Pass B refines every kept top-k peak, not only the global best. Epochs
+    maximize mean in-transit depth.
     """
     backend_name = _select_backend(len(time), backend)
     bls_fn = _BACKEND_FNS[backend_name]
+    rho = float(rho_star_solar) if rho_star_solar is not None else 1.0
+    n_durations = int(np.clip(n_durations, 1, 4))
 
     if duration_phase is None:
-        from .physical_priors import duration_phase_for_period
-        rho = rho_star_solar if rho_star_solar is not None else 1.0
-        # Use the geometric mean of the period range as the representative.
-        rep_period = float(np.sqrt(period_min * period_max))
-        duration_phase = duration_phase_for_period(rep_period, rho)
-        logger.info("Adaptive duration_phase=%.4f (rho=%.2f, period~%.2fd)",
-                    duration_phase, rho, rep_period)
+        logger.info(
+            "Per-period duration grid: %d durations (rho=%.2f, P=%.3f–%.3f d)",
+            n_durations, rho, period_min, period_max,
+        )
 
-    ds_time, ds_flux = _downsample(time, flux, downsample_limit)
+    min_dur = _shortest_duration_days(period_min, duration_phase, rho)
+    ds_time, ds_flux = _downsample(
+        time, flux, downsample_limit, min_duration_days=min_dur,
+    )
     logger.info(
         "BLS backend=%s, cadences=%d (ds=%d), two_pass=%s",
         backend_name, len(time), len(ds_time), two_pass,
     )
 
+    def _result(periods, power, used, seed_periods=None) -> BLSResult:
+        sde = compute_sde(power)
+        best_idx = int(np.argmax(power)) if len(power) else 0
+        best_period = float(periods[best_idx]) if len(periods) else float(period_min)
+        dur_best = float(used[best_idx]) if len(used) else 0.05
+        epoch = _epoch_for_period(ds_time, ds_flux, best_period, dur_best)
+        peaks = _build_peaks(
+            periods, power, sde, ds_time, ds_flux, best_period, topk, used,
+            seed_periods=seed_periods,
+        )
+        return BLSResult(
+            periods=periods, power=power, best_period=best_period, epoch=epoch,
+            sde=float(np.max(sde)) if len(sde) else 0.0, peaks=peaks,
+        )
+
     if not two_pass:
         periods = np.exp(np.linspace(np.log(period_min), np.log(period_max), nperiods))
-        periods, power, best_period, epoch = bls_fn(ds_time, ds_flux, periods, duration_phase=duration_phase)
-        sde = compute_sde(power)
-        peaks = _build_peaks(periods, power, sde, ds_time, best_period, topk, duration_phase)
-        return BLSResult(periods=periods, power=power, best_period=best_period, epoch=epoch,
-                         sde=float(np.max(sde)), peaks=peaks)
+        power, used = _power_on_grid(
+            bls_fn, ds_time, ds_flux, periods, duration_phase, rho, n_durations,
+        )
+        return _result(periods, power, used)
 
     # Pass A: coarse log-spaced grid.
     t0 = _time.time()
     coarse_periods = np.exp(np.linspace(np.log(period_min), np.log(period_max), coarse_nperiods))
-    coarse_periods, coarse_power, coarse_best, coarse_epoch = bls_fn(
-        ds_time, ds_flux, coarse_periods, duration_phase=duration_phase,
+    coarse_power, coarse_used = _power_on_grid(
+        bls_fn, ds_time, ds_flux, coarse_periods, duration_phase, rho, n_durations,
     )
     coarse_sde = compute_sde(coarse_power)
+    coarse_best = float(coarse_periods[int(np.argmax(coarse_power))])
     logger.info(
         "  Coarse pass: %d periods in %.0f ms -> peak=%.4f d (SDE=%.2f)",
         coarse_nperiods, (_time.time() - t0) * 1000, coarse_best, float(np.max(coarse_sde)),
     )
 
-    coarse_peak_idx = _select_topk_peaks(coarse_periods, coarse_power, coarse_sde, k=topk)
+    coarse_peaks = _select_topk_peaks(coarse_periods, coarse_power, coarse_sde, k=topk)
 
-    # Pass B: refine around the global best peak.
+    # Pass B: fine grid around every kept top-k peak (and the global best).
     t0 = _time.time()
-    refine_lo = max(period_min, coarse_best * (1 - refine_half_width))
-    refine_hi = min(period_max, coarse_best * (1 + refine_half_width))
-    refine_periods = np.linspace(refine_lo, refine_hi, refine_nperiods)
-    refine_periods, refine_power, best_period, epoch = bls_fn(
-        ds_time, ds_flux, refine_periods, duration_phase=duration_phase,
-    )
+    seeds: List[float] = []
+    seen = set()
+    for pseed in [coarse_best] + [p for _, p in coarse_peaks]:
+        key = round(float(pseed), 6)
+        if key in seen or not np.isfinite(pseed) or pseed <= 0:
+            continue
+        seen.add(key)
+        seeds.append(float(pseed))
+        if len(seeds) >= max(int(topk), 1):
+            break
+
+    refine_periods_all: List[np.ndarray] = []
+    refine_power_all: List[np.ndarray] = []
+    refine_used_all: List[np.ndarray] = []
+    for pseed in seeds:
+        grid, pw, used = _refine_period(
+            bls_fn, ds_time, ds_flux, pseed,
+            period_min, period_max, refine_nperiods, refine_half_width,
+            duration_phase, rho, n_durations,
+        )
+        refine_periods_all.append(grid)
+        refine_power_all.append(pw)
+        refine_used_all.append(used)
     logger.info(
-        "  Refine pass: %d periods [%.3f-%.3f] in %.0f ms -> best=%.4f d",
-        refine_nperiods, refine_lo, refine_hi, (_time.time() - t0) * 1000, best_period,
+        "  Refine pass: %d peaks × %d periods in %.0f ms",
+        len(seeds), refine_nperiods, (_time.time() - t0) * 1000,
     )
+
+    refine_periods = np.concatenate(refine_periods_all) if refine_periods_all else coarse_periods[:0]
+    refine_power = np.concatenate(refine_power_all) if refine_power_all else coarse_power[:0]
+    refine_used = np.concatenate(refine_used_all) if refine_used_all else coarse_used[:0]
 
     all_periods = np.concatenate([coarse_periods, refine_periods])
     all_power = np.concatenate([coarse_power, refine_power])
+    all_used = np.concatenate([coarse_used, refine_used])
     sort_idx = np.argsort(all_periods)
     all_periods = all_periods[sort_idx]
     all_power = all_power[sort_idx]
-    sde = compute_sde(all_power)
+    all_used = all_used[sort_idx]
 
-    # Build peaks from the union, anchored on the coarse-pass selections so
-    # we capture multi-planet candidates.
-    peaks = _build_peaks(all_periods, all_power, sde, ds_time, best_period, topk, duration_phase,
-                         seed_periods=[p for _, p in coarse_peak_idx])
-    return BLSResult(
-        periods=all_periods, power=all_power,
-        best_period=best_period, epoch=epoch,
-        sde=float(np.max(sde)), peaks=peaks,
+    return _result(
+        all_periods, all_power, all_used,
+        seed_periods=[p for _, p in coarse_peaks],
     )
 
 
@@ -481,15 +675,16 @@ def _build_peaks(
     power: np.ndarray,
     sde: np.ndarray,
     time: np.ndarray,
+    flux: np.ndarray,
     best_period: float,
     topk: int,
-    duration_phase: float,
+    duration_used: np.ndarray,
     seed_periods: Optional[List[float]] = None,
 ) -> List[BLSPeak]:
-    """Select top-k peaks (with NMS) and recover epoch for each via NumPy fold."""
+    """Select top-k peaks (with NMS) and recover a depth-maximizing epoch for each."""
+    duration_used = np.asarray(duration_used, dtype=np.float64)
     selected = _select_topk_peaks(periods, power, sde, k=topk)
     if seed_periods:
-        # Ensure the seeded coarse peaks are present.
         existing = {round(p, 6) for _, p in selected}
         for P in seed_periods:
             if round(P, 6) not in existing:
@@ -498,27 +693,28 @@ def _build_peaks(
         selected = selected[:topk]
 
     out: List[BLSPeak] = []
-    t0 = float(np.nanmin(time))
     for idx, P in selected:
-        epoch = _epoch_for_period(time, P, duration_phase)
+        dur = float(duration_used[idx]) if idx < len(duration_used) else 0.05
+        epoch = _epoch_for_period(time, flux, float(P), dur)
         out.append(
             BLSPeak(
                 period=float(P),
                 epoch=float(epoch),
                 power=float(max(power[idx], 0.0)),
                 sde=float(sde[idx]),
-                duration_phase=duration_phase,
+                duration_phase=dur,
                 depth=float("nan"),
             )
         )
     if not out:
+        dur = float(duration_used[int(np.argmax(power))]) if len(duration_used) else 0.05
         out.append(
             BLSPeak(
                 period=float(best_period),
-                epoch=t0,
-                power=float(np.max(power)),
-                sde=float(np.max(sde)),
-                duration_phase=duration_phase,
+                epoch=_epoch_for_period(time, flux, float(best_period), dur),
+                power=float(np.max(power)) if len(power) else 0.0,
+                sde=float(np.max(sde)) if len(sde) else 0.0,
+                duration_phase=dur,
             )
         )
     return out
@@ -526,33 +722,49 @@ def _build_peaks(
 
 def _epoch_for_period(
     time: np.ndarray,
+    flux: np.ndarray,
     period: float,
     duration_phase: float,
     n_phase_steps: int = 64,
 ) -> float:
-    """Find best transit epoch for a given period via a NumPy phase-offset scan
-    using the **fixed** wrap-around mask."""
+    """Mid-transit epoch that maximizes mean in-transit depth.
+
+    Scoring by in-transit point count (``n_in``) is almost flat on a uniform
+    cadence, so the epoch was arbitrary. Folds, odd/even, and secondary tests
+    all use this epoch.
+    """
     time = np.asarray(time, dtype=np.float64)
-    phase = (time % period) / period
-    best_phi = 0.5
-    best_score = -1.0
-    for j in range(n_phase_steps):
-        phi = j / n_phase_steps
-        high = phi + duration_phase
+    flux = np.asarray(flux, dtype=np.float64)
+    if len(time) == 0 or not np.isfinite(period) or period <= 0:
+        return 0.0
+    if len(flux) != len(time):
+        raise ValueError("time and flux must have the same length")
+    phase = np.mod(time, period) / period
+    n_steps = max(int(n_phase_steps), 1)
+    dur = float(duration_phase) if duration_phase and duration_phase > 0 else 0.05
+    best_phi = 0.0
+    best_score = -np.inf
+    for j in range(n_steps):
+        phi = j / n_steps
+        high = phi + dur
         if high > 1.0:
-            in_transit = (phase >= phi) | (phase < high - 1.0)
+            in_transit = (phase >= phi) | (phase < (high - 1.0))
         else:
             in_transit = (phase >= phi) & (phase < high)
         n_in = int(np.sum(in_transit))
         if n_in < 2:
             continue
-        # Use mean depth as scoring proxy for epoch refinement.
-        score = float(n_in)
+        y_in = float(np.mean(flux[in_transit]))
+        y_out = float(np.mean(flux[~in_transit]))
+        score = y_out - y_in
         if score > best_score:
             best_score = score
             best_phi = phi
-    t0 = float(np.nanmin(time))
-    return t0 + best_phi * period
+    mid_phase = (best_phi + 0.5 * dur) % 1.0
+    t_min = float(np.nanmin(time))
+    phase_of_tmin = (t_min % period) / period
+    dphi = (mid_phase - phase_of_tmin) % 1.0
+    return float(t_min + dphi * period)
 
 
 # ---------------------------------------------------------------------------

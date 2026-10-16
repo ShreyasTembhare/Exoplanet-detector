@@ -47,8 +47,6 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -95,16 +93,21 @@ def _phase1_worker(tic_id: str, sector: int, with_tpf: bool) -> Optional[dict]:
 
 def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: int,
                    sde_threshold: float, prefilter_on: bool, backend: Optional[str],
-                   adaptive_duration: bool) -> Optional[dict]:
-    """CPU/GPU-bound: prefilter + BLS. Runs in a process or main thread."""
+                   adaptive_duration: bool, use_tls: bool = True) -> Optional[dict]:
+    """Prefilter, cached BLS, vet SDE-pass peaks, mask-and-research, monotransit MES.
+
+    The phase-2 cache is consulted first so a second pass over the same
+    TIC / sector / grid does not recompute BLS. TLS runs only inside
+    ``search_with_masking`` after the SDE gate.
+    """
     try:
         from pipeline import prefilter_target
-        from pipeline.bls_gpu import compute_bls_periodogram
         from pipeline.physical_priors import derive_rho_star
+        from pipeline.planet_search import search_with_masking
 
         time_arr = item["time"]
         flux_arr = item["flux"]
-        meta = item["meta"]
+        meta = item["meta"] or {}
 
         if prefilter_on:
             pf = prefilter_target(time_arr, flux_arr, meta=meta)
@@ -114,16 +117,31 @@ def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: i
 
         rho = derive_rho_star(meta) if adaptive_duration else 1.0
         t0 = _time.time()
-        res = compute_bls_periodogram(
+        known_period = item.get("mask_period")
+        known_epoch = item.get("mask_epoch")
+        found = search_with_masking(
             time_arr, flux_arr,
+            tic_id=item["tic_id"], sector=str(item["sector"]),
             period_min=period_min, period_max=period_max, nperiods=nperiods,
-            duration_phase=None if adaptive_duration else 0.05,
             backend=backend, rho_star_solar=rho,
+            adaptive_duration=adaptive_duration,
+            sde_threshold=sde_threshold,
+            use_cache=known_period is None,
+            use_tls=use_tls,
+            tpf_time=item.get("tpf_time"),
+            tpf_flux_cube=item.get("tpf_flux_cube"),
+            ra=float(meta.get("ra", float("nan"))),
+            dec=float(meta.get("dec", float("nan"))),
+            known_period=known_period,
+            known_epoch=known_epoch,
         )
-        item["bls"] = res
         item["phase2_ms"] = (_time.time() - t0) * 1000
-        if res.sde < sde_threshold:
-            item["status"] = f"NO_SIGNAL (SDE={res.sde:.2f})"
+        item["bls"] = found.get("bls")
+        item["signals"] = found.get("signals") or []
+        item["monotransit"] = found.get("monotransit")
+        if not item["signals"] and item["monotransit"] is None:
+            sde = item["bls"].sde if item["bls"] is not None else float("nan")
+            item["status"] = f"NO_SIGNAL (SDE={sde:.2f})" if sde == sde else "NO_SIGNAL"
         return item
     except Exception as exc:
         logger.warning("Phase 2 failed for %s: %s", item.get("tic_id"), exc)
@@ -132,31 +150,15 @@ def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: i
 
 
 def _phase3_worker(item: dict) -> Optional[dict]:
-    """CPU-bound: fold + vet. Runs in a CPU process pool."""
-    if "status" in item:
-        return item  # already failed/filtered
-    try:
-        from pipeline import run_phase3
+    """Folding already happened on each SDE-pass peak inside phase 2.
 
-        t0 = _time.time()
-        res = item["bls"]
-        global_view, local_view, centroid_offset, extras = run_phase3(
-            item["time"], item["flux"], res.best_period, res.epoch,
-            tic_id=item["tic_id"], sector=item["sector"], use_cache=True,
-            bls_sde=res.sde, bls_periods=res.periods, bls_power=res.power,
-            tpf_time=item.get("tpf_time"),
-            tpf_flux_cube=item.get("tpf_flux_cube"),
-        )
-        item["global_view"] = global_view
-        item["local_view"] = local_view
-        item["centroid_offset"] = centroid_offset
-        item["extras"] = extras
-        item["phase3_ms"] = (_time.time() - t0) * 1000
+    This stage only stamps timing so the process-pool slot still exists for
+    debugging. Signals and the monotransit statistic are already on ``item``.
+    """
+    if "status" in item and not item.get("signals") and not item.get("monotransit"):
         return item
-    except Exception as exc:
-        logger.warning("Phase 3 failed for %s: %s", item.get("tic_id"), exc)
-        item["status"] = f"ERROR: {exc}"
-        return item
+    item["phase3_ms"] = item.get("phase3_ms", 0.0)
+    return item
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +168,9 @@ def _phase3_worker(item: dict) -> Optional[dict]:
 
 def run_parallel_hunt(
     sector: int,
-    tics: List[str],
+    tics: Optional[List[str]] = None,
     *,
+    targets: Optional[list] = None,
     period_min: float = 0.5,
     period_max: float = 15.0,
     nperiods: int = 10000,
@@ -184,6 +187,7 @@ def run_parallel_hunt(
     adaptive_duration: bool = True,
     infer_batch_size: int = 32,
     queue_depth: int = 32,
+    use_tls: bool = True,
 ) -> Dict[str, Any]:
     """Run a sector hunt with the producer-consumer pipeline above."""
     from hunter import (
@@ -195,12 +199,21 @@ def run_parallel_hunt(
         _predict_batch,
         _save_candidate_evidence,
         _save_candidate_plot,
+        status_for_probability,
     )
+    from pipeline.target_rank import TargetRecord
 
+    if targets is None:
+        targets = [TargetRecord(tic_id=str(tic)) for tic in (tics or [])]
     log_file = log_file or f"processed_stars_s{sector:03d}.txt"
     _ensure_setup(log_file, candidate_dir)
 
     model, device = _load_model(checkpoint) if checkpoint else (None, None)
+    if model is None:
+        logger.warning(
+            "No checkpoint at %s. SDE-pass stars will be saved as CANDIDATE_SDE with vetting JSON.",
+            checkpoint,
+        )
 
     q_phase2 = queue.Queue(maxsize=queue_depth)
     q_phase3 = queue.Queue(maxsize=queue_depth)
@@ -218,19 +231,24 @@ def run_parallel_hunt(
     def producer():
         with ThreadPoolExecutor(max_workers=download_workers) as ex:
             futures = {
-                ex.submit(_phase1_worker, tic, sector, with_tpf): tic for tic in tics
+                ex.submit(_phase1_worker, f"TIC {target.tic_norm}", sector, with_tpf): target
+                for target in targets
             }
             for fut in futures:
-                tic = futures[fut]
+                target = futures[fut]
                 try:
                     item = fut.result()
                 except Exception as exc:
-                    logger.warning("download fail %s: %s", tic, exc)
+                    logger.warning("download fail %s: %s", target.tic_norm, exc)
                     item = None
                 if item is None:
-                    _append_log(log_file, _normalize_tic(tic), STAGE_DONE,
-                                "ERROR: phase1 failed")
+                    _append_log(log_file, target.tic_norm, STAGE_DONE, "ERROR: phase1 failed")
                     continue
+                if target.queue == "second_pass" and target.known_period == target.known_period:
+                    item["mask_period"] = float(target.known_period)
+                    item["mask_epoch"] = (
+                        float(target.known_epoch) if target.known_epoch == target.known_epoch else None
+                    )
                 item["tic_start"] = _time.time()
                 q_phase2.put(item)
         q_phase2.put(SENTINEL)
@@ -244,7 +262,7 @@ def run_parallel_hunt(
                 return
             item = _phase2_worker(
                 item, period_min, period_max, nperiods,
-                sde_threshold, prefilter, bls_backend, adaptive_duration,
+                sde_threshold, prefilter, bls_backend, adaptive_duration, use_tls,
             )
             if "status" in item:
                 _drain_failed(item, log_file, timings_path)
@@ -294,47 +312,109 @@ def run_parallel_hunt(
                 _flush_batch(batch)
                 batch = []
 
+    def _rows_for_item(item: dict) -> List[dict]:
+        signals = list(item.get("signals") or [])
+        mono = item.get("monotransit")
+        if mono is not None:
+            signals.append({
+                "period": float("nan"),
+                "epoch": mono["epoch"],
+                "sde": mono["mes"],
+                "power": 0.0,
+                "global_view": None,
+                "local_view": None,
+                "centroid_offset": float("nan"),
+                "vetting": {
+                    "depth": mono["depth"],
+                    "duration_hours": mono["duration_days"] * 24.0,
+                    "n_transits": 1,
+                    "transit_center_btjd": mono["epoch"],
+                    "mes": mono["mes"],
+                    "kind": "monotransit",
+                },
+                "hard_flags": ["n_transits"],
+                "kind": "monotransit",
+            })
+        rows = []
+        for sig in signals:
+            vetting = dict(sig.get("vetting") or {})
+            vetting["hard_flags"] = list(sig.get("hard_flags") or [])
+            rows.append({
+                "global_view": sig.get("global_view"),
+                "local_view": sig.get("local_view"),
+                "centroid_offset": sig.get("centroid_offset"),
+                "period": sig.get("period"),
+                "epoch": sig.get("epoch"),
+                "sde": sig.get("sde"),
+                "power": sig.get("power") or 0.0,
+                "vetting": vetting,
+                "tic_id": item["tic_id"],
+                "time": item["time"],
+                "flux": item["flux"],
+                "phase1_ms": item.get("phase1_ms", 0.0),
+                "phase2_ms": item.get("phase2_ms", 0.0),
+                "phase3_ms": item.get("phase3_ms", 0.0),
+                "tic_start": item.get("tic_start", _time.time()),
+                "peaks": [
+                    {"period": s.get("period"), "epoch": s.get("epoch"),
+                     "power": s.get("power"), "sde": s.get("sde")}
+                    for s in signals
+                ],
+            })
+        return rows
+
     def _flush_batch(batch: List[dict]):
         nonlocal completed
+        rows = []
+        for item in batch:
+            rows.extend(_rows_for_item(item))
+        if not rows:
+            return
+        predictable = [
+            row for row in rows
+            if row["global_view"] is not None and row["local_view"] is not None
+        ]
         t0 = _time.time()
-        if model is None:
-            probs = [None] * len(batch)
+        if model is None or not predictable:
+            pred_probs = [None] * len(predictable)
         else:
-            probs = _predict_batch(model, device, batch)
-        per_item_ms = (_time.time() - t0) * 1000 / max(len(batch), 1)
-        for item, prob in zip(batch, probs):
-            res = item["bls"]
-            tic_norm = _normalize_tic(item["tic_id"])
-            if prob is None:
-                status = "CLEARED"
-            elif prob >= threshold:
-                status = f"CANDIDATE ({prob:.2f})"
+            pred_probs = _predict_batch(model, device, predictable)
+        per_item_ms = (_time.time() - t0) * 1000 / max(len(rows), 1)
+        prob_by_id = {id(row): prob for row, prob in zip(predictable, pred_probs)}
+        seen_tics = set()
+        for row in rows:
+            prob = prob_by_id.get(id(row))
+            status = status_for_probability(prob, threshold)
+            tic_norm = _normalize_tic(row["tic_id"])
+            if status == "CANDIDATE_SDE" or status.startswith("CANDIDATE ("):
                 plot_path = _save_candidate_plot(
-                    item["time"], item["flux"], res.best_period, res.epoch,
-                    item["tic_id"], prob, candidate_dir,
+                    row["time"], row["flux"], row["period"], row["epoch"],
+                    row["tic_id"], prob, candidate_dir,
                 )
                 _save_candidate_evidence(
-                    candidate_dir, item["tic_id"], res.best_period, prob,
-                    float(np.max(res.power)), res.sde,
-                    item["centroid_offset"] or 0.0, plot_path,
-                    vetting=item["extras"].get("vetting", {}),
-                    peaks=[{"period": pk.period, "epoch": pk.epoch, "power": pk.power, "sde": pk.sde}
-                           for pk in res.peaks],
-                    strategy_profile="parallel",
+                    candidate_dir, row["tic_id"], row["period"] if row["period"] == row["period"] else 0.0,
+                    prob, float(row["power"] or 0.0), float(row["sde"]),
+                    row["centroid_offset"] if row["centroid_offset"] == row["centroid_offset"] else 0.0,
+                    plot_path, vetting=row["vetting"], peaks=row["peaks"],
+                    strategy_profile="parallel", epoch=row["epoch"],
                 )
-                candidates.append({"tic_id": item["tic_id"], "period": res.best_period,
-                                   "prob_planet": prob, "sde": res.sde})
-            else:
-                status = "CLEARED"
-
-            total_ms = (_time.time() - item["tic_start"]) * 1000
+                candidates.append({
+                    "tic_id": row["tic_id"], "period": row["period"],
+                    "prob_planet": prob, "sde": row["sde"], "epoch": row["epoch"],
+                    "status": status,
+                })
+            total_ms = (_time.time() - row["tic_start"]) * 1000
             _append_log(log_file, tic_norm, STAGE_DONE, status,
-                        best_period=res.best_period, sde=res.sde)
-            with open(timings_path, "a") as f:
-                f.write(f"{tic_norm},{item['phase1_ms']:.0f},{item['phase2_ms']:.0f},"
-                        f"{item['phase3_ms']:.0f},{per_item_ms:.0f},{total_ms:.0f},"
-                        f"{res.sde:.3f},{status}\n")
-            completed += 1
+                        best_period=row["period"], sde=row["sde"])
+            if tic_norm not in seen_tics:
+                with open(timings_path, "a") as handle:
+                    handle.write(
+                        f"{tic_norm},{row['phase1_ms']:.0f},{row['phase2_ms']:.0f},"
+                        f"{row['phase3_ms']:.0f},{per_item_ms:.0f},{total_ms:.0f},"
+                        f"{float(row['sde']):.3f},{status}\n"
+                    )
+                seen_tics.add(tic_norm)
+                completed += 1
         gc.collect()
 
     threads = [
@@ -412,14 +492,17 @@ def main():
                         choices=[None, "jax", "numpy", "astropy", "cuvarbase"])
     args = parser.parse_args()
 
-    from hunter import _get_sector_target_list
-    tics = _get_sector_target_list(args.sector, args.limit, args.tic_list)
-    if not tics:
+    from hunter import _get_ranked_queue
+    ranked = _get_ranked_queue(
+        args.sector, args.limit, args.tic_list, args.period_min, args.period_max,
+    )
+    targets = ranked.search_order()
+    if not targets:
         logger.error("No targets for sector %d.", args.sector)
         sys.exit(1)
     return run_parallel_hunt(
         sector=args.sector,
-        tics=tics,
+        targets=targets,
         period_min=args.period_min,
         period_max=args.period_max,
         nperiods=args.nperiods,

@@ -148,6 +148,7 @@ def run_phase3(
     ra: float = float("nan"),
     dec: float = float("nan"),
     toi_table: Optional[object] = None,
+    skip_gaia: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, float, dict]:
     """
     Returns ``(global_view, local_view, centroid_offset, extras)`` where
@@ -192,6 +193,7 @@ def run_phase3(
         tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
         ra=ra, dec=dec, tic_id=tic_id, toi_table=toi_table,
         half_width=transit_half_width,
+        skip_gaia=skip_gaia,
     )
 
     extras = {
