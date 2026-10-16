@@ -166,14 +166,15 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
     log_file = f"processed_stars_s{sector:03d}.txt"
     try:
         if parallel:
-            from hunter import _get_sector_target_list
+            from hunter import _get_ranked_queue
             from parallel_hunter import run_parallel_hunt
-            tics = _get_sector_target_list(sector, limit, None)
-            if not tics:
+            ranked = _get_ranked_queue(sector, limit, None, period_min, period_max)
+            targets = ranked.search_order()
+            if not targets:
                 logger.error("No targets for sector %d.", sector)
                 return {"completed": 0, "candidates": []}
             return run_parallel_hunt(
-                sector=sector, tics=tics,
+                sector=sector, targets=targets,
                 period_min=period_min, period_max=period_max, nperiods=nperiods,
                 sde_threshold=sde_threshold, threshold=threshold,
                 checkpoint=checkpoint, candidate_dir=candidate_dir,
@@ -205,7 +206,7 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
                   max_per_class=2500, train_epochs=30, candidate_dir=CANDIDATE_DIR,
                   state_file=STATE_FILE, strategy_profile=None,
                   period_min=0.5, period_max=15.0, nperiods=10000,
-                  parallel=False, download_workers=8, cpu_workers=4,
+                  parallel=True, download_workers=8, cpu_workers=4,
                   bls_backend=None):
     """Core autopilot logic, callable without CLI arg parsing.
 
@@ -339,7 +340,9 @@ def main():
     parser.add_argument("--period-max", type=float, default=15.0)
     parser.add_argument("--nperiods", type=int, default=10000)
     parser.add_argument("--parallel", action="store_true",
-                        help="Use the parallel hunter (producer-consumer pipeline) per sector.")
+                        help="Use the parallel hunter (this is the default).")
+    parser.add_argument("--sequential", action="store_true",
+                        help="Use sequential hunter.py for debugging.")
     parser.add_argument("--download-workers", type=int, default=8,
                         help="Parallel MAST download threads (only with --parallel).")
     parser.add_argument("--cpu-workers", type=int, default=4,
@@ -358,7 +361,7 @@ def main():
         strategy_profile=args.strategy_profile,
         period_min=args.period_min, period_max=args.period_max,
         nperiods=args.nperiods,
-        parallel=args.parallel,
+        parallel=not args.sequential,
         download_workers=args.download_workers,
         cpu_workers=args.cpu_workers,
         bls_backend=args.bls_backend,

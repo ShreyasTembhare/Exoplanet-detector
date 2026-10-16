@@ -134,12 +134,38 @@ def _load_progress(log_file: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _get_sector_target_list(sector: int, limit: int, tic_list_path: str = None):
-    if tic_list_path and os.path.exists(tic_list_path):
-        with open(tic_list_path) as f:
-            lines = [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
-        tics = [_normalize_tic(t) for t in lines]
-        return list(dict.fromkeys(tics))[:limit]
+def _records_from_tic_file(path: str):
+    """A TIC file is either one id per line or a CSV with catalog columns."""
+    from pipeline.target_rank import TargetRecord, records_from_rows
+
+    with open(path) as handle:
+        raw = handle.read()
+    lines = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+    if not lines:
+        return []
+    header = lines[0].lower()
+    if "," in lines[0] and any(token in header for token in ("tic", "radius", "tmag", "crowdsap", "disposition")):
+        import pandas as pd
+        frame = pd.read_csv(path, comment="#")
+        frame.columns = [str(c).strip().lower() for c in frame.columns]
+        return records_from_rows(frame.to_dict(orient="records"))
+    records = []
+    seen = set()
+    for line in lines:
+        tic = _normalize_tic(line.split(",")[0].split()[0])
+        if tic and tic not in seen:
+            seen.add(tic)
+            records.append(TargetRecord(tic_id=tic))
+    return records
+
+
+def _fetch_sector_records(sector: int, cap: int):
+    """MAST/lightkurve target list. Columns are kept when the table has them.
+
+    The list is not cut to ``cap`` until after ranking. ``cap`` only bounds
+    the catalog pull so a sector query cannot be unbounded.
+    """
+    from pipeline.target_rank import TargetRecord, records_from_rows
 
     try:
         from astroquery.mast import Observations
@@ -150,11 +176,30 @@ def _get_sector_target_list(sector: int, limit: int, tic_list_path: str = None):
             dataproduct_type="timeseries",
         )
         if obs is not None and len(obs) > 0:
-            col = "target_name" if "target_name" in obs.colnames else obs.colnames[0]
-            tics = [_normalize_tic(str(n)) for n in obs[col]]
-            unique = list(dict.fromkeys(t for t in tics if t and t.isdigit()))
-            logger.info("MAST returned %d numeric TICs for sector %d", len(unique), sector)
-            return unique[:limit]
+            rows = []
+            take = min(len(obs), cap)
+            for i in range(take):
+                row = {name: obs[name][i] for name in obs.colnames}
+                name = row.get("target_name", row.get(obs.colnames[0]))
+                tic = _normalize_tic(str(name))
+                if not tic or not tic.isdigit():
+                    continue
+                rows.append({
+                    "tic_id": tic,
+                    "ra": row.get("s_ra", float("nan")),
+                    "dec": row.get("s_dec", float("nan")),
+                    "tmag": row.get("t_mag", row.get("tess_mag", float("nan"))),
+                })
+            # Unique, preserving pull order for ties.
+            seen = set()
+            unique_rows = []
+            for row in rows:
+                if row["tic_id"] in seen:
+                    continue
+                seen.add(row["tic_id"])
+                unique_rows.append(row)
+            logger.info("MAST returned %d numeric TICs for sector %d", len(unique_rows), sector)
+            return records_from_rows(unique_rows)
     except Exception as e:
         logger.warning("MAST query failed (%s); trying lightkurve fallback.", e)
 
@@ -164,12 +209,103 @@ def _get_sector_target_list(sector: int, limit: int, tic_list_path: str = None):
         if search is not None and len(search) > 0 and hasattr(search, "table"):
             col = "target_name" if "target_name" in search.table.colnames else search.table.colnames[0]
             tics = [_normalize_tic(str(n)) for n in search.table[col]]
-            return list(dict.fromkeys(t for t in tics if t and t.isdigit()))[:limit]
+            seen = set()
+            records = []
+            for tic in tics:
+                if tic and tic.isdigit() and tic not in seen:
+                    seen.add(tic)
+                    records.append(TargetRecord(tic_id=tic))
+                    if len(records) >= cap:
+                        break
+            return records
     except Exception as e:
         logger.warning("lightkurve fallback also failed (%s).", e)
-
-    logger.error("Could not fetch targets for sector %d. Provide --tic-list.", sector)
     return []
+
+
+def _attach_toi_dispositions(records):
+    """Mark known CP/KP hosts and FP/FA using the TOI table, when it answers.
+
+    This is one catalog query, before any light curve download. A failure
+    leaves dispositions blank; ranking does not use sky position.
+    """
+    if not records:
+        return records
+    try:
+        from astroquery.nasa_exoplanet_archive import NasaExoplanetArchive
+        toi = NasaExoplanetArchive.query_criteria(
+            table="toi",
+            select="tid,tfopwg_disp,pl_orbper,pl_tranmid,st_rad,st_tmag",
+        )
+        frame = toi.to_pandas()
+    except Exception as exc:
+        logger.info("TOI table unavailable (%s); known-host queue stays empty.", exc)
+        return records
+
+    by_tic = {}
+    for _, row in frame.iterrows():
+        try:
+            tic = str(int(row["tid"]))
+        except (TypeError, ValueError):
+            continue
+        by_tic[tic] = row
+    for rec in records:
+        row = by_tic.get(rec.tic_norm)
+        if row is None:
+            continue
+        disp = str(row.get("tfopwg_disp", "") or "").strip().upper()
+        if disp and disp != "NAN":
+            rec.disposition = disp
+        for attr, column in (
+            ("known_period", "pl_orbper"),
+            ("known_epoch", "pl_tranmid"),
+            ("radius", "st_rad"),
+            ("tmag", "st_tmag"),
+        ):
+            try:
+                value = float(row.get(column))
+            except (TypeError, ValueError):
+                continue
+            if value == value:
+                current = getattr(rec, attr)
+                if attr in ("radius", "tmag") and current == current:
+                    continue
+                setattr(rec, attr, value)
+    return records
+
+
+def _get_ranked_queue(
+    sector: int, limit: int, tic_list_path: str = None,
+    period_min: float = 0.5, period_max: float = 15.0,
+):
+    """Best-N primary targets, then a masked second pass for known CP/KP hosts."""
+    from pipeline.target_rank import rank_targets
+
+    if tic_list_path and os.path.exists(tic_list_path):
+        records = _records_from_tic_file(tic_list_path)
+    else:
+        # Pull a wider pool than ``limit`` so ranking, not MAST order, chooses.
+        records = _fetch_sector_records(sector, cap=max(int(limit) * 20, int(limit)))
+        if not records:
+            logger.error("Could not fetch targets for sector %d. Provide --tic-list.", sector)
+            from pipeline.target_rank import RankedQueue
+            return RankedQueue(primary=[], second_pass=[])
+        records = _attach_toi_dispositions(records)
+    return rank_targets(
+        records, limit=limit, period_min=period_min, period_max=period_max,
+    )
+
+
+def _get_sector_target_list(
+    sector: int, limit: int, tic_list_path: str = None,
+    period_min: float = 0.5, period_max: float = 15.0,
+):
+    """TIC ids in search order: best N by expected SNR, then known-host second pass.
+
+    ``limit`` is the best N primary targets, not the first N MAST returned.
+    """
+    queue = _get_ranked_queue(sector, limit, tic_list_path, period_min, period_max)
+    return [rec.tic_norm for rec in queue.search_order()]
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +317,13 @@ def _save_candidate_plot(time, flux, best_period, epoch, tic_id: str, prob_plane
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    phase = ((time - epoch) % best_period) / best_period
+    period_ok = best_period is not None and best_period == best_period and best_period > 0
+    epoch_ok = epoch is not None and epoch == epoch
+    if period_ok and epoch_ok:
+        phase = ((time - epoch) % best_period) / best_period
+    else:
+        phase = np.zeros_like(np.asarray(time, dtype=np.float64))
+        best_period = 0.0 if not period_ok else best_period
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
     axes[0].scatter(phase, flux, s=1, alpha=0.7)
     axes[0].set_xlabel("Phase")
@@ -197,7 +339,11 @@ def _save_candidate_plot(time, flux, best_period, epoch, tic_id: str, prob_plane
     axes[1].plot(np.linspace(0, 1, n_bins), binned, "k-", lw=1)
     axes[1].set_xlabel("Phase")
     axes[1].set_ylabel("Binned flux")
-    axes[1].set_title(f"Binned view | Prob: {prob_planet:.2%}")
+    if prob_planet is None or prob_planet != prob_planet:
+        prob_txt = "SDE (no classifier)"
+    else:
+        prob_txt = f"{float(prob_planet):.2%}"
+    axes[1].set_title(f"Binned view | Prob: {prob_txt}")
     fig.suptitle(f"CANDIDATE: TIC {tic_id} | P={best_period:.4f} d", fontsize=13)
     fig.tight_layout()
     safe_tic = str(tic_id).replace(" ", "_").replace("/", "_")
@@ -207,20 +353,35 @@ def _save_candidate_plot(time, flux, best_period, epoch, tic_id: str, prob_plane
     return path
 
 
+def status_for_probability(prob_planet, threshold: float) -> str:
+    """SDE-pass stars stay candidates when there is no checkpoint."""
+    if prob_planet is None:
+        return "CANDIDATE_SDE"
+    if float(prob_planet) >= float(threshold):
+        return f"CANDIDATE ({float(prob_planet):.2f})"
+    return "CLEARED"
+
+
 def _save_candidate_evidence(
     candidate_dir: str, tic_id: str, best_period: float, prob_planet: float,
     bls_power: float, sde: float, centroid_offset: float,
     plot_path: str, vetting: dict, peaks: list, strategy_profile: str,
+    epoch: float = None,
 ):
     safe_tic = str(tic_id).replace(" ", "_").replace("/", "_")
+    vetting = dict(vetting or {})
+    if epoch is not None and epoch == epoch:
+        vetting.setdefault("transit_center_btjd", float(epoch))
     meta = {
         "tic_id": tic_id,
         "best_period": best_period,
+        "epoch": None if epoch is None or epoch != epoch else float(epoch),
         "prob_planet": prob_planet,
         "bls_max_power": bls_power,
         "sde": sde,
         "centroid_offset": centroid_offset if centroid_offset == centroid_offset else None,
         "vetting": vetting,
+        "hard_flags": vetting.get("hard_flags", []),
         "alt_peaks": peaks,
         "strategy_profile": strategy_profile,
         "plot": plot_path,
@@ -256,25 +417,49 @@ def _load_model(checkpoint_path: str):
 
 
 def _predict_batch(model, device, items):
-    """Run batched inference. items: list of dicts with global_view, local_view, centroid_offset."""
-    if model is None:
+    """Batched inference with the same contract as ``train_classifier``.
+
+    Two-tower checkpoints are called as
+    ``TwoTowerResNet1D.forward(global, local, centroid_offset=...)`` on
+    ``make_two_tower_inputs``. A legacy single-tower checkpoint still accepts
+    the stacked two-channel tensor.
+    """
+    if model is None or not items:
         return [None] * len(items)
     try:
         import torch
 
-        from models.resnet1d import make_two_channel
+        from models.resnet1d import TwoTowerResNet1D, make_two_channel, make_two_tower_inputs
     except ImportError:
         return [None] * len(items)
-    xs, cos = [], []
+
+    two_tower = isinstance(model, TwoTowerResNet1D) or hasattr(model, "global_tower")
+    cos = []
+    if two_tower:
+        globals_, locals_ = [], []
+        for item in items:
+            global_in, local_in = make_two_tower_inputs(item["global_view"], item["local_view"])
+            globals_.append(global_in)
+            locals_.append(local_in)
+            co = item.get("centroid_offset")
+            cos.append(float(co) if co == co and co is not None else 0.0)
+        global_t = torch.from_numpy(np.stack(globals_, axis=0)).float().to(device)
+        local_t = torch.from_numpy(np.stack(locals_, axis=0)).float().to(device)
+        co_t = torch.tensor(cos, device=device, dtype=torch.float32)
+        with torch.inference_mode():
+            logits = model(global_t, local_t, centroid_offset=co_t)
+            probs = torch.softmax(logits, dim=1)
+        return [probs[i, 1].item() for i in range(len(items))]
+
+    xs = []
     for item in items:
-        gv, lv, co = item["global_view"], item["local_view"], item["centroid_offset"]
-        co_val = float(co) if co == co and co is not None else 0.0
-        xs.append(make_two_channel(gv, lv))
-        cos.append(co_val)
-    x = torch.from_numpy(np.stack(xs, axis=0)).float().to(device)
+        xs.append(make_two_channel(item["global_view"], item["local_view"]))
+        co = item.get("centroid_offset")
+        cos.append(float(co) if co == co and co is not None else 0.0)
+    stacked = torch.from_numpy(np.stack(xs, axis=0)).float().to(device)
     co_t = torch.tensor(cos, device=device, dtype=torch.float32)
     with torch.inference_mode():
-        logits = model(x, centroid_offset=co_t)
+        logits = model(stacked, centroid_offset=co_t)
         probs = torch.softmax(logits, dim=1)
     return [probs[i, 1].item() for i in range(len(items))]
 
@@ -304,7 +489,7 @@ def run_hunt(
     checkpoint=DEFAULT_CHECKPOINT, log_file=LOG_FILE, candidate_dir=CANDIDATE_DIR,
     tic_list=None, infer_batch_size=32, period_min=0.5, period_max=15.0,
     nperiods=10000, strategy_profile=None, with_tpf=True, prefilter=True,
-    backend=None, adaptive_duration=True, use_tls=False,
+    backend=None, adaptive_duration=True, use_tls=True,
 ):
     """Core hunt logic, callable without CLI arg parsing."""
     candidates_found = []
@@ -312,23 +497,28 @@ def run_hunt(
     progress = _load_progress(log_file)
     logger.info("Loaded progress for %d TICs from %s", len(progress), log_file)
 
-    target_list = _get_sector_target_list(sector, limit, tic_list)
+    ranked = _get_ranked_queue(sector, limit, tic_list, period_min, period_max)
+    target_list = ranked.search_order()
     if not target_list:
         logger.error("No targets for sector %s.", sector)
         return {"completed": 0, "candidates": candidates_found}
-    logger.info("Sector %s: %d unique targets (limit %d)", sector, len(target_list), limit)
+    logger.info(
+        "Sector %s: %d primary + %d known-host second pass (limit %d means best N)",
+        sector, len(ranked.primary), len(ranked.second_pass), limit,
+    )
 
     model, device = _load_model(checkpoint)
     if model is None:
-        logger.warning("Running without classifier; all SDE-pass stars will be logged as CLEARED.")
+        logger.warning(
+            "No checkpoint at %s. SDE-pass stars will be saved as CANDIDATE_SDE with vetting JSON.",
+            checkpoint,
+        )
 
     from pipeline import (
         fetch_tpf_arrays,
         prefilter_target,
         run_phase1,
-        run_phase3,
     )
-    from pipeline.bls_gpu import compute_bls_periodogram
     from pipeline.physical_priors import derive_rho_star
 
     total = len(target_list)
@@ -356,10 +546,8 @@ def run_hunt(
             tic_id_q = item["tic_id"]
             best_period_q = item["best_period"]
 
-            if prob_planet is None:
-                status_q = "CLEARED"
-            elif prob_planet >= threshold:
-                status_q = f"CANDIDATE ({prob_planet:.2f})"
+            status_q = status_for_probability(prob_planet, threshold)
+            if status_q == "CANDIDATE_SDE" or status_q.startswith("CANDIDATE ("):
                 plot_path = _save_candidate_plot(
                     item["time_arr"], item["flux_arr"], best_period_q,
                     item["epoch"], tic_id_q, prob_planet, candidate_dir,
@@ -369,14 +557,15 @@ def run_hunt(
                     item["max_power"] or 0.0, item["sde"], item["centroid_offset"] or 0.0,
                     plot_path, vetting=item["vetting"], peaks=item["peaks"],
                     strategy_profile=strategy_profile or "",
+                    epoch=item["epoch"],
                 )
                 candidates_found.append({
                     "tic_id": tic_id_q, "period": best_period_q,
                     "prob_planet": prob_planet, "sde": item["sde"],
+                    "epoch": item["epoch"],
                     "strategy_profile": strategy_profile,
+                    "status": status_q,
                 })
-            else:
-                status_q = "CLEARED"
 
             total_ms = (_time.time() - item["tic_start"]) * 1000
             _append_log(log_file, tic_norm_q, STAGE_DONE, status_q,
@@ -400,8 +589,9 @@ def run_hunt(
         predict_queue.clear()
         gc.collect()
 
-    for i, tic_raw in enumerate(target_list):
-        tic_id = tic_raw if tic_raw.upper().startswith("TIC") else f"TIC {tic_raw}"
+    for i, target in enumerate(target_list):
+        tic_raw = target.tic_norm
+        tic_id = tic_raw if str(tic_raw).upper().startswith("TIC") else f"TIC {tic_raw}"
         tic_norm = _normalize_tic(tic_id)
 
         if _should_skip_stage(progress, tic_norm, "predict"):
@@ -410,7 +600,6 @@ def run_hunt(
         logger.info("[%s/%s] Processing %s...", i + 1, total, tic_id)
         time_arr, flux_arr = None, None
         best_period, epoch, max_power, sde_val = None, None, None, float("nan")
-        global_view, local_view, centroid_offset = None, None, None
         peaks_list: list = []
         vetting_dict: dict = {}
         timings = {"phase1": 0, "phase2": 0, "phase3": 0, "predict": 0}
@@ -439,95 +628,95 @@ def run_hunt(
                     logger.info("  -> %s", status)
                     continue
 
-            # --- Phase 2 (BLS) ---
+            # --- Phase 2–3: BLS, vet every SDE-pass peak, mask, MES ---
             t0 = _time.time()
             rho_star = derive_rho_star(meta) if adaptive_duration else 1.0
-            # We bypass run_phase2's defaults here so we can pass backend +
-            # adaptive duration; cache key is unchanged.
-            from pipeline.cache_io import get_phase2, set_phase2
-            res = None
-            cached = get_phase2(tic_id, sector_label, period_min, period_max, nperiods)
-            if cached is not None:
-                periods, power, best_p, epoch_c, peaks_c = cached
-                from pipeline.bls_gpu import BLSResult
-                from pipeline.bls_gpu import compute_sde as _compute_sde
-                sde_arr = _compute_sde(power)
-                res = BLSResult(periods=periods, power=power, best_period=best_p,
-                                epoch=epoch_c, sde=float(np.max(sde_arr)), peaks=peaks_c)
-            else:
-                res = compute_bls_periodogram(
-                    time_arr, flux_arr,
-                    period_min=period_min, period_max=period_max, nperiods=nperiods,
-                    duration_phase=None if adaptive_duration else 0.05,
-                    backend=backend, rho_star_solar=rho_star,
-                )
-                set_phase2(tic_id, sector_label, period_min, period_max, nperiods,
-                           res.periods, res.power, res.best_period, res.epoch, peaks=res.peaks)
-            timings["phase2"] = (_time.time() - t0) * 1000
-            best_period = res.best_period
-            epoch = res.epoch
-            max_power = float(np.max(res.power))
-            sde_val = res.sde
-            peaks_list = [
-                {"period": p.period, "epoch": p.epoch, "power": p.power, "sde": p.sde}
-                for p in res.peaks
-            ]
-
-            # SDE gate (cadence-invariant) + legacy power gate (default off)
-            if sde_val < sde_threshold or max_power < bls_threshold:
-                status = f"NO_SIGNAL (SDE={sde_val:.2f})"
-                _append_log(log_file, tic_norm, STAGE_DONE, status,
-                            best_period=best_period, sde=sde_val)
-                progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
-                logger.info("  -> %s (SDE=%.2f < %.2f)", status, sde_val, sde_threshold)
-                continue
-
-            # Optional TLS refinement on top peaks (slow but small-planet friendly)
-            tls_refinements = []
-            if use_tls:
-                from pipeline import best_refinement, refine_peaks
-                tls_refinements = refine_peaks(
-                    time_arr, flux_arr, res.peaks, max_peaks=3,
-                )
-                br = best_refinement(tls_refinements)
-                if br is not None:
-                    logger.info("  TLS refined: P=%.4f, depth=%.5f, SDE=%.2f, SNR=%.2f",
-                                br.period, br.depth, br.sde, br.snr)
-                    if br.sde > sde_val:
-                        # Use TLS period if it found a stronger signal.
-                        best_period = br.period
-                        epoch = br.epoch
-                        sde_val = max(sde_val, br.sde)
-
-            # --- Phase 3 + vetting ---
-            t0 = _time.time()
             tpf_data = None
             if with_tpf:
                 tpf_data = fetch_tpf_arrays(tic_id, sector=sector, use_cache=True)
             tpf_time = tpf_data[0] if tpf_data else None
             tpf_flux_cube = tpf_data[1] if tpf_data else None
-
-            global_view, local_view, centroid_offset, extras = run_phase3(
-                time_arr, flux_arr, best_period, epoch,
-                tic_id=tic_id, sector=sector_label, use_cache=True,
-                bls_sde=sde_val, bls_periods=res.periods, bls_power=res.power,
+            known_period = target.known_period if target.queue == "second_pass" else None
+            known_epoch = target.known_epoch if target.queue == "second_pass" else None
+            from pipeline.planet_search import search_with_masking
+            found = search_with_masking(
+                time_arr, flux_arr,
+                tic_id=tic_id, sector=str(sector_label),
+                period_min=period_min, period_max=period_max, nperiods=nperiods,
+                backend=backend, rho_star_solar=rho_star,
+                adaptive_duration=adaptive_duration,
+                sde_threshold=sde_threshold,
+                use_cache=True, use_tls=use_tls, max_planets=3,
                 tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
+                ra=float(meta.get("ra", float("nan"))) if isinstance(meta, dict) else float("nan"),
+                dec=float(meta.get("dec", float("nan"))) if isinstance(meta, dict) else float("nan"),
+                known_period=known_period if known_period == known_period else None,
+                known_epoch=known_epoch if known_epoch == known_epoch else None,
+                run_triceratops=True,
             )
-            timings["phase3"] = (_time.time() - t0) * 1000
-            vetting_dict = extras.get("vetting", {}) if isinstance(extras, dict) else {}
-
-            predict_queue.append({
-                "tic_norm": tic_norm, "tic_id": tic_id,
-                "time_arr": time_arr, "flux_arr": flux_arr,
-                "best_period": best_period, "epoch": epoch,
-                "max_power": max_power, "sde": sde_val,
-                "global_view": global_view, "local_view": local_view,
-                "centroid_offset": centroid_offset,
-                "peaks": peaks_list, "vetting": vetting_dict,
-                "timings": timings, "tic_start": tic_start,
-            })
-            if len(predict_queue) >= infer_batch_size:
-                _flush_predict_queue()
+            timings["phase2"] = (_time.time() - t0) * 1000
+            res = found.get("bls")
+            signals = list(found.get("signals") or [])
+            mono = found.get("monotransit")
+            if res is None or (not signals and mono is None):
+                sde_val = float(res.sde) if res is not None else float("nan")
+                best_period = float(res.best_period) if res is not None else None
+                status = f"NO_SIGNAL (SDE={sde_val:.2f})" if sde_val == sde_val else "NO_SIGNAL"
+                if res is not None and float(np.max(res.power)) < bls_threshold:
+                    status = f"NO_SIGNAL (SDE={sde_val:.2f})"
+                _append_log(log_file, tic_norm, STAGE_DONE, status,
+                            best_period=best_period, sde=sde_val)
+                progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
+                logger.info("  -> %s", status)
+                continue
+            if mono is not None:
+                signals.append({
+                    "period": float("nan"),
+                    "epoch": mono["epoch"],
+                    "power": 0.0,
+                    "sde": mono["mes"],
+                    "vetting": {
+                        "depth": mono["depth"],
+                        "duration_hours": mono["duration_days"] * 24.0,
+                        "n_transits": 1,
+                        "transit_center_btjd": mono["epoch"],
+                        "mes": mono["mes"],
+                        "kind": "monotransit",
+                    },
+                    "hard_flags": ["n_transits"],
+                    "global_view": np.zeros(2048),
+                    "local_view": np.zeros(256),
+                    "centroid_offset": float("nan"),
+                    "kind": "monotransit",
+                })
+            peaks_list = [
+                {"period": s["period"], "epoch": s["epoch"], "power": s["power"], "sde": s["sde"]}
+                for s in signals
+            ]
+            for signal in signals:
+                vetting_dict = dict(signal.get("vetting") or {})
+                vetting_dict["hard_flags"] = list(signal.get("hard_flags") or [])
+                if signal.get("diff_image"):
+                    vetting_dict["diff_image"] = signal["diff_image"]
+                if signal.get("triceratops"):
+                    vetting_dict["triceratops"] = signal["triceratops"]
+                best_period = signal["period"]
+                epoch = signal["epoch"]
+                sde_val = signal["sde"]
+                max_power = signal.get("power") or 0.0
+                predict_queue.append({
+                    "tic_norm": tic_norm, "tic_id": tic_id,
+                    "time_arr": time_arr, "flux_arr": flux_arr,
+                    "best_period": best_period, "epoch": epoch,
+                    "max_power": max_power, "sde": sde_val,
+                    "global_view": signal.get("global_view"),
+                    "local_view": signal.get("local_view"),
+                    "centroid_offset": signal.get("centroid_offset"),
+                    "peaks": peaks_list, "vetting": vetting_dict,
+                    "timings": timings, "tic_start": tic_start,
+                })
+                if len(predict_queue) >= infer_batch_size:
+                    _flush_predict_queue()
 
         except Exception as e:
             status = f"ERROR: {str(e)}"
@@ -573,7 +762,9 @@ def main():
     parser.add_argument("--no-adaptive-duration", action="store_true",
                         help="Disable Kepler's-3rd-law transit duration prior")
     parser.add_argument("--use-tls", action="store_true",
-                        help="Run Transit Least Squares refinement on BLS top peaks")
+                        help="TLS on SDE-pass peaks (this is already the default).")
+    parser.add_argument("--no-tls", action="store_true",
+                        help="Do not run TLS, even on SDE-pass peaks.")
     args = parser.parse_args()
     return run_hunt(
         sector=args.sector, limit=args.limit, threshold=args.threshold,
@@ -585,7 +776,7 @@ def main():
         nperiods=args.nperiods, strategy_profile=args.strategy_profile,
         with_tpf=not args.no_tpf, prefilter=not args.no_prefilter,
         backend=args.backend, adaptive_duration=not args.no_adaptive_duration,
-        use_tls=args.use_tls,
+        use_tls=not args.no_tls,
     )
 
 

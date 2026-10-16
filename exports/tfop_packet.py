@@ -54,6 +54,38 @@ def _safe_float(v, default: float = float("nan")) -> float:
         return default
 
 
+def _is_real_epoch(value) -> bool:
+    """An epoch of 0 is not a Phase 2 transit time when any other epoch exists."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and number != 0.0
+
+
+def phase2_epoch(candidate: dict) -> float:
+    """Epoch written into a TFOP packet.
+
+    Prefer the Phase 2 / catalog epoch on the candidate. A vetting field of
+    0 must not overwrite a real epoch, and a packet must not emit t0 = 0
+    when any epoch is present (including an alternate peak).
+    """
+    vetting = candidate.get("vetting") or {}
+    for value in (
+        candidate.get("epoch"),
+        candidate.get("t0"),
+        candidate.get("epoch_btjd"),
+        vetting.get("transit_center_btjd"),
+        vetting.get("epoch"),
+    ):
+        if _is_real_epoch(value):
+            return float(value)
+    for peak in candidate.get("alt_peaks") or []:
+        if isinstance(peak, dict) and _is_real_epoch(peak.get("epoch")):
+            return float(peak["epoch"])
+    return 0.0
+
+
 def candidate_json_to_tfop(candidate: dict) -> TFOPCandidate:
     """Translate a ``candidates/TIC_*.json`` payload into a TFOPCandidate."""
     vetting = candidate.get("vetting") or {}
@@ -62,7 +94,7 @@ def candidate_json_to_tfop(candidate: dict) -> TFOPCandidate:
     return TFOPCandidate(
         tic_id=str(candidate.get("tic_id", "")),
         period_days=_safe_float(candidate.get("best_period")),
-        epoch_btjd=_safe_float(vetting.get("transit_center_btjd"), 0.0),
+        epoch_btjd=phase2_epoch(candidate),
         depth_ppm=_safe_float(vetting.get("depth")) * 1e6
             if vetting.get("depth") is not None else float("nan"),
         duration_hours=_safe_float(vetting.get("duration_hours")),

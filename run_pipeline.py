@@ -96,11 +96,22 @@ def run(
 
 
 def predict(result: dict, checkpoint_path: str = None):
-    """Run ResNet-1D on pipeline result. Returns class (0 or 1) and probability."""
+    """Run the two-tower ResNet on a pipeline result.
+
+    Uses ``make_two_tower_inputs`` and
+    ``TwoTowerResNet1D.forward(global, local, centroid_offset=...)``,
+    matching ``train_classifier``. Legacy single-tower checkpoints still
+    receive the stacked two-channel view.
+    """
     try:
         import torch
 
-        from models.resnet1d import load_checkpoint, make_two_channel
+        from models.resnet1d import (
+            TwoTowerResNet1D,
+            load_checkpoint,
+            make_two_channel,
+            make_two_tower_inputs,
+        )
     except ImportError:
         logger.warning("PyTorch or models not available; skipping prediction")
         return None
@@ -113,13 +124,20 @@ def predict(result: dict, checkpoint_path: str = None):
     from device_util import get_device
     device = get_device()
     model = load_checkpoint(checkpoint_path, device=device, strict=False)
-    x = make_two_channel(result["global_view"], result["local_view"])
-    x = torch.from_numpy(x).float().unsqueeze(0).to(device)
     co_val = result["centroid_offset"]
     co_val = 0.0 if (co_val != co_val or co_val is None) else co_val
-    co = torch.tensor([co_val], device=device)
+    co = torch.tensor([co_val], device=device, dtype=torch.float32)
+    two_tower = isinstance(model, TwoTowerResNet1D) or hasattr(model, "global_tower")
     with torch.inference_mode():
-        logits = model(x, centroid_offset=co)
+        if two_tower:
+            global_in, local_in = make_two_tower_inputs(result["global_view"], result["local_view"])
+            global_t = torch.from_numpy(global_in).float().unsqueeze(0).to(device)
+            local_t = torch.from_numpy(local_in).float().unsqueeze(0).to(device)
+            logits = model(global_t, local_t, centroid_offset=co)
+        else:
+            stacked = make_two_channel(result["global_view"], result["local_view"])
+            stacked_t = torch.from_numpy(stacked).float().unsqueeze(0).to(device)
+            logits = model(stacked_t, centroid_offset=co)
         probs = torch.softmax(logits, dim=1)
         pred = logits.argmax(dim=1).item()
     return {"class": pred, "prob_planet": probs[0, 1].item(), "prob_fp": probs[0, 0].item()}

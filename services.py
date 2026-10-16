@@ -49,6 +49,7 @@ class HuntConfig:
     strategy_profile: str = "balanced"
     with_tpf: bool = True
     prefilter: bool = True
+    sequential: bool = False
 
 
 @dataclass
@@ -90,7 +91,7 @@ class AutopilotConfig:
     period_min: float = 0.5
     period_max: float = 15.0
     nperiods: int = 10000
-    parallel: bool = False
+    parallel: bool = True
     download_workers: int = 8
     cpu_workers: int = 4
     bls_backend: Optional[str] = None
@@ -124,27 +125,50 @@ def run_scan(config: ScanConfig) -> dict:
 
 
 def run_hunt(config: HuntConfig) -> dict:
-    """Run the sector hunter. Returns stats dict."""
-    from hunter import run_hunt as _hunt
+    """Run the sector hunter. Parallel search is the default."""
     from strategy_profiles import apply_profile_to_hunt_kwargs
 
     profile_kw = apply_profile_to_hunt_kwargs(config.strategy_profile)
+    period_min = profile_kw.get("period_min", config.period_min)
+    period_max = profile_kw.get("period_max", config.period_max)
+    if config.sequential:
+        from hunter import run_hunt as _hunt
+        return _hunt(
+            sector=config.sector,
+            limit=config.limit,
+            threshold=profile_kw.get("threshold", config.threshold),
+            bls_threshold=profile_kw.get("bls_threshold", config.bls_threshold),
+            sde_threshold=profile_kw.get("sde_threshold", config.sde_threshold),
+            checkpoint=config.checkpoint,
+            log_file=config.log_file,
+            candidate_dir=config.candidate_dir,
+            tic_list=config.tic_list,
+            infer_batch_size=config.infer_batch_size,
+            period_min=period_min,
+            period_max=period_max,
+            nperiods=profile_kw.get("nperiods", config.nperiods),
+            strategy_profile=config.strategy_profile,
+            with_tpf=config.with_tpf,
+            prefilter=config.prefilter,
+        )
 
-    return _hunt(
+    from hunter import _get_ranked_queue
+    from parallel_hunter import run_parallel_hunt
+
+    ranked = _get_ranked_queue(
+        config.sector, config.limit, config.tic_list, period_min, period_max,
+    )
+    return run_parallel_hunt(
         sector=config.sector,
-        limit=config.limit,
-        threshold=profile_kw.get("threshold", config.threshold),
-        bls_threshold=profile_kw.get("bls_threshold", config.bls_threshold),
-        sde_threshold=profile_kw.get("sde_threshold", config.sde_threshold),
-        checkpoint=config.checkpoint,
-        log_file=config.log_file,
-        candidate_dir=config.candidate_dir,
-        tic_list=config.tic_list,
-        infer_batch_size=config.infer_batch_size,
-        period_min=profile_kw.get("period_min", config.period_min),
-        period_max=profile_kw.get("period_max", config.period_max),
+        targets=ranked.search_order(),
+        period_min=period_min,
+        period_max=period_max,
         nperiods=profile_kw.get("nperiods", config.nperiods),
-        strategy_profile=config.strategy_profile,
+        sde_threshold=profile_kw.get("sde_threshold", config.sde_threshold),
+        threshold=profile_kw.get("threshold", config.threshold),
+        checkpoint=config.checkpoint,
+        candidate_dir=config.candidate_dir,
+        log_file=config.log_file,
         with_tpf=config.with_tpf,
         prefilter=config.prefilter,
     )

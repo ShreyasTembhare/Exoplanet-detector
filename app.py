@@ -354,6 +354,7 @@ with tab_hunt:
                     "--cpu-workers", str(int(hunt_cpu_workers)),
                 ])
             else:
+                cmd.append("--sequential")
                 cmd.extend([
                     "--bls-threshold", str(hunt_bls),
                     "--sde-threshold", str(sde_thresh),

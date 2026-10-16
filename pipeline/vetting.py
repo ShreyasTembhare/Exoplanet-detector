@@ -46,6 +46,7 @@ class VettingMetrics:
     gaia_neighbors_within_30arcsec: int = -1
     matches_toi: bool = False
     matched_toi_id: str = ""
+    transit_center_btjd: float = float("nan")
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -304,6 +305,7 @@ def compute_vetting_metrics(
 ) -> VettingMetrics:
     m = VettingMetrics()
     m.sde = float(bls_sde)
+    m.transit_center_btjd = float(epoch) if epoch == epoch else float("nan")
 
     depth, dur_phase = transit_depth_and_duration(time, flux, period, epoch, base_half_width=half_width)
     m.depth = depth

@@ -46,7 +46,6 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 from models.resnet1d import (  # noqa: E402  (after optional torch try/except above)
-    ResNet1DClassifier,
     TwoTowerResNet1D,
     count_parameters,
     load_checkpoint,
@@ -164,19 +163,22 @@ def load_csv_data(csv_path: str):
 def build_labeled_dataset_toi_only(
     out_dir: str = "data/labeled",
     max_per_class: int = 2500,
-    inject_synthetic: bool = True,
-    synthetic_per_class: int = 1000,
+    inject_synthetic: bool = False,
+    synthetic_per_class: int = 0,
     sector: Optional[int] = None,
 ):
     """
-    Build a labeled dataset from the TOI table (single source of truth):
-      * label=1 if ``tfopwg_disp in ('CP', 'KP')``.
-      * label=0 if ``tfopwg_disp in ('FP', 'FA')``.
-      * Drop ``PC`` (planet candidate, still ambiguous).
-    Optionally inject synthetic transits onto quiet stars for extra positives.
-    """
-    import pandas as pd
+    Build a labeled dataset from catalog ephemerides.
 
+    Rows are folded at the archive period, epoch, and duration. CP/KP are
+    the positive class and FP/FA the negative class. PC is dropped. This
+    function does not label "whatever BLS found", and it does not inject
+    boxes onto FP/FA stars. ``inject_synthetic`` is ignored for that reason.
+
+    When the archive or MAST is unreachable, returns None. Callers must not
+    fall back to Gaussian vectors.
+    """
+    del inject_synthetic, synthetic_per_class  # boxes on FP/FA are not a training set
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
     manifest = out_path / "manifest.csv"
@@ -184,113 +186,97 @@ def build_labeled_dataset_toi_only(
         logger.info("Manifest already exists at %s; reusing.", manifest)
         return str(manifest)
 
-    pos_tics, neg_tics = [], []
+    remote = None
+    try:
+        from pipeline.catalog_labels import try_remote_catalog_subset
+        remote = try_remote_catalog_subset(out_dir=str(out_path / "triage_v2"))
+    except Exception as exc:
+        logger.info("Remote Triage-v2 subset unavailable: %s", exc)
+    if remote:
+        return remote
+
     try:
         from astroquery.nasa_exoplanet_archive import NasaExoplanetArchive
 
         toi = NasaExoplanetArchive.query_criteria(
-            table="toi", select="tid,toi,tfopwg_disp,pl_orbper,sectors",
+            table="toi",
+            select="tid,toi,tfopwg_disp,pl_orbper,pl_tranmid,pl_trandurh,sectors",
         )
         df = toi.to_pandas()
-        pos = df[df["tfopwg_disp"].isin(["CP", "KP"])]
-        neg = df[df["tfopwg_disp"].isin(["FP", "FA"])]
-        pos_tics = list({str(t) for t in pos["tid"] if pd.notna(t)})[:max_per_class]
-        neg_tics = list({str(t) for t in neg["tid"] if pd.notna(t)})[:max_per_class]
-        logger.info("TOI labels: %d positive (CP/KP), %d negative (FP/FA)",
-                    len(pos_tics), len(neg_tics))
     except Exception as exc:
         logger.warning("Could not query TOI table: %s", exc)
         return None
 
-    from pipeline import run_phase1, run_phase2, run_phase3
+    from pipeline import run_phase1
+    from pipeline.catalog_labels import FALSE_DISPOSITIONS, PLANET_DISPOSITIONS, fold_at_catalog_ephemeris
 
+    df = df[df["tfopwg_disp"].isin(list(PLANET_DISPOSITIONS | FALSE_DISPOSITIONS))]
     rows = []
-    for label, tic_list in [(1, pos_tics), (0, neg_tics)]:
-        tag = "planet" if label == 1 else "fp"
-        for i, tic_raw in enumerate(tic_list):
-            tic_id = f"TIC {tic_raw}" if not tic_raw.upper().startswith("TIC") else tic_raw
-            npz_path = out_path / f"{tag}_{i:04d}.npz"
-            if npz_path.exists():
-                rows.append({"path": str(npz_path), "label": label, "tic": tic_raw,
-                             "sector": sector if sector is not None else -1})
-                continue
-            try:
-                t, f, _, sec, meta = run_phase1(tic_id, sector=sector, use_cache=True)
-                if t is None or len(t) < 50:
-                    continue
-                res = run_phase2(t, f, tic_id=tic_id, sector=sec, use_cache=True, return_result=True)
-                gv, lv, co, _ = run_phase3(
-                    t, f, res.best_period, res.epoch,
-                    tic_id=tic_id, sector=sec, use_cache=True,
-                    bls_sde=res.sde, bls_periods=res.periods, bls_power=res.power,
-                )
-                np.savez(npz_path, global_view=gv, local_view=lv,
-                         centroid_offset=np.array(co), label=np.array(label))
-                rows.append({"path": str(npz_path), "label": label, "tic": tic_raw,
-                             "sector": int(sec) if str(sec).isdigit() else -1})
-                logger.info("[%s %d/%d] Saved %s", tag, i + 1, len(tic_list), npz_path.name)
-            except Exception as e:
-                logger.warning("Skipping %s: %s", tic_id, e)
-
-    if inject_synthetic and synthetic_per_class > 0:
+    counts = {1: 0, 0: 0}
+    for _, rec in df.iterrows():
+        disp = str(rec.get("tfopwg_disp", ""))
+        label = 1 if disp in PLANET_DISPOSITIONS else 0
+        if counts[label] >= max_per_class:
+            continue
         try:
-            n_synth = generate_injection_recovery(
-                out_path, n_samples=synthetic_per_class, neg_tics=neg_tics, rows=rows,
+            period = float(rec["pl_orbper"])
+            epoch = float(rec["pl_tranmid"])
+            duration_hours = float(rec["pl_trandurh"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if not (period > 0 and duration_hours > 0 and epoch == epoch):
+            continue
+        tic_raw = str(rec["tid"])
+        tic_id = tic_raw if tic_raw.upper().startswith("TIC") else f"TIC {tic_raw}"
+        tag = "planet" if label == 1 else "fp"
+        npz_path = out_path / f"{tag}_{counts[label]:04d}.npz"
+        try:
+            t, f, _, sec, _meta = run_phase1(tic_id, sector=sector, use_cache=True)
+            if t is None or len(t) < 50:
+                continue
+            gv, lv = fold_at_catalog_ephemeris(
+                t, f, period, epoch, duration_hours / 24.0,
             )
-            logger.info("Generated %d synthetic injection-recovery positives", n_synth)
+            np.savez(
+                npz_path, global_view=gv, local_view=lv,
+                centroid_offset=np.array(np.nan), label=np.array(label),
+                period=np.array(period), epoch=np.array(epoch),
+            )
+            rows.append({
+                "path": str(npz_path), "label": label, "tic": tic_raw,
+                "sector": int(sec) if str(sec).isdigit() else -1,
+                "period": period, "epoch": epoch, "folded_at": "catalog",
+            })
+            counts[label] += 1
+            logger.info("[%s %d] folded at catalog P=%.4f", tag, counts[label], period)
         except Exception as exc:
-            logger.warning("Injection-recovery synthesis failed: %s", exc)
+            logger.warning("Skipping %s: %s", tic_id, exc)
+        if counts[0] >= max_per_class and counts[1] >= max_per_class:
+            break
 
     if not rows:
-        logger.error("No samples generated.")
+        logger.error("No catalog-ephemeris samples generated.")
         return None
 
-    df_out = pd.DataFrame(rows)
-    df_out.to_csv(manifest, index=False)
-    logger.info("Manifest written: %s (%d samples)", manifest, len(df_out))
+    import pandas as pd
+    pd.DataFrame(rows).to_csv(manifest, index=False)
+    logger.info("Manifest written: %s (%d samples)", manifest, len(rows))
     return str(manifest)
 
 
 def generate_injection_recovery(out_path: Path, n_samples: int, neg_tics: list,
                                 rows: list) -> int:
-    """Inject simple box transits onto known-noisy LCs to make synthetic +
-    samples. We use the negative-class LCs as "background" because they're
-    already cached and have realistic noise."""
-    from pipeline import run_phase1, run_phase2, run_phase3
-    rng = np.random.default_rng(0)
-    written = 0
-    for i in range(n_samples):
-        if not neg_tics:
-            break
-        tic_raw = rng.choice(neg_tics)
-        tic_id = f"TIC {tic_raw}"
-        try:
-            t, f, _, sec, _ = run_phase1(tic_id, sector=None, use_cache=True)
-            if t is None or len(t) < 100:
-                continue
-            period = float(rng.uniform(0.5, 12.0))
-            depth = float(rng.uniform(0.0005, 0.02))
-            duration_d = float(rng.uniform(0.05, 0.2))
-            epoch = float(t.min() + rng.uniform(0, period))
-            phase = ((t - epoch) % period) / period
-            in_transit = (phase < duration_d / 2 / period) | (phase > 1 - duration_d / 2 / period)
-            f_inj = f.copy()
-            f_inj[in_transit] -= depth
-            res = run_phase2(t, f_inj, tic_id=f"INJ_{i}", sector=str(sec), use_cache=False, return_result=True)
-            gv, lv, co, _ = run_phase3(
-                t, f_inj, res.best_period, res.epoch,
-                tic_id=f"INJ_{i}", sector=str(sec), use_cache=False,
-                bls_sde=res.sde, bls_periods=res.periods, bls_power=res.power,
-            )
-            npz_path = out_path / f"inj_{i:04d}.npz"
-            np.savez(npz_path, global_view=gv, local_view=lv,
-                     centroid_offset=np.array(co), label=np.array(1))
-            rows.append({"path": str(npz_path), "label": 1, "tic": f"INJ_{i}",
-                         "sector": int(sec) if str(sec).isdigit() else -1})
-            written += 1
-        except Exception:
-            continue
-    return written
+    """Refused. Box injections on FP/FA stars are not a planet training set.
+
+    Completeness injections belong on quiet stars
+    (:mod:`pipeline.injection_recovery`) and are not written into ``resnet1d.pt``.
+    """
+    del out_path, n_samples, neg_tics, rows
+    raise RuntimeError(
+        "Refusing to inject box transits onto FP/FA stars. "
+        "Fold training samples at catalog ephemerides, and run batman "
+        "injection-recovery only on quiet stars."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -468,29 +454,41 @@ def run_train(
     if not TORCH_AVAILABLE:
         logger.error("PyTorch is required. Install with: pip install torch")
         return None
+    if model_arch not in ("resnet1d", "two_tower"):
+        logger.error(
+            "Refusing to train arch=%s. The live training path is TwoTowerResNet1D only.",
+            model_arch,
+        )
+        return {"refused": True, "reason": "arch", "checkpoint_written": False}
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     # ---- Data ----
+    # --data is required. Gaussian vectors must never become resnet1d.pt.
+    if data is None or str(data).strip() == "":
+        logger.error(
+            "Refusing to write %s: --data is required. "
+            "A checkpoint is not trained on Gaussian noise.",
+            out,
+        )
+        return {"refused": True, "reason": "missing_data", "checkpoint_written": False}
     if data == "auto":
         manifest = build_labeled_dataset_toi_only(
             max_per_class=max_per_class,
-            inject_synthetic=use_injection_recovery,
-            synthetic_per_class=max(0, max_per_class // 3),
+            inject_synthetic=False,
+            synthetic_per_class=0,
         )
         if manifest is None:
-            return None
+            logger.error(
+                "No catalog-ephemeris dataset (Triage-v2 / MAST unreachable). "
+                "Refusing to write %s.",
+                out,
+            )
+            return {"refused": True, "reason": "no_catalog_data", "checkpoint_written": False}
         gv, lv, co, lb, sectors = load_csv_data(manifest)
-    elif data is not None:
-        gv, lv, co, lb, sectors = load_csv_data(data)
     else:
-        logger.warning("No --data; using small synthetic dataset for demo.")
-        n = 200
-        gv = [np.random.randn(2048).astype(np.float32) for _ in range(n)]
-        lv = [np.random.randn(256).astype(np.float32) for _ in range(n)]
-        co = np.random.rand(n).astype(np.float32)
-        lb = (np.random.rand(n) > 0.5).astype(np.int64)
-        sectors = np.full(n, -1)
+        gv, lv, co, lb, sectors = load_csv_data(data)
+    del use_injection_recovery  # box injection on FP/FA is not part of training
 
     n_total = len(lb)
     holdout = parse_sector_range(val_holdout_sectors)
@@ -514,13 +512,15 @@ def run_train(
     logger.info("Device: %s", device)
 
     # ---- Model ----
-    two_tower = (model_arch == "resnet1d")  # resnet1d means two-tower in Phase 4
+    # The live training path is TwoTowerResNet1D only.
+    two_tower = True
     if pretrained:
         model = load_checkpoint(pretrained, device=device, strict=False)
-    elif two_tower:
-        model = TwoTowerResNet1D(use_centroid=True).to(device)
+        if not hasattr(model, "global_tower"):
+            logger.error("Refusing to train: pretrained checkpoint is not TwoTowerResNet1D.")
+            return {"refused": True, "reason": "arch", "checkpoint_written": False}
     else:
-        model = ResNet1DClassifier(use_centroid=True).to(device)
+        model = TwoTowerResNet1D(use_centroid=True).to(device)
     logger.info("Model: %s, %s params",
                 type(model).__name__, f"{count_parameters(model):,}")
 
