@@ -47,9 +47,13 @@ class RunBody(BaseModel):
     disposition: str = ""
 
 
-def create_app(data_dir: str | Path = "var/desk") -> FastAPI:
+def create_app(
+    data_dir: str | Path = "var/desk",
+    *,
+    enable_auto_start: bool = True,
+) -> FastAPI:
     app = FastAPI(title="Transit desk")
-    app.state.desk = Desk(Path(data_dir))
+    app.state.desk = Desk(Path(data_dir), enable_auto_start=enable_auto_start)
 
     @app.get("/api/health")
     def health():
@@ -79,6 +83,10 @@ def create_app(data_dir: str | Path = "var/desk") -> FastAPI:
     @app.get("/api/continuous")
     def continuous_state():
         return app.state.desk.continuous.snapshot()
+
+    @app.get("/api/continuous/progress")
+    def continuous_progress():
+        return app.state.desk.continuous.progress()
 
     @app.post("/api/continuous/start")
     def continuous_start(body: ContinuousBody):

@@ -1,4 +1,4 @@
-"""Continuous search: log, local files, pause, and refresh. No MAST."""
+"""Continuous search: log, local files, pause, auto-start, progress. No MAST."""
 
 from __future__ import annotations
 
@@ -11,6 +11,10 @@ from fastapi.testclient import TestClient
 
 from tool.desk import Desk
 from tool.server import create_app
+
+
+def _app(path, *, auto=False):
+    return create_app(path, enable_auto_start=auto)
 
 
 def _curve(path, samples=48):
@@ -36,7 +40,7 @@ def test_log_lines_append(tmp_path):
     curves.mkdir()
     _curve(curves / "only.csv")
     desk = tmp_path / "desk"
-    client = TestClient(create_app(desk))
+    client = TestClient(_app(desk))
     started = client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
     assert started.status_code == 200
     first = _wait(client, lambda body: len(body["lines"]) >= 1)
@@ -57,7 +61,7 @@ def test_loop_advances_to_next_local_file(tmp_path):
     curves.mkdir()
     _curve(curves / "a.csv")
     _curve(curves / "b.csv")
-    client = TestClient(create_app(tmp_path / "desk"))
+    client = TestClient(_app(tmp_path / "desk"))
     response = client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
     assert response.status_code == 200
     body = _wait(
@@ -88,7 +92,7 @@ def test_pause_stops_new_work(tmp_path, monkeypatch):
         return real(time, flux, tic_id, candidate_dir, **kwargs)
 
     monkeypatch.setattr(continuous, "run_local_lightcurve", wrapped)
-    client = TestClient(create_app(tmp_path / "desk"))
+    client = TestClient(_app(tmp_path / "desk"))
     response = client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
     assert response.status_code == 200
     assert started.wait(5)
@@ -105,6 +109,8 @@ def test_pause_stops_new_work(tmp_path, monkeypatch):
     assert body["status"] == "paused"
     assert "b.csv" not in [line["target"] for line in body["lines"]]
     assert calls == ["a"]
+    # Pause keeps auto_start on so a process restart can be resumed by the operator.
+    assert body.get("auto_start") is True
 
 
 def test_refresh_reads_the_same_log(tmp_path):
@@ -112,7 +118,7 @@ def test_refresh_reads_the_same_log(tmp_path):
     curves.mkdir()
     _curve(curves / "only.csv")
     desk_dir = tmp_path / "desk"
-    client = TestClient(create_app(desk_dir))
+    client = TestClient(_app(desk_dir))
     client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
     first = _wait(client, lambda body: any(line["phase"] == "result" for line in body["lines"]))
     second = client.get("/api/continuous").json()
@@ -122,7 +128,7 @@ def test_refresh_reads_the_same_log(tmp_path):
     finished = _wait(client, lambda body: body["status"] == "stopped")
     again = client.get("/api/continuous").json()
     assert again["lines"] == finished["lines"]
-    reloaded = Desk(desk_dir)
+    reloaded = Desk(desk_dir, enable_auto_start=False)
     assert reloaded.continuous.snapshot()["lines"] == again["lines"]
     assert reloaded.continuous.snapshot()["status"] == "stopped"
 
@@ -132,7 +138,7 @@ def test_ranked_queue_is_walked_when_mast_is_missing(tmp_path):
 
     if mast_requirement()["available"]:
         pytest.skip("MAST clients are installed")
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     ranked = client.post("/api/queue/rank", json={
         "rows": [
             {"tic_id": "1", "radius": 1.2, "n_sectors": 1, "crowdsap": 0.9, "tmag": 10},
@@ -155,7 +161,7 @@ def test_missing_mast_does_not_invent_stars(tmp_path):
 
     if mast_requirement()["available"]:
         pytest.skip("MAST clients are installed")
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     started = client.post("/api/continuous/start", json={"sector": 15, "nperiods": 64})
     assert started.status_code == 200
     body = _wait(client, lambda item: item["status"] == "paused")
@@ -166,3 +172,78 @@ def test_missing_mast_does_not_invent_stars(tmp_path):
     later = client.get("/api/continuous").json()
     assert later["sector"] == 15
     assert len(later["lines"]) == len(body["lines"])
+
+
+def test_auto_start_on_desk_create(tmp_path):
+    from tool.desk import mast_requirement
+
+    if mast_requirement()["available"]:
+        pytest.skip("MAST clients are installed")
+    desk_dir = tmp_path / "desk"
+    client = TestClient(_app(desk_dir, auto=True))
+    body = _wait(client, lambda item: item["status"] in {"running", "paused"})
+    assert body.get("auto_start") is True
+    progress = client.get("/api/continuous/progress").json()
+    assert progress["status"] in {"running", "paused"}
+    assert (desk_dir / "continuous_progress.json").is_file()
+    assert progress["stars_done"] >= 0
+
+
+def test_stop_turns_off_auto_start(tmp_path):
+    curves = tmp_path / "curves"
+    curves.mkdir()
+    _curve(curves / "a.csv")
+    _curve(curves / "b.csv")
+    desk_dir = tmp_path / "desk"
+    client = TestClient(_app(desk_dir))
+    client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
+    _wait(client, lambda item: any(line["phase"] == "start" for line in item["lines"]))
+    stopped = client.post("/api/continuous/stop")
+    assert stopped.status_code == 200
+    assert stopped.json()["status"] == "stopped"
+    assert stopped.json()["auto_start"] is False
+    progress = client.get("/api/continuous/progress").json()
+    assert progress["auto_start"] is False
+    # Reloading the desk must not auto-start again.
+    again = Desk(desk_dir, enable_auto_start=True)
+    snap = again.continuous.snapshot()
+    assert snap["status"] == "stopped"
+    assert snap["auto_start"] is False
+    assert again.continuous.is_running() is False
+
+
+def test_progress_counters_update(tmp_path):
+    curves = tmp_path / "curves"
+    curves.mkdir()
+    _curve(curves / "a.csv")
+    _curve(curves / "b.csv")
+    desk_dir = tmp_path / "desk"
+    client = TestClient(_app(desk_dir))
+    client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
+    body = _wait(client, lambda item: item["status"] == "stopped")
+    progress = body["progress"]
+    assert progress["stars_done"] == 2
+    assert progress["candidates_found"] == 0
+    assert progress["last_log_line"]
+    disk = json.loads((desk_dir / "continuous_progress.json").read_text())
+    assert disk["stars_done"] == 2
+    assert "stars_per_hour" in disk
+    assert disk["elapsed_seconds"] >= 0
+
+
+def test_start_after_stop_turns_auto_start_back_on(tmp_path):
+    curves = tmp_path / "curves"
+    curves.mkdir()
+    _curve(curves / "only.csv")
+    _curve(curves / "two.csv")
+    client = TestClient(_app(tmp_path / "desk"))
+    client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
+    _wait(client, lambda item: any(line["phase"] == "start" for line in item["lines"]))
+    stopped = client.post("/api/continuous/stop").json()
+    assert stopped["auto_start"] is False
+    resumed = client.post("/api/continuous/start", json={"local_dir": str(curves), "nperiods": 64})
+    assert resumed.status_code == 200
+    assert resumed.json()["auto_start"] is True
+    body = _wait(client, lambda item: item["status"] == "stopped")
+    assert body["auto_start"] is True
+    assert body["progress"]["stars_done"] >= 1

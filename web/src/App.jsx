@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const STEPS = [
-  { id: "queue", n: "01", title: "Queue" },
-  { id: "search", n: "02", title: "Search" },
-  { id: "inbox", n: "03", title: "Inbox" },
-  { id: "review", n: "04", title: "Review" },
+  { id: "live", title: "Live" },
+  { id: "queue", title: "Queue" },
+  { id: "inbox", title: "Inbox" },
+  { id: "review", title: "Review" },
 ];
 
 const FLAG_LABEL = {
@@ -17,6 +17,16 @@ const FLAG_LABEL = {
 function fmt(value, digits) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
   return Number(value).toFixed(digits);
+}
+
+function statusLabel(status) {
+  const raw = (status || "idle").toLowerCase();
+  if (raw === "running") return "RUNNING";
+  if (raw === "paused") return "PAUSED";
+  if (raw === "stopped") return "STOPPED";
+  if (raw === "failed") return "FAILED";
+  if (raw === "done") return "DONE";
+  return "IDLE";
 }
 
 async function api(path, options) {
@@ -64,8 +74,30 @@ function PhaseChart({ curve }) {
   );
 }
 
+function ProgressStrip({ continuous, candidates }) {
+  const progress = (continuous && continuous.progress) || continuous || {};
+  const status = statusLabel(progress.status || (continuous && continuous.status) || "idle");
+  const target = progress.current_target || continuous?.current_target || "—";
+  const stars = progress.stars_done ?? continuous?.stars_done ?? 0;
+  const found = progress.candidates_found ?? continuous?.candidates_found ?? candidates.length;
+  const last = progress.last_log_line || continuous?.last_log_line || continuous?.message || "Waiting for the first log line.";
+  const rate = progress.stars_per_hour;
+  return (
+    <header className={`strip status-${(progress.status || continuous?.status || "idle").toLowerCase()}`}>
+      <p className={`pill ${(progress.status || continuous?.status || "idle").toLowerCase()}`}>{status}</p>
+      <div className="strip-metrics">
+        <span><em>Target</em> {target || "—"}</span>
+        <span><em>Stars</em> {stars}</span>
+        <span><em>Candidates</em> {found}</span>
+        {rate != null && rate > 0 ? <span><em>Rate</em> {fmt(rate, 1)}/h</span> : null}
+      </div>
+      <p className="strip-log" title={last}>{last}</p>
+    </header>
+  );
+}
+
 export default function App() {
-  const [step, setStep] = useState("queue");
+  const [step, setStep] = useState("live");
   const [health, setHealth] = useState(null);
   const [queue, setQueue] = useState(null);
   const [candidates, setCandidates] = useState([]);
@@ -75,7 +107,7 @@ export default function App() {
   const [limit, setLimit] = useState(10);
   const [tableText, setTableText] = useState("");
   const [tablePath, setTablePath] = useState("");
-  const [sector, setSector] = useState(15);
+  const [sector, setSector] = useState(1);
   const [sde, setSde] = useState(7);
   const [curveText, setCurveText] = useState("");
   const [curvePath, setCurvePath] = useState("");
@@ -92,41 +124,38 @@ export default function App() {
     return body.candidates;
   }, []);
 
+  const refreshContinuous = useCallback(async () => {
+    const body = await api("/api/continuous");
+    setContinuous(body);
+    return body;
+  }, []);
+
   useEffect(() => {
     api("/api/health").then(setHealth).catch((error) => setNotice(error.message));
     api("/api/queue").then((body) => setQueue(body.queue)).catch(() => {});
     api("/api/runs/current").then((body) => setRun(body.run)).catch(() => {});
-    api("/api/continuous").then(setContinuous).catch(() => {});
+    refreshContinuous().catch(() => {});
     refreshCandidates().catch((error) => setNotice(error.message));
-  }, [refreshCandidates]);
+  }, [refreshCandidates, refreshContinuous]);
 
   const continuousStatus = continuous ? continuous.status : "idle";
 
   useEffect(() => {
-    if (continuousStatus !== "running" && continuousStatus !== "paused") return undefined;
     const timer = setInterval(() => {
-      api("/api/continuous")
-        .then((body) => {
-          setContinuous(body);
-          refreshCandidates().catch(() => {});
-        })
+      refreshContinuous()
+        .then(() => refreshCandidates().catch(() => {}))
         .catch((error) => setNotice(error.message));
-    }, 800);
+      if (run && run.status === "running") {
+        api("/api/runs/current")
+          .then((body) => {
+            setRun(body.run);
+            if (body.run && body.run.status !== "running") refreshCandidates();
+          })
+          .catch(() => {});
+      }
+    }, 1200);
     return () => clearInterval(timer);
-  }, [continuousStatus, refreshCandidates]);
-
-  useEffect(() => {
-    if (!run || run.status !== "running") return undefined;
-    const timer = setInterval(() => {
-      api("/api/runs/current")
-        .then((body) => {
-          setRun(body.run);
-          if (body.run && body.run.status !== "running") refreshCandidates();
-        })
-        .catch((error) => setNotice(error.message));
-    }, 800);
-    return () => clearInterval(timer);
-  }, [run, refreshCandidates]);
+  }, [refreshContinuous, refreshCandidates, run]);
 
   useEffect(() => {
     if (!selected) {
@@ -198,7 +227,7 @@ export default function App() {
         body: JSON.stringify(payload),
       });
       setRun(body.run);
-      setStep("search");
+      setStep("live");
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -224,7 +253,7 @@ export default function App() {
         }),
       });
       setContinuous(body);
-      setStep("search");
+      setStep("live");
     } catch (error) {
       setNotice(error.message);
     } finally {
@@ -270,14 +299,13 @@ export default function App() {
   }
 
   const checkpoint = health && health.checkpoint;
-  const keepLive = continuousStatus === "running" || continuousStatus === "paused";
-  const runStatus = keepLive ? continuousStatus : (run ? run.status : "idle");
+  const showModel = checkpoint || candidates.some((row) => row.model_score != null || row.prob_planet != null);
 
   return (
     <div className="shell">
       <aside>
         <p className="brand">Transit desk</p>
-        <p className="brand-sub">TESS search</p>
+        <p className="brand-sub">Always-on search</p>
         <nav>
           {STEPS.map((item) => (
             <button
@@ -286,51 +314,30 @@ export default function App() {
               className={step === item.id ? "step on" : "step"}
               onClick={() => setStep(item.id)}
             >
-              <span>{item.n}</span>
               {item.title}
               {item.id === "inbox" ? <em>{candidates.length}</em> : null}
+              {item.id === "live" && continuousStatus === "running" ? <em className="pulse">●</em> : null}
             </button>
           ))}
         </nav>
         <p className="rail-note">
-          {checkpoint ? "Classifier checkpoint loaded." : "No classifier checkpoint. An SDE pass is kept as a candidate."}
+          {checkpoint
+            ? "Classifier checkpoint loaded. Inbox shows model scores when present."
+            : "No classifier checkpoint. An SDE pass is kept as a candidate."}
         </p>
         <details>
           <summary>Command line</summary>
           <p>
-            Training, autopilot, and SSL pretrain are not on this desk.
-            They stay on <code>python run.py</code>.
+            Training, autopilot, and SSL pretrain stay on <code>python run.py</code>.
+            Catalog train path: <code>python train_triage_v2.py</code>.
           </p>
         </details>
       </aside>
       <main>
-        <header className="top">
-          <p className={`pill ${runStatus}`}>{runStatus === "idle" ? "Idle" : runStatus}</p>
-          <p className="top-note">
-            {keepLive && continuous.message
-              ? continuous.message
-              : run && run.message
-                ? run.message
-                : "Rank a table, then keep searching. Nothing is added without an SDE pass."}
-          </p>
-        </header>
+        <ProgressStrip continuous={continuous} candidates={candidates} />
         {notice ? <p className="banner">{notice}</p> : null}
-        {step === "queue" ? (
-          <QueueView
-            queue={queue}
-            limit={limit}
-            setLimit={setLimit}
-            tableText={tableText}
-            setTableText={setTableText}
-            tablePath={tablePath}
-            setTablePath={setTablePath}
-            onFile={onFile}
-            onRank={onRank}
-            busy={busy}
-          />
-        ) : null}
-        {step === "search" ? (
-          <SearchView
+        {step === "live" ? (
+          <LiveView
             sector={sector}
             setSector={setSector}
             limit={limit}
@@ -355,13 +362,29 @@ export default function App() {
             stopSearching={stopSearching}
           />
         ) : null}
-        {step === "inbox" ? <InboxView candidates={candidates} onOpen={openCandidate} /> : null}
+        {step === "queue" ? (
+          <QueueView
+            queue={queue}
+            limit={limit}
+            setLimit={setLimit}
+            tableText={tableText}
+            setTableText={setTableText}
+            tablePath={tablePath}
+            setTablePath={setTablePath}
+            onFile={onFile}
+            onRank={onRank}
+            busy={busy}
+          />
+        ) : null}
+        {step === "inbox" ? (
+          <InboxView candidates={candidates} onOpen={openCandidate} showModel={showModel} />
+        ) : null}
         {step === "review" ? (
           <ReviewView
             detail={detail}
             onExport={onExport}
             exportResult={exportResult}
-            notice={notice}
+            showModel={showModel}
           />
         ) : null}
       </main>
@@ -373,7 +396,7 @@ function QueueView({ queue, limit, setLimit, tableText, setTableText, tablePath,
   return (
     <section>
       <h1>Queue</h1>
-      <p className="lede">Who is next, before any light curve is downloaded.</p>
+      <p className="lede">Rank who is next before any light curve is downloaded. Bare TIC lists are enriched for radius, sectors, CROWDSAP, and Tmag when the cache or catalog can fill them.</p>
       <form onSubmit={onRank} className="form">
         <label>
           Best N
@@ -442,7 +465,7 @@ function TargetTable({ title, rows }) {
   );
 }
 
-function SearchView({
+function LiveView({
   sector, setSector, limit, setLimit, sde, setSde,
   curveText, setCurveText, curvePath, setCurvePath, ticId, setTicId,
   onFile, start, run, busy,
@@ -451,15 +474,29 @@ function SearchView({
   const logRef = useRef(null);
   const lines = (continuous && continuous.lines) || [];
   const status = continuous ? continuous.status : "idle";
+  const progress = (continuous && continuous.progress) || {};
   useEffect(() => {
     const node = logRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [lines.length]);
   return (
-    <section>
-      <h1>Search</h1>
-      <p className="lede">Keep searching stays on the server. Closing this page does not stop it.</p>
-      <div className="form">
+    <section className="live">
+      <h1>Live Run</h1>
+      <p className="lede">
+        Continuous search starts with the desk. Closing this page does not stop it.
+        {continuous?.auto_start === false ? " Auto-start is off until Start or Resume." : ""}
+      </p>
+      <div className="live-metrics">
+        <div><dt>Status</dt><dd className={status}>{statusLabel(status)}</dd></div>
+        <div><dt>Target</dt><dd>{progress.current_target || continuous?.current_target || "—"}</dd></div>
+        <div><dt>Sector / cursor</dt><dd className="num">{continuous?.sector ?? "—"} / {continuous?.cursor ?? 0}</dd></div>
+        <div><dt>Stars done</dt><dd className="num">{progress.stars_done ?? continuous?.stars_done ?? 0}</dd></div>
+        <div><dt>Candidates</dt><dd className="num">{progress.candidates_found ?? continuous?.candidates_found ?? 0}</dd></div>
+        <div><dt>Last SDE</dt><dd className="num">{fmt(progress.last_sde ?? continuous?.last_sde, 2)}</dd></div>
+        <div><dt>Stars / hour</dt><dd className="num">{fmt(progress.stars_per_hour, 1)}</dd></div>
+        <div><dt>Elapsed</dt><dd className="num">{fmt(progress.elapsed_seconds, 0)} s</dd></div>
+      </div>
+      <div className="form live-controls">
         <label>
           Sector
           <input type="number" value={sector} onChange={(event) => setSector(event.target.value)} />
@@ -472,77 +509,73 @@ function SearchView({
           SDE gate
           <input type="number" step="0.1" value={sde} onChange={(event) => setSde(event.target.value)} />
         </label>
-        <label className="wide">
-          Local curve directory
-          <input
-            value={curveDir}
-            onChange={(event) => setCurveDir(event.target.value)}
-            placeholder="/path/curves"
-          />
-        </label>
         <div className="actions">
           <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={keepSearching}>
-            {status === "paused" ? "Resume" : "Keep searching"}
+            {status === "paused" || status === "stopped" ? "Resume" : "Start"}
           </button>
           <button type="button" disabled={status !== "running"} onClick={pauseSearching}>Pause</button>
           <button type="button" disabled={status !== "running" && status !== "paused"} onClick={stopSearching}>Stop</button>
         </div>
       </div>
-      <p className="quiet">
-        A directory of time, flux CSVs is searched as given. Otherwise a ranked queue is walked, and if there is no queue the sectors advance. A missing MAST client is logged and no star is invented.
-      </p>
       <ol className="log" ref={logRef} aria-live="polite">
         {lines.length === 0 ? (
-          <li className="quiet">The log is empty.</li>
+          <li className="quiet">The log is empty. When MAST is missing, the loop stays honest and invents no stars.</li>
         ) : lines.map((line, index) => (
-          <li key={`${line.ts}-${index}`} className={line.error ? "error" : line.candidate ? "candidate" : ""}>
+          <li key={`${line.ts}-${index}`} className={`log-line ${line.error ? "error" : line.candidate ? "candidate" : ""}`}>
             <time dateTime={line.ts}>{line.ts}</time>
             <span>{line.message}</span>
           </li>
         ))}
       </ol>
-      <div className="split">
-        <h2>One target</h2>
-        <p className="quiet">A single sector uses MAST. One pasted curve uses the same BLS path without a download.</p>
-      <div className="form">
-        <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("sector")}>
-          Start sector search
-        </button>
-      </div>
-      <RunState run={run} />
-      <div className="split">
-        <h2>Local light curve</h2>
-        <p className="quiet">Time and flux. A candidate is written only if the SDE gate passes. This is not a MAST discovery.</p>
+      <details className="one-off">
+        <summary>One-off sector / local curve</summary>
+        <p className="quiet">A directory of time, flux CSVs is searched as given. Otherwise a ranked queue is walked, and if there is no queue the sectors advance.</p>
         <div className="form">
-          <label>
-            TIC label
-            <input value={ticId} onChange={(event) => setTicId(event.target.value)} />
-          </label>
           <label className="wide">
-            Curve
-            <textarea rows={4} value={curveText} onChange={(event) => setCurveText(event.target.value)} placeholder="time,flux" />
+            Local curve directory
+            <input
+              value={curveDir}
+              onChange={(event) => setCurveDir(event.target.value)}
+              placeholder="/path/curves"
+            />
           </label>
-          <label className="wide">
-            File
-            <input type="file" accept=".csv,.txt" onChange={(event) => onFile(event, setCurveText)} />
-          </label>
-          <label className="wide">
-            Path on this machine
-            <input value={curvePath} onChange={(event) => setCurvePath(event.target.value)} placeholder="/path/curve.csv" />
-          </label>
-          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("local")}>
-            Search this curve
+          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("sector")}>
+            Start sector search once
           </button>
         </div>
-      </div>
-      </div>
+        <RunState run={run} />
+        <div className="split">
+          <h2>Local light curve</h2>
+          <div className="form">
+            <label>
+              TIC label
+              <input value={ticId} onChange={(event) => setTicId(event.target.value)} />
+            </label>
+            <label className="wide">
+              Curve
+              <textarea rows={4} value={curveText} onChange={(event) => setCurveText(event.target.value)} placeholder="time,flux" />
+            </label>
+            <label className="wide">
+              File
+              <input type="file" accept=".csv,.txt" onChange={(event) => onFile(event, setCurveText)} />
+            </label>
+            <label className="wide">
+              Path on this machine
+              <input value={curvePath} onChange={(event) => setCurvePath(event.target.value)} placeholder="/path/curve.csv" />
+            </label>
+            <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("local")}>
+              Search this curve
+            </button>
+          </div>
+        </div>
+      </details>
     </section>
   );
 }
 
 function RunState({ run }) {
   if (!run) {
-    return <p className="empty">No search has been started.</p>;
+    return <p className="empty">No one-off search has been started.</p>;
   }
   if (run.status === "running") {
     return <p className="state running">Running. {run.message}</p>;
@@ -563,13 +596,13 @@ function RunState({ run }) {
   );
 }
 
-function InboxView({ candidates, onOpen }) {
+function InboxView({ candidates, onOpen, showModel }) {
   return (
     <section>
       <h1>Inbox</h1>
-      <p className="lede">SDE-pass stars. Known TOI versus new is a label, not the order. Sorted by SDE.</p>
+      <p className="lede">SDE-pass stars, sorted by SDE. Known TOI versus new is a label, not the order.</p>
       {candidates.length === 0 ? (
-        <p className="empty">No candidates. A star appears here only after an SDE pass. This list stays empty when a search fails or nothing clears the gate.</p>
+        <p className="empty">No candidates yet. Continuous search has not found an SDE pass. This list stays empty when a search fails or nothing clears the gate.</p>
       ) : (
         <table>
           <thead>
@@ -579,13 +612,14 @@ function InboxView({ candidates, onOpen }) {
               <th>Epoch</th>
               <th>Depth</th>
               <th>SDE</th>
+              {showModel ? <th>Model</th> : null}
               <th>Flags</th>
               <th>Label</th>
             </tr>
           </thead>
           <tbody>
             {candidates.map((row) => (
-              <tr key={row.id}>
+              <tr key={row.id} className={row.sde != null && row.sde >= 7 ? "hit" : ""}>
                 <td>
                   <button type="button" className="link" onClick={() => onOpen(row.id)}>{row.tic_id}</button>
                 </td>
@@ -593,6 +627,9 @@ function InboxView({ candidates, onOpen }) {
                 <td className="num">{fmt(row.epoch_btjd, 4)}</td>
                 <td className="num">{row.depth_ppm === null ? "—" : `${fmt(row.depth_ppm, 0)} ppm`}</td>
                 <td className="num">{fmt(row.sde, 1)}</td>
+                {showModel ? (
+                  <td className="num">{row.model_score == null && row.prob_planet == null ? "—" : fmt(row.model_score ?? row.prob_planet, 3)}</td>
+                ) : null}
                 <td>{row.hard_flags.length ? row.hard_flags.map((flag) => FLAG_LABEL[flag] || flag).join(", ") : "None"}</td>
                 <td>{row.label}</td>
               </tr>
@@ -604,7 +641,7 @@ function InboxView({ candidates, onOpen }) {
   );
 }
 
-function ReviewView({ detail, onExport, exportResult }) {
+function ReviewView({ detail, onExport, exportResult, showModel }) {
   if (!detail) {
     return (
       <section>
@@ -620,6 +657,7 @@ function ReviewView({ detail, onExport, exportResult }) {
       <p className="lede">
         {detail.label}
         {detail.status === "CANDIDATE_SDE" ? " · SDE pass, no classifier score" : ""}
+        {showModel && detail.model_score != null ? ` · model ${fmt(detail.model_score, 3)}` : ""}
       </p>
       <dl className="metrics">
         <div><dt>Period</dt><dd>{fmt(detail.period_days, 4)} d</dd></div>

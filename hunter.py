@@ -280,6 +280,7 @@ def _get_ranked_queue(
 ):
     """Best-N primary targets, then a masked second pass for known CP/KP hosts."""
     from pipeline.target_rank import rank_targets
+    from pipeline.tic_enrich import enrich_records
 
     if tic_list_path and os.path.exists(tic_list_path):
         records = _records_from_tic_file(tic_list_path)
@@ -291,6 +292,8 @@ def _get_ranked_queue(
             from pipeline.target_rank import RankedQueue
             return RankedQueue(primary=[], second_pass=[])
         records = _attach_toi_dispositions(records)
+    # Bare MAST TIC lists lack radius / n_sectors / CROWDSAP; enrich before rank.
+    enrich_records(records)
     return rank_targets(
         records, limit=limit, period_min=period_min, period_max=period_max,
     )

@@ -504,7 +504,11 @@ def run_train(
                                          lb_all[train_idx], augment=True)
     val_ds = LightCurveTwoTowerDataset(gv[val_idx], lv[val_idx], co_all[val_idx],
                                        lb_all[val_idx], augment=False)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    # drop_last avoids BatchNorm crashing on a size-1 final batch in train mode.
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=0,
+        drop_last=len(train_ds) >= batch_size,
+    )
     val_loader = DataLoader(val_ds, batch_size=batch_size)
 
     from device_util import get_device

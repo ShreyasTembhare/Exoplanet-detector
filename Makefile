@@ -1,10 +1,11 @@
-.PHONY: bootstrap test lint hunt phunt scan train pretrain autopilot clean smoke tool dev
+.PHONY: bootstrap test lint hunt phunt scan train pretrain autopilot clean smoke tool desk dev
 
 PY := .venv/bin/python
+PIP := .venv/bin/pip
 
 bootstrap:
-	test -d .venv || uv venv
-	uv pip install --native-tls -r requirements.txt
+	test -d .venv || python3 -m venv .venv
+	$(PIP) install -r requirements.txt
 
 test:
 	$(PY) -m pytest -q
@@ -37,14 +38,17 @@ autopilot:
 smoke:
 	$(PY) -m pytest tests/test_cache.py tests/test_bls.py tests/test_vetting.py -q
 
-dev:
-	cd web && npm install
-	python3 -m tool --host 127.0.0.1 --port 8765 &
-	cd web && npm run dev
-
-tool:
+# Default local run: one process, built UI, continuous search auto-starts.
+desk: bootstrap
 	cd web && npm install && npm run build
-	python3 -m tool --host 127.0.0.1 --port 8765
+	$(PY) -m tool --host 127.0.0.1 --port 8765
+
+tool: desk
+
+dev: bootstrap
+	cd web && npm install
+	$(PY) -m tool --host 127.0.0.1 --port 8765 &
+	cd web && npm run dev
 
 clean:
 	rm -rf cache/phase1/*.npz cache/phase2/*.npz cache/phase3/*.npz \

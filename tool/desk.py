@@ -164,6 +164,7 @@ def present_candidate(meta: dict) -> dict:
     period = _finite(meta.get("best_period"))
     diff = meta.get("difference_image")
     plot = meta.get("plot") or meta.get("_plot_path")
+    prob = _finite(meta.get("prob_planet"))
     return {
         "id": meta.get("_id"),
         "tic_id": str(meta.get("tic_id") or ""),
@@ -172,6 +173,8 @@ def present_candidate(meta: dict) -> dict:
         "depth": depth,
         "depth_ppm": None if depth is None else depth * 1e6,
         "sde": sde,
+        "prob_planet": prob,
+        "model_score": prob,
         "hard_flags": flags,
         "label": candidate_label(meta),
         "status": meta.get("status") or ("CANDIDATE_SDE" if meta.get("prob_planet") is None else ""),
@@ -187,7 +190,7 @@ def present_candidate(meta: dict) -> dict:
 
 
 class Desk:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, enable_auto_start: bool = True):
         self.root = Path(root)
         self.candidates = self.root / "candidates"
         self.exports = self.root / "exports"
@@ -202,25 +205,40 @@ class Desk:
                 self.queue = json.loads(saved.read_text())
             except json.JSONDecodeError:
                 self.queue = None
-        self.continuous = ContinuousSearch(self)
+        self.continuous = ContinuousSearch(self, enable_auto_start=enable_auto_start)
 
     def health(self) -> dict:
         checkpoint = Path("models/checkpoints/resnet1d.pt")
         mast = mast_requirement()
+        progress = self.continuous.progress()
         return {
             "ok": True,
             "checkpoint": checkpoint.is_file(),
             "mast": mast["available"],
             "mast_message": mast["message"],
+            "continuous_status": progress.get("status") or self.continuous.state.get("status"),
+            "auto_start": bool(progress.get("auto_start", True)),
         }
 
     def rank(self, rows: list, *, limit: int, period_min: float, period_max: float) -> dict:
         from pipeline.target_rank import rank_targets, records_from_rows
+        from pipeline.tic_enrich import enrich_records
 
+        cache = self.root / "tic_enrich.json"
         records = records_from_rows(rows)
+        enrich_records(records, cache_path=cache)
         provided = {}
         for record, row in zip(records, rows):
             flags = _provided_fields(row)
+            # After enrichment, treat filled fields as provided for the why string.
+            if _finite(record.radius):
+                flags["radius"] = True
+            if record.n_sectors and int(record.n_sectors) > 0:
+                flags["n_sectors"] = True
+            if _finite(record.crowdsap):
+                flags["crowdsap"] = True
+            if _finite(record.tmag):
+                flags["tmag"] = True
             record.extra = flags
             provided[id(record)] = flags
         ranked = rank_targets(

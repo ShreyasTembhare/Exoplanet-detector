@@ -11,17 +11,22 @@ from fastapi.testclient import TestClient
 from tool.server import create_app
 
 
+def _app(path):
+    return create_app(path, enable_auto_start=False)
+
+
 def test_health(tmp_path):
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     response = client.get("/api/health")
     assert response.status_code == 200
     body = response.json()
     assert body["ok"] is True
     assert body["checkpoint"] is False
+    assert "auto_start" in body
 
 
 def test_empty_candidate_list(tmp_path):
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     response = client.get("/api/candidates")
     assert response.status_code == 200
     assert response.json()["candidates"] == []
@@ -36,7 +41,7 @@ def test_export_rejects_missing_epoch(tmp_path):
         "sde": 8.0,
         "vetting": {"depth": 0.001, "n_transits": 3},
     }))
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     listed = client.get("/api/candidates").json()["candidates"]
     assert listed[0]["epoch_btjd"] is None
     response = client.post(f"/api/candidates/{listed[0]['id']}/export")
@@ -72,8 +77,25 @@ def test_export_rejects_missing_epoch(tmp_path):
     assert detail.json()["epoch_btjd"] == pytest.approx(1710.25)
 
 
+def test_candidate_exposes_model_score(tmp_path):
+    candidates = tmp_path / "candidates"
+    candidates.mkdir()
+    (candidates / "TIC_42_p3.00.json").write_text(json.dumps({
+        "tic_id": "42",
+        "best_period": 3.0,
+        "epoch": 1710.5,
+        "sde": 9.2,
+        "prob_planet": 0.87,
+        "vetting": {"depth": 0.002, "n_transits": 4, "transit_center_btjd": 1710.5},
+    }))
+    client = TestClient(_app(tmp_path))
+    rows = client.get("/api/candidates").json()["candidates"]
+    assert rows[0]["model_score"] == pytest.approx(0.87)
+    assert rows[0]["prob_planet"] == pytest.approx(0.87)
+
+
 def test_rank_order_on_fixture_tic_table(tmp_path):
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     rows = [
         {"tic_id": "1", "radius": 1.2, "n_sectors": 1, "crowdsap": 0.90, "tmag": 10, "ra": 10, "dec": 20},
         {"tic_id": "2", "radius": 0.35, "n_sectors": 13, "crowdsap": 0.97, "tmag": 11, "ra": 200, "dec": -40},
@@ -118,7 +140,7 @@ def test_sector_search_reports_mast_and_writes_nothing(tmp_path):
 
     if mast_requirement()["available"]:
         pytest.skip("MAST clients are installed")
-    client = TestClient(create_app(tmp_path))
+    client = TestClient(_app(tmp_path))
     started = client.post("/api/runs", json={"mode": "sector", "sector": 15, "limit": 5})
     assert started.status_code == 200
     assert started.json()["run"]["status"] == "running"

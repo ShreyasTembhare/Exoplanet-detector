@@ -53,16 +53,32 @@ def _sde_text(sde) -> str:
     return f"{number:.2f}"
 
 
+def _parse_iso(value) -> float | None:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
 class ContinuousSearch:
-    def __init__(self, desk):
+    def __init__(self, desk, *, enable_auto_start: bool = True):
         self.desk = desk
         self.path = desk.root / "continuous.json"
         self.log_path = desk.root / "continuous.log"
+        self.progress_path = desk.root / "continuous_progress.json"
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
         self.state = self._load()
+        if "auto_start" not in self.state:
+            self.state["auto_start"] = True
+        self._write_progress_unlocked()
         if self.state.get("status") == "running":
             self._ensure_thread()
+        elif enable_auto_start:
+            self._maybe_auto_start()
 
     def _idle(self) -> dict:
         return {
@@ -76,6 +92,12 @@ class ContinuousSearch:
             "config": {},
             "started_at": None,
             "updated_at": None,
+            "auto_start": True,
+            "stars_done": 0,
+            "candidates_found": 0,
+            "current_target": "",
+            "last_sde": None,
+            "last_log_line": "",
         }
 
     def _load(self) -> dict:
@@ -89,11 +111,39 @@ class ContinuousSearch:
             return self._idle()
         base = self._idle()
         base.update(data)
+        if "auto_start" not in data:
+            base["auto_start"] = True
         return base
 
     def _persist(self):
         self.state["updated_at"] = _now()
         self.path.write_text(json.dumps(_json_ready(self.state), indent=2))
+        self._write_progress_unlocked()
+
+    def _write_progress_unlocked(self):
+        started = _parse_iso(self.state.get("started_at"))
+        elapsed = max(0.0, datetime.now(timezone.utc).timestamp() - started) if started else 0.0
+        stars = int(self.state.get("stars_done") or 0)
+        stars_per_hour = (stars / elapsed * 3600.0) if elapsed > 1 else 0.0
+        payload = {
+            "status": self.state.get("status") or "idle",
+            "mode": self.state.get("mode"),
+            "cursor": int(self.state.get("cursor") or 0),
+            "sector": self.state.get("sector"),
+            "current_target": self.state.get("current_target") or "",
+            "stars_done": stars,
+            "candidates_found": int(self.state.get("candidates_found") or 0),
+            "last_sde": self.state.get("last_sde"),
+            "last_log_line": self.state.get("last_log_line") or "",
+            "message": self.state.get("message") or "",
+            "auto_start": bool(self.state.get("auto_start", True)),
+            "started_at": self.state.get("started_at"),
+            "updated_at": self.state.get("updated_at") or _now(),
+            "elapsed_seconds": round(elapsed, 1),
+            "stars_per_hour": round(stars_per_hour, 2),
+        }
+        self.progress_path.parent.mkdir(parents=True, exist_ok=True)
+        self.progress_path.write_text(json.dumps(_json_ready(payload), indent=2))
 
     def read_lines(self) -> list:
         if not self.log_path.is_file():
@@ -109,15 +159,75 @@ class ContinuousSearch:
                 continue
         return lines
 
+    def progress(self) -> dict:
+        with self.lock:
+            self._write_progress_unlocked()
+            if self.progress_path.is_file():
+                try:
+                    return json.loads(self.progress_path.read_text())
+                except json.JSONDecodeError:
+                    pass
+            return {}
+
     def snapshot(self) -> dict:
         with self.lock:
             state = copy.deepcopy(self.state)
+            self._write_progress_unlocked()
+            progress = {}
+            if self.progress_path.is_file():
+                try:
+                    progress = json.loads(self.progress_path.read_text())
+                except json.JSONDecodeError:
+                    progress = {}
         state["lines"] = self.read_lines()
+        state["progress"] = progress
         return state
 
     def is_running(self) -> bool:
         with self.lock:
             return self.state.get("status") == "running"
+
+    def _maybe_auto_start(self):
+        with self.lock:
+            if not self.state.get("auto_start", True):
+                return
+            status = self.state.get("status")
+            # Resume an interrupted running loop; stay paused if the operator paused.
+            # Stop with auto_start=false stays idle. A finished pass (stopped +
+            # auto_start still true) may start the next sector/queue walk.
+            if status in {"running", "paused"}:
+                return
+        try:
+            sector = 1
+            with self.lock:
+                sector = int(self.state.get("sector") or 1)
+            self.start({
+                "sector": sector,
+                "limit": 20,
+                "period_min": 0.5,
+                "period_max": 15.0,
+                "nperiods": 400,
+                "sde_threshold": 7.0,
+            })
+        except Exception as exc:
+            with self.lock:
+                self.state["message"] = f"Auto-start deferred: {exc}"
+                self._persist()
+
+    def _plan_differs(self, config: dict) -> bool:
+        local_dir = str(config.get("local_dir") or "").strip()
+        mode = self.state.get("mode")
+        if local_dir:
+            try:
+                wanted = str(Path(local_dir).expanduser().resolve())
+            except OSError:
+                wanted = str(Path(local_dir).expanduser())
+            current = str(self.state.get("local_dir") or "")
+            return mode != "local" or current != wanted
+        ids = _queue_ids(self.desk.queue)
+        if ids:
+            return mode != "queue" or list(self.state.get("queue_ids") or []) != ids
+        return mode != "sectors"
 
     def start(self, config: dict) -> dict:
         with self.desk.lock:
@@ -127,8 +237,9 @@ class ContinuousSearch:
                 status = self.state.get("status")
                 if status == "running":
                     raise RuntimeError("Keep searching is already running.")
-                if status == "paused":
+                if status == "paused" and not self._plan_differs(config):
                     self.state["status"] = "running"
+                    self.state["auto_start"] = True
                     self.state["message"] = "Resumed. The loop continues from the next target."
                     self._persist()
                     self._ensure_thread()
@@ -139,7 +250,7 @@ class ContinuousSearch:
                         "status": "running",
                         "mode": plan["mode"],
                         "cursor": 0,
-                        "sector": int(config.get("sector") or 1),
+                        "sector": int(config.get("sector") or self.state.get("sector") or 1),
                         "local_dir": plan.get("local_dir"),
                         "queue_ids": plan.get("queue_ids") or [],
                         "message": plan["message"],
@@ -152,12 +263,19 @@ class ContinuousSearch:
                         },
                         "started_at": _now(),
                         "updated_at": _now(),
+                        "auto_start": True,
+                        "stars_done": 0,
+                        "candidates_found": 0,
+                        "current_target": "",
+                        "last_sde": None,
+                        "last_log_line": plan["message"],
                     }
                     self.log_path.write_text("")
                     self._persist()
                     self._ensure_thread()
                     state = copy.deepcopy(self.state)
         state["lines"] = self.read_lines()
+        state["progress"] = self.progress()
         return state
 
     def pause(self) -> dict:
@@ -178,6 +296,7 @@ class ContinuousSearch:
             self._persist()
             state = copy.deepcopy(self.state)
         state["lines"] = self.read_lines()
+        state["progress"] = self.progress()
         return state
 
     def stop(self) -> dict:
@@ -185,7 +304,8 @@ class ContinuousSearch:
             if self.state.get("status") not in {"running", "paused"}:
                 raise RuntimeError("Keep searching is not running.")
             self.state["status"] = "stopped"
-            self.state["message"] = "Stopped."
+            self.state["auto_start"] = False
+            self.state["message"] = "Stopped. Auto-start is off until Start or Resume."
             self._append_unlocked({
                 "target": "",
                 "sector": self.state.get("sector"),
@@ -193,11 +313,12 @@ class ContinuousSearch:
                 "candidate": False,
                 "error": None,
                 "phase": "stop",
-                "message": "Stopped.",
+                "message": "Stopped. Auto-start is off until Start or Resume.",
             })
             self._persist()
             state = copy.deepcopy(self.state)
         state["lines"] = self.read_lines()
+        state["progress"] = self.progress()
         return state
 
     def _plan(self, config: dict) -> dict:
@@ -211,7 +332,7 @@ class ContinuousSearch:
                 raise ValueError("Local curve directory has no time, flux CSV files.")
             return {
                 "mode": "local",
-                "local_dir": str(directory),
+                "local_dir": str(directory.resolve()),
                 "message": f"Walking {len(files)} local curves.",
             }
         ids = _queue_ids(self.desk.queue)
@@ -437,6 +558,8 @@ class ContinuousSearch:
             tic_path.write_text(f"tic_id\n{target}\n")
             tic_list = str(tic_path)
             limit = 1
+        # Same hunt path as a one-shot desk search: parallel hunter, duration
+        # grid, top-k peaks, hard flags, optional checkpoint scores.
         result = run_hunt(HuntConfig(
             sector=sector,
             limit=limit,
@@ -525,6 +648,19 @@ class ContinuousSearch:
             handle.write(json.dumps(line) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        phase = line.get("phase")
+        if line.get("target"):
+            self.state["current_target"] = line["target"]
+        if line.get("message"):
+            self.state["last_log_line"] = line["message"]
+        if phase == "result":
+            self.state["stars_done"] = int(self.state.get("stars_done") or 0) + 1
+            sde = _finite(line.get("sde"))
+            if sde is not None:
+                self.state["last_sde"] = sde
+            if line.get("candidate"):
+                self.state["candidates_found"] = int(self.state.get("candidates_found") or 0) + 1
+        self._write_progress_unlocked()
 
 
 def _queue_ids(queue: dict | None) -> list:
