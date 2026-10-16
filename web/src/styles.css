@@ -105,9 +105,9 @@ main { padding: 22px 28px 48px; }
 }
 
 .pill { padding: 3px 8px; border: 1px solid #d3cdc2; }
-.pill.running { color: #8a5a12; border-color: #8a5a12; }
+.pill.running, .pill.paused { color: #8a5a12; border-color: #8a5a12; }
 .pill.failed { color: #8d3b2f; border-color: #8d3b2f; }
-.pill.done { color: #1e5c45; border-color: #1e5c45; }
+.pill.done, .pill.stopped { color: #1e5c45; border-color: #1e5c45; }
 
 h1 {
   margin: 0 0 4px;
@@ -172,7 +172,7 @@ textarea {
 
 input[type="file"] { max-width: 280px; text-transform: none; }
 
-button[type="submit"], .form > button, .export button, .link {
+button[type="submit"], .form > button, .actions button, .export button, .link {
   white-space: nowrap;
   padding: 8px 12px;
   border: 1px solid #1c1916;
@@ -228,6 +228,31 @@ th {
 .state-title { margin-bottom: 4px; color: #8d3b2f; }
 
 .split { margin-top: 8px; padding-top: 8px; border-top: 1px solid #d3cdc2; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; grid-column: 1 / -1; }
+
+.log {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  max-height: 280px;
+  overflow: auto;
+  border-top: 1px solid #d3cdc2;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.log li {
+  display: grid;
+  grid-template-columns: 168px minmax(0, 1fr);
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px solid #e4dfd6;
+}
+
+.log time { color: #6f675e; }
+.log .candidate, .log li.candidate { color: #1e5c45; }
+.log li.error { color: #8d3b2f; }
 
 .metrics {
   display: grid;

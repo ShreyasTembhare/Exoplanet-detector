@@ -24,7 +24,7 @@ python run.py pretrain  mlm --epochs 10
 python run.py autopilot --start-sector 1 --end-sector 26
 ```
 
-The desk is the operator UI: rank a TIC table, start a search, review SDE-pass candidates, export one TFOP packet. Training, autopilot, and SSL pretrain stay on the CLI. A sector search needs MAST (`lightkurve` and `astroquery`). Without them the desk says so and writes no candidates.
+The desk is the operator UI: rank a TIC table, keep searching, review SDE-pass candidates, export one TFOP packet. Training, autopilot, and SSL pretrain stay on the CLI. Keep searching is one server-side loop: a ranked queue, otherwise sectors forward, or a directory of local `time,flux` CSVs. The log is appended under the desk data directory and stays up when the browser closes. A sector search needs MAST (`lightkurve` and `astroquery`). Without them the desk says so in the log and writes no candidates.
 
 Hardware is auto-detected: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
 

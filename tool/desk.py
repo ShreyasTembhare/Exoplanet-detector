@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from services import HuntConfig, load_candidates, mast_requirement, run_hunt, run_local_lightcurve
+from tool.continuous import ContinuousSearch
 
 
 def _json_ready(value):
@@ -201,6 +202,7 @@ class Desk:
                 self.queue = json.loads(saved.read_text())
             except json.JSONDecodeError:
                 self.queue = None
+        self.continuous = ContinuousSearch(self)
 
     def health(self) -> dict:
         checkpoint = Path("models/checkpoints/resnet1d.pt")
@@ -343,7 +345,7 @@ class Desk:
         if mode not in {"sector", "local"}:
             raise ValueError("mode must be sector or local")
         with self.lock:
-            if self.run and self.run.get("status") == "running":
+            if self.continuous.is_running() or (self.run and self.run.get("status") == "running"):
                 raise RuntimeError("A search is already running.")
             run = {
                 "id": "run-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S"),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const STEPS = [
   { id: "queue", n: "01", title: "Queue" },
@@ -83,6 +83,8 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [exportResult, setExportResult] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [continuous, setContinuous] = useState(null);
+  const [curveDir, setCurveDir] = useState("");
 
   const refreshCandidates = useCallback(async () => {
     const body = await api("/api/candidates");
@@ -94,8 +96,24 @@ export default function App() {
     api("/api/health").then(setHealth).catch((error) => setNotice(error.message));
     api("/api/queue").then((body) => setQueue(body.queue)).catch(() => {});
     api("/api/runs/current").then((body) => setRun(body.run)).catch(() => {});
+    api("/api/continuous").then(setContinuous).catch(() => {});
     refreshCandidates().catch((error) => setNotice(error.message));
   }, [refreshCandidates]);
+
+  const continuousStatus = continuous ? continuous.status : "idle";
+
+  useEffect(() => {
+    if (continuousStatus !== "running" && continuousStatus !== "paused") return undefined;
+    const timer = setInterval(() => {
+      api("/api/continuous")
+        .then((body) => {
+          setContinuous(body);
+          refreshCandidates().catch(() => {});
+        })
+        .catch((error) => setNotice(error.message));
+    }, 800);
+    return () => clearInterval(timer);
+  }, [continuousStatus, refreshCandidates]);
 
   useEffect(() => {
     if (!run || run.status !== "running") return undefined;
@@ -188,6 +206,51 @@ export default function App() {
     }
   }
 
+  async function keepSearching() {
+    setNotice("");
+    setBusy(true);
+    try {
+      const body = await api("/api/continuous/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          local_dir: curveDir.trim() || null,
+          sector: Number(sector),
+          limit: Number(limit),
+          sde_threshold: Number(sde),
+          period_min: 0.5,
+          period_max: 15,
+          nperiods: curveDir.trim() ? 400 : 2000,
+        }),
+      });
+      setContinuous(body);
+      setStep("search");
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function pauseSearching() {
+    setNotice("");
+    try {
+      setContinuous(await api("/api/continuous/pause", { method: "POST" }));
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
+  async function stopSearching() {
+    setNotice("");
+    try {
+      setContinuous(await api("/api/continuous/stop", { method: "POST" }));
+      refreshCandidates().catch(() => {});
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
   function openCandidate(id) {
     setSelected(id);
     setExportResult(null);
@@ -207,7 +270,8 @@ export default function App() {
   }
 
   const checkpoint = health && health.checkpoint;
-  const runStatus = run ? run.status : "idle";
+  const keepLive = continuousStatus === "running" || continuousStatus === "paused";
+  const runStatus = keepLive ? continuousStatus : (run ? run.status : "idle");
 
   return (
     <div className="shell">
@@ -243,7 +307,11 @@ export default function App() {
         <header className="top">
           <p className={`pill ${runStatus}`}>{runStatus === "idle" ? "Idle" : runStatus}</p>
           <p className="top-note">
-            {run && run.message ? run.message : "Rank a table, then search. Nothing is added without an SDE pass."}
+            {keepLive && continuous.message
+              ? continuous.message
+              : run && run.message
+                ? run.message
+                : "Rank a table, then keep searching. Nothing is added without an SDE pass."}
           </p>
         </header>
         {notice ? <p className="banner">{notice}</p> : null}
@@ -279,6 +347,12 @@ export default function App() {
             start={start}
             run={run}
             busy={busy}
+            curveDir={curveDir}
+            setCurveDir={setCurveDir}
+            continuous={continuous}
+            keepSearching={keepSearching}
+            pauseSearching={pauseSearching}
+            stopSearching={stopSearching}
           />
         ) : null}
         {step === "inbox" ? <InboxView candidates={candidates} onOpen={openCandidate} /> : null}
@@ -372,11 +446,19 @@ function SearchView({
   sector, setSector, limit, setLimit, sde, setSde,
   curveText, setCurveText, curvePath, setCurvePath, ticId, setTicId,
   onFile, start, run, busy,
+  curveDir, setCurveDir, continuous, keepSearching, pauseSearching, stopSearching,
 }) {
+  const logRef = useRef(null);
+  const lines = (continuous && continuous.lines) || [];
+  const status = continuous ? continuous.status : "idle";
+  useEffect(() => {
+    const node = logRef.current;
+    if (node) node.scrollTop = node.scrollHeight;
+  }, [lines.length]);
   return (
     <section>
       <h1>Search</h1>
-      <p className="lede">Sector search uses MAST. A local curve uses the same BLS path without a download.</p>
+      <p className="lede">Keep searching stays on the server. Closing this page does not stop it.</p>
       <div className="form">
         <label>
           Sector
@@ -390,7 +472,40 @@ function SearchView({
           SDE gate
           <input type="number" step="0.1" value={sde} onChange={(event) => setSde(event.target.value)} />
         </label>
-        <button type="button" disabled={busy || (run && run.status === "running")} onClick={() => start("sector")}>
+        <label className="wide">
+          Local curve directory
+          <input
+            value={curveDir}
+            onChange={(event) => setCurveDir(event.target.value)}
+            placeholder="/path/curves"
+          />
+        </label>
+        <div className="actions">
+          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={keepSearching}>
+            {status === "paused" ? "Resume" : "Keep searching"}
+          </button>
+          <button type="button" disabled={status !== "running"} onClick={pauseSearching}>Pause</button>
+          <button type="button" disabled={status !== "running" && status !== "paused"} onClick={stopSearching}>Stop</button>
+        </div>
+      </div>
+      <p className="quiet">
+        A directory of time, flux CSVs is searched as given. Otherwise a ranked queue is walked, and if there is no queue the sectors advance. A missing MAST client is logged and no star is invented.
+      </p>
+      <ol className="log" ref={logRef} aria-live="polite">
+        {lines.length === 0 ? (
+          <li className="quiet">The log is empty.</li>
+        ) : lines.map((line, index) => (
+          <li key={`${line.ts}-${index}`} className={line.error ? "error" : line.candidate ? "candidate" : ""}>
+            <time dateTime={line.ts}>{line.ts}</time>
+            <span>{line.message}</span>
+          </li>
+        ))}
+      </ol>
+      <div className="split">
+        <h2>One target</h2>
+        <p className="quiet">A single sector uses MAST. One pasted curve uses the same BLS path without a download.</p>
+      <div className="form">
+        <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("sector")}>
           Start sector search
         </button>
       </div>
@@ -415,10 +530,11 @@ function SearchView({
             Path on this machine
             <input value={curvePath} onChange={(event) => setCurvePath(event.target.value)} placeholder="/path/curve.csv" />
           </label>
-          <button type="button" disabled={busy || (run && run.status === "running")} onClick={() => start("local")}>
+          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("local")}>
             Search this curve
           </button>
         </div>
+      </div>
       </div>
     </section>
   );

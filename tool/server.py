@@ -21,6 +21,16 @@ class RankBody(BaseModel):
     period_max: float = 15.0
 
 
+class ContinuousBody(BaseModel):
+    local_dir: str | None = None
+    sector: int = 1
+    limit: int = 20
+    period_min: float = 0.5
+    period_max: float = 15.0
+    nperiods: int = Field(default=400, le=20000, ge=32)
+    sde_threshold: float = 7.0
+
+
 class RunBody(BaseModel):
     mode: str = "sector"
     sector: int = 15
@@ -65,6 +75,33 @@ def create_app(data_dir: str | Path = "var/desk") -> FastAPI:
         return app.state.desk.rank(
             rows, limit=body.limit, period_min=body.period_min, period_max=body.period_max,
         )
+
+    @app.get("/api/continuous")
+    def continuous_state():
+        return app.state.desk.continuous.snapshot()
+
+    @app.post("/api/continuous/start")
+    def continuous_start(body: ContinuousBody):
+        try:
+            return app.state.desk.continuous.start(body.model_dump())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/continuous/pause")
+    def continuous_pause():
+        try:
+            return app.state.desk.continuous.pause()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/continuous/stop")
+    def continuous_stop():
+        try:
+            return app.state.desk.continuous.stop()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/runs/current")
     def current_run():
