@@ -538,6 +538,10 @@ class ContinuousSearch:
     def _search_hunt(self, item: dict):
         target = str(item.get("target") or "")
         sector = int(item.get("sector") or 1)
+        if item.get("kind") == "sector":
+            start_message = f"Searching sector {sector}."
+        else:
+            start_message = f"Searching {target} sector {sector}."
         self._append(
             target=target,
             sector=sector,
@@ -545,7 +549,7 @@ class ContinuousSearch:
             candidate=False,
             error=None,
             phase="start",
-            message=f"Searching {target} sector {sector}.",
+            message=start_message,
         )
         cfg = self.state.get("config") or {}
         log_file = self.desk.root / "continuous_hunt.csv"
