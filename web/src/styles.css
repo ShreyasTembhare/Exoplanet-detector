@@ -23,10 +23,12 @@
 
 body { margin: 0; }
 
-button, input, textarea {
+button, input, textarea, select {
   font: inherit;
   color: inherit;
 }
+
+:focus-visible { outline: 2px solid var(--ember); outline-offset: 2px; }
 
 .shell {
   display: grid;
@@ -59,6 +61,8 @@ aside {
 nav { display: flex; flex-direction: column; gap: 2px; }
 
 .step {
+  color: inherit;
+  text-decoration: none;
   display: flex;
   gap: 10px;
   align-items: baseline;
@@ -232,7 +236,7 @@ label {
   color: var(--mute);
 }
 
-input, textarea {
+input, textarea, select {
   padding: 7px 8px;
   border: 1px solid var(--rule);
   border-radius: 2px;
@@ -253,7 +257,7 @@ textarea {
 
 input[type="file"] { max-width: 280px; text-transform: none; }
 
-button[type="submit"], .form > button, .actions button, .export button, .link {
+button[type="submit"], .form > button, .actions button, .export button, .pager button, .link {
   white-space: nowrap;
   padding: 8px 12px;
   border: 1px solid var(--ink);
@@ -380,4 +384,77 @@ tr.hit td { background: rgba(30, 92, 69, 0.06); }
   nav { flex-direction: row; flex-wrap: wrap; }
   .strip { grid-template-columns: 1fr; }
   .live-metrics, .metrics { grid-template-columns: 1fr 1fr; }
+}
+
+.shell.single { grid-template-columns: 1fr; }
+.gate { max-width: 560px; margin: 10vh auto 0; }
+
+.skip { position: absolute; left: -9999px; top: 0; }
+.skip:focus { left: 8px; top: 8px; padding: 6px 10px; background: var(--ink); color: #f6f3ec; z-index: 10; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+.text-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.banner { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.rail-note.warn { color: var(--clay); }
+.bad { color: var(--clay); }
+.error-text { color: var(--clay); font-family: "IBM Plex Mono", ui-monospace, monospace; font-size: 12px; }
+.crumb { margin: 0 0 4px; color: var(--mute); font-size: 13px; }
+
+.live-dot { color: var(--mute); }
+.live-dot.on { color: var(--moss); }
+.live-dot::before { content: "● "; }
+
+.live-metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.live-metrics dd.bad { color: var(--clay); }
+
+.log-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.log-head h2 { margin-bottom: 0; }
+
+.filters {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 10px 12px;
+  margin: 0 0 14px;
+}
+
+.pager { display: flex; gap: 14px; align-items: center; margin-top: 14px; }
+
+.chart { margin: 0; max-width: 760px; }
+.chart svg { width: 100%; height: auto; background: var(--paper-lift); }
+.chart .grid line { stroke: #e2ddd3; }
+.chart text { fill: var(--mute); font-size: 11px; font-family: "IBM Plex Mono", ui-monospace, monospace; }
+.chart .marker { stroke: var(--ember); stroke-dasharray: 3 3; opacity: 0.6; }
+.chart .ln { fill: none; stroke-width: 1.5; }
+.chart .ln.ink { stroke: var(--ink); }
+.chart .ln.ember { stroke: var(--ember); }
+.chart .ln.moss { stroke: var(--moss); }
+.chart .pts.ink rect { fill: var(--ink); opacity: 0.55; }
+.chart .bar.ink { fill: var(--ink); }
+.chart .bar.moss { fill: var(--moss); }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--mute); margin-top: 4px; }
+.legend .key::before { content: ""; display: inline-block; width: 14px; height: 2px; margin-right: 6px; vertical-align: middle; background: var(--ink); }
+.legend .key.ember::before { background: var(--ember); }
+.legend .key.moss::before { background: var(--moss); }
+
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; max-width: 1100px; }
+
+.verdict { max-width: 760px; display: grid; gap: 10px; }
+.actions button.chosen { background: var(--moss); border-color: var(--moss); }
+
+@media (max-width: 900px) {
+  .filters { grid-template-columns: 1fr 1fr; }
+  .pair { grid-template-columns: 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
 }

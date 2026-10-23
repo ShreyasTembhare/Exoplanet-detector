@@ -402,7 +402,7 @@ def run_local_lightcurve(
         for p in (res.peaks or [])
     ]
     power = float(np.nanmax(res.power)) if len(res.power) else float("nan")
-    from hunter import _save_candidate_evidence, _save_candidate_plot
+    from hunter import _evidence_for, _save_candidate_evidence, _save_candidate_plot
 
     try:
         plot_path = _save_candidate_plot(time, flux, period, epoch, str(tic_id), None, candidate_dir)
@@ -412,6 +412,7 @@ def run_local_lightcurve(
     _save_candidate_evidence(
         candidate_dir, str(tic_id), period, None, power, sde, centroid,
         plot_path, vetting, peaks, "balanced", epoch=epoch,
+        evidence=_evidence_for(time, flux, {"period": period, "epoch": epoch, "vetting": vetting}, res),
     )
     safe = str(tic_id).replace(" ", "_").replace("/", "_")
     json_path = os.path.join(candidate_dir, f"TIC_{safe}_p{period:.2f}.json")

@@ -206,6 +206,7 @@ def run_parallel_hunt(
         STAGE_DONE,
         _append_log,
         _ensure_setup,
+        _evidence_for,
         _load_model,
         _load_progress,
         _normalize_tic,
@@ -386,6 +387,7 @@ def run_parallel_hunt(
                 "sde": sig.get("sde"),
                 "power": sig.get("power") or 0.0,
                 "vetting": vetting,
+                "evidence": _evidence_for(item["time"], item["flux"], sig, item.get("bls")),
                 "tic_id": item["tic_id"],
                 "time": item["time"],
                 "flux": item["flux"],
@@ -436,6 +438,7 @@ def run_parallel_hunt(
                     row["centroid_offset"] if row["centroid_offset"] == row["centroid_offset"] else 0.0,
                     plot_path, vetting=row["vetting"], peaks=row["peaks"],
                     strategy_profile=strategy_profile or "balanced", epoch=row["epoch"],
+                    evidence=row.get("evidence"),
                 )
                 candidates.append({
                     "tic_id": row["tic_id"], "period": row["period"],

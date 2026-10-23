@@ -132,10 +132,15 @@ def create_app(
         return app.state.desk.continuous.snapshot(after_id=after_id, limit=limit)
 
     @app.get("/api/continuous/events")
-    def continuous_events(after_id: int = 0, limit: int = Query(default=200, ge=1, le=5000), tail: bool = False):
+    def continuous_events(after_id: int = 0, limit: int = Query(default=200, ge=1, le=5000), tail: bool = False,
+                          before_id: int | None = None):
         store = app.state.desk.store
-        return {"lines": store.events(after_id=after_id, limit=limit, tail=tail),
-                "last_event_id": store.last_event_id()}
+        return {"lines": store.events(after_id=after_id, limit=limit, tail=tail, before_id=before_id),
+                "last_event_id": store.last_event_id(), "total": store.event_count()}
+
+    @app.get("/api/stats")
+    def stats():
+        return app.state.desk.stats()
 
     @app.get("/api/stream")
     def stream(after_id: int = 0):

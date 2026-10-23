@@ -166,9 +166,16 @@ class StateStore:
             )
             return int(cur.lastrowid)
 
-    def events(self, after_id: int = 0, limit: int = 500, tail: bool = False) -> List[dict]:
+    def events(self, after_id: int = 0, limit: int = 500, tail: bool = False,
+               before_id: Optional[int] = None) -> List[dict]:
         conn = self._conn()
-        if tail:
+        if before_id is not None:
+            rows = conn.execute(
+                "SELECT id, payload FROM (SELECT id, payload FROM events WHERE id > ? AND id < ? "
+                "ORDER BY id DESC LIMIT ?) ORDER BY id ASC",
+                (int(after_id), int(before_id), int(limit)),
+            ).fetchall()
+        elif tail:
             rows = conn.execute(
                 "SELECT id, payload FROM (SELECT id, payload FROM events WHERE id > ? "
                 "ORDER BY id DESC LIMIT ?) ORDER BY id ASC",

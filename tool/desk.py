@@ -6,7 +6,7 @@ import copy
 import csv
 import io
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -184,7 +184,7 @@ def present_candidate(meta: dict) -> dict:
         "status": meta.get("status") or ("CANDIDATE_SDE" if meta.get("prob_planet") is None else ""),
         "source": meta.get("source") or "",
         "has_difference_image": bool(diff) and Path(str(diff)).is_file(),
-        "has_phase_curve": bool((meta.get("phase_curve") or {}).get("phase")),
+        "has_phase_curve": bool(meta.get("_has_phase_curve") or (meta.get("phase_curve") or {}).get("phase")),
         "has_plot": bool(plot) and Path(str(plot)).is_file(),
         "odd_even_ratio": _finite(vetting.get("odd_even_ratio")),
         "secondary_significance": _finite(vetting.get("secondary_significance")),
@@ -270,6 +270,45 @@ class Desk:
             "mast_message": mast["message"],
             "continuous_status": progress.get("status") or self.continuous.state.get("status"),
             "auto_start": bool(progress.get("auto_start", True)),
+        }
+
+    def stats(self, hours: int = 24) -> dict:
+        """Throughput per hour (from the log), work-queue health, inbox makeup."""
+        now = datetime.now(timezone.utc)
+        buckets = {}
+        for i in range(hours):
+            start = (now - timedelta(hours=hours - 1 - i)).replace(minute=0, second=0, microsecond=0)
+            buckets[start.isoformat(timespec="minutes")] = {"hour": start.isoformat(timespec="minutes"),
+                                                            "stars": 0, "candidates": 0, "errors": 0}
+        for line in self.store.events(limit=20000, tail=True):
+            if line.get("phase") != "result":
+                continue
+            try:
+                ts = datetime.fromisoformat(str(line.get("ts")).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            key = ts.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat(timespec="minutes")
+            bucket = buckets.get(key)
+            if bucket is None:
+                continue
+            bucket["stars"] += 1
+            bucket["candidates"] += int(bool(line.get("candidate")))
+            bucket["errors"] += int(bool(line.get("error")))
+        labels = {}
+        reviewed = self.store.labels()
+        rows = [present_candidate(meta) for meta in self._index.refresh()]
+        for row in rows:
+            labels[row["label"]] = labels.get(row["label"], 0) + 1
+        failed = self.store.items(status="failed", limit=50)
+        return {
+            "hourly": list(buckets.values()),
+            "work": self.store.counts(),
+            "failed_items": failed,
+            "candidates_by_label": labels,
+            "reviewed": len(reviewed),
+            "progress": self.continuous.progress(),
         }
 
     def rank(self, rows: list, *, limit: int, period_min: float, period_max: float) -> dict:

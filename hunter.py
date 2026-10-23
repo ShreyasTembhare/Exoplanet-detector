@@ -399,7 +399,7 @@ def _save_candidate_evidence(
     candidate_dir: str, tic_id: str, best_period: float, prob_planet: float,
     bls_power: float, sde: float, centroid_offset: float,
     plot_path: str, vetting: dict, peaks: list, strategy_profile: str,
-    epoch: float = None,
+    epoch: float = None, evidence: dict = None,
 ):
     safe_tic = str(tic_id).replace(" ", "_").replace("/", "_")
     from pipeline.hard_flags import demotion
@@ -424,6 +424,8 @@ def _save_candidate_evidence(
         "plot": plot_path,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
+    if evidence:
+        meta.update(evidence)
     from strategy_profiles import DEFAULT_PROFILE, PROFILES, compute_candidate_score
 
     profile = strategy_profile if strategy_profile in PROFILES else DEFAULT_PROFILE
@@ -446,6 +448,22 @@ def _save_candidate_evidence(
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
+
+
+def _evidence_for(time_arr, flux_arr, signal: dict, bls_result) -> dict:
+    """Plot data for the desk panels; never fails the star."""
+    try:
+        from pipeline.evidence import evidence_curves
+
+        hours = (signal.get("vetting") or {}).get("duration_hours")
+        return evidence_curves(
+            time_arr, flux_arr, signal.get("period"), signal.get("epoch"),
+            duration_days=float(hours) / 24.0 if hours and hours == hours else None,
+            periods=getattr(bls_result, "periods", None), power=getattr(bls_result, "power", None),
+        )
+    except Exception as exc:
+        logger.debug("Evidence curves skipped: %s", exc)
+        return {}
 
 
 def _load_model(checkpoint_path: str):
@@ -627,7 +645,7 @@ def run_hunt(
                     item["max_power"] or 0.0, item["sde"], item["centroid_offset"] or 0.0,
                     plot_path, vetting=item["vetting"], peaks=item["peaks"],
                     strategy_profile=strategy_profile or "",
-                    epoch=item["epoch"],
+                    epoch=item["epoch"], evidence=item.get("evidence"),
                 )
                 candidates_found.append({
                     "tic_id": tic_id_q, "period": best_period_q,
@@ -787,6 +805,7 @@ def run_hunt(
                     "centroid_offset": signal.get("centroid_offset"),
                     "skip_classifier": bool(signal.get("skip_classifier")),
                     "peaks": peaks_list, "vetting": vetting_dict,
+                    "evidence": _evidence_for(time_arr, flux_arr, signal, res),
                     "timings": timings, "tic_start": tic_start,
                 })
                 if len(predict_queue) >= infer_batch_size:
