@@ -72,6 +72,8 @@ Hosting options:
 - **Docker anywhere:** `docker build -t transit-hunt .`, then `docker run -e STATE_BUCKET=... transit-hunt worker` (headless) or `docker run -p 8765:8765 -e DESK_TOKEN=... -v $PWD/var:/app/var transit-hunt` (desk and UI).
 - **Fly.io always-on:** copy [`fly.toml.example`](fly.toml.example) to `fly.toml`; the volume keeps `state.db` and `STATE_BUCKET` adds off-machine backups.
 
+Security: when the desk binds to anything other than loopback it refuses to start without `DESK_TOKEN` (every `/api` route except `/api/health` then needs `Authorization: Bearer <token>`; the UI asks for it once), and path inputs are jailed to the data directory plus `DESK_ALLOWED_DIRS` (`:`-separated). Continuous search starts on boot only with `AUTO_START=1` or `--auto-start` (`make desk` passes it). `DESK_CHECKPOINT_MINUTES` makes a long-running desk push checkpoints too.
+
 ```bash
 python -m tool.checkpoint pull --data var/desk   # restore by hand
 python -m tool.checkpoint push --data var/desk   # back up by hand

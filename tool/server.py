@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -63,17 +64,45 @@ def create_app(
     enable_auto_start: bool = True,
     allowed_dirs: list | None = None,
     token: str | None = None,
+    checkpoint_minutes: float = 0.0,
 ) -> FastAPI:
+    """``token`` requires ``Authorization: Bearer <token>`` (or ``?token=`` for
+    EventSource and image URLs) on every ``/api`` route except health."""
     app = FastAPI(title="Transit desk")
     app.state.desk = Desk(Path(data_dir), enable_auto_start=enable_auto_start, allowed_dirs=allowed_dirs)
+    app.state.checkpointer = None
+
+    if token:
+        expected = token.encode()
+
+        @app.middleware("http")
+        async def require_token(request: Request, call_next):
+            path = request.url.path
+            if path.startswith("/api/") and path != "/api/health":
+                header = request.headers.get("authorization", "")
+                supplied = header[7:] if header.lower().startswith("bearer ") else request.query_params.get("token", "")
+                if not hmac.compare_digest(supplied.encode(), expected):
+                    return JSONResponse({"detail": "A desk token is required."}, status_code=401,
+                                        headers={"WWW-Authenticate": "Bearer"})
+            return await call_next(request)
+
+    @app.on_event("startup")
+    def _start_checkpoints():
+        if checkpoint_minutes and checkpoint_minutes > 0:
+            from tool.checkpoint import PeriodicCheckpoint
+
+            app.state.checkpointer = PeriodicCheckpoint(app.state.desk, checkpoint_minutes * 60.0)
+            app.state.checkpointer.start()
 
     @app.on_event("shutdown")
     def _drain():
         app.state.desk.shutdown(timeout=None)
+        if app.state.checkpointer is not None:
+            app.state.checkpointer.stop(final_push=True)
 
     @app.get("/api/health")
     def health():
-        return app.state.desk.health()
+        return {**app.state.desk.health(), "auth_required": bool(token)}
 
     @app.get("/api/queue")
     def get_queue():

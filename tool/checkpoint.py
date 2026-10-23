@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -223,6 +224,40 @@ def push(root: Path, backend=None, store=None) -> Optional[int]:
     data = build_archive(Path(root), store=store)
     backend.put(data)
     return len(data)
+
+
+class PeriodicCheckpoint:
+    """Push a checkpoint of a running desk every ``interval`` seconds."""
+
+    def __init__(self, desk, interval: float, backend=None):
+        self.desk = desk
+        self.interval = max(30.0, float(interval))
+        self.backend = backend if backend is not None else backend_from_env()
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="checkpoint", daemon=True)
+        self.last_error: Optional[str] = None
+
+    def start(self) -> None:
+        if self.backend is not None:
+            self.thread.start()
+
+    def push_now(self) -> Optional[int]:
+        try:
+            size = push(self.desk.root, self.backend, store=self.desk.store)
+            self.last_error = None
+            return size
+        except Exception as exc:
+            self.last_error = str(exc)
+            return None
+
+    def _run(self) -> None:
+        while not self.stopped.wait(self.interval):
+            self.push_now()
+
+    def stop(self, final_push: bool = True) -> None:
+        self.stopped.set()
+        if final_push and self.backend is not None:
+            self.push_now()
 
 
 def main(argv=None):

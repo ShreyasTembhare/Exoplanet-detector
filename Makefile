@@ -41,13 +41,13 @@ smoke:
 # Default local run: one process, built UI, continuous search auto-starts.
 desk: bootstrap
 	cd web && npm install && npm run build
-	$(PY) -m tool --host 127.0.0.1 --port 8765
+	$(PY) -m tool --host 127.0.0.1 --port 8765 --auto-start
 
 tool: desk
 
 dev: bootstrap
 	cd web && npm install
-	$(PY) -m tool --host 127.0.0.1 --port 8765 &
+	$(PY) -m tool --host 127.0.0.1 --port 8765 --auto-start &
 	cd web && npm run dev
 
 clean:
