@@ -94,12 +94,37 @@ def apply_profile_to_hunt_kwargs(profile_name: str, overrides: Optional[dict] = 
     return kwargs
 
 
-def compute_candidate_score(prob_planet: float, bls_power: float,
-                            centroid_offset: float, profile_name: str = "balanced",
-                            vetting: Optional[dict] = None) -> float:
+def _finite(value) -> bool:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and abs(number) != float("inf")
+
+
+def detection_strength(sde: Optional[float] = None, bls_power: Optional[float] = None) -> float:
+    """Map detection significance onto [0, 1].
+
+    BLS power here is ``depth^2 * n_in * n_out / n`` and is not on a fixed
+    scale, so SDE is preferred: SDE 7 (the gate) maps to 0 and SDE 20+ to 1.
     """
-    Unified candidate score combining model probability, BLS power,
-    centroid offset, and a niche-specific bonus.
+    if _finite(sde):
+        return max(0.0, min(1.0, (float(sde) - 7.0) / 13.0))
+    if _finite(bls_power) and float(bls_power) > 0:
+        return max(0.0, min(1.0, float(bls_power) / (float(bls_power) + 1e-4)))
+    return 0.0
+
+
+def compute_candidate_score(prob_planet: Optional[float], bls_power: float,
+                            centroid_offset: float, profile_name: str = "balanced",
+                            vetting: Optional[dict] = None,
+                            sde: Optional[float] = None) -> float:
+    """
+    Unified candidate score combining model probability, detection strength
+    (SDE when given), centroid offset, and a niche-specific bonus.
+
+    Without a classifier (``prob_planet`` is None) the probability weight is
+    moved onto detection strength so SDE-only runs still rank sensibly.
 
     If ``vetting`` is provided, the score also penalises eclipsing-binary
     indicators (low odd/even ratio, strong secondary eclipse, low V/U)
@@ -108,32 +133,42 @@ def compute_candidate_score(prob_planet: float, bls_power: float,
     Returns a value in [0, 1] where higher is better.
     """
     p = get_profile(profile_name)
-    w = p["scoring_weights"]
+    w = dict(p["scoring_weights"])
 
-    prob_component = max(0.0, min(1.0, prob_planet))
-    bls_norm = min(bls_power / 0.01, 1.0)
+    strength = detection_strength(sde, bls_power)
+    if _finite(prob_planet):
+        prob_component = max(0.0, min(1.0, float(prob_planet)))
+    else:
+        prob_component = 0.0
+        w["bls_power"] += w["prob_planet"]
+        w["prob_planet"] = 0.0
     centroid_ok = (
-        max(0.0, 1.0 - centroid_offset / 5.0)
-        if (centroid_offset == centroid_offset and centroid_offset is not None)
+        max(0.0, 1.0 - float(centroid_offset) / 5.0)
+        if _finite(centroid_offset)
         else 0.5
     )
 
-    niche_bonus = 0.0
     if profile_name == "ultra_short_period":
-        niche_bonus = 0.8 if bls_power > 0.003 else 0.3
+        niche_bonus = 0.8 if strength > 0.3 else 0.3
     elif profile_name == "single_transit_long_period":
         niche_bonus = 0.9
     elif profile_name == "low_snr_m_dwarf":
-        niche_bonus = 0.7 if prob_planet > 0.6 else 0.3
+        niche_bonus = 0.7 if (prob_component > 0.6 or strength > 0.4) else 0.3
     else:
         niche_bonus = 0.5
 
     score = (
         w["prob_planet"] * prob_component
-        + w["bls_power"] * bls_norm
+        + w["bls_power"] * strength
         + w["centroid"] * centroid_ok
         + w["niche_bonus"] * niche_bonus
     )
+
+    # Graded demotion from pipeline.hard_flags already folds in odd/even,
+    # secondary, shape, centroid, density and dilution evidence.
+    demotion = (vetting or {}).get("demotion") or {}
+    if isinstance(demotion, dict) and _finite(demotion.get("factor")):
+        return round(min(score * float(demotion["factor"]), 1.0), 4)
 
     # Vetting penalties (multiplicative, in [0.3, 1.0]).
     if vetting:
@@ -156,5 +191,8 @@ def compute_candidate_score(prob_planet: float, bls_power: float,
         gaia = vetting.get("gaia_neighbors_within_30arcsec", -1)
         if isinstance(gaia, int) and gaia > 5:
             score *= 0.85
+        dilution = vetting.get("gaia_flux_ratio")
+        if _finite(dilution) and float(dilution) > 0.5:
+            score *= 0.7
 
     return round(min(score, 1.0), 4)

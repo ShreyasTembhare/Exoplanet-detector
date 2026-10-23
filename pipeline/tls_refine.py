@@ -89,12 +89,23 @@ def refine_peaks(
     half_window_frac: float = 0.05,
     max_peaks: int = 5,
 ) -> List[TLSRefinement]:
-    """Refine the top-N BLS peaks."""
+    """Refine the top-N BLS peaks.
+
+    The output is index-aligned with ``bls_peaks[:max_peaks]``: a peak that
+    cannot be refined yields an ``available=False`` placeholder so callers can
+    ``zip`` peaks with refinements safely.
+    """
     out = []
     for pk in bls_peaks[:max_peaks]:
-        period = getattr(pk, "period", None) or pk.get("period")
-        epoch = getattr(pk, "epoch", None) or pk.get("epoch")
+        if isinstance(pk, dict):
+            period, epoch = pk.get("period"), pk.get("epoch")
+        else:
+            period, epoch = getattr(pk, "period", None), getattr(pk, "epoch", None)
         if period is None or epoch is None:
+            out.append(TLSRefinement(
+                period=float("nan"), epoch=float("nan"), depth=float("nan"),
+                duration_hours=float("nan"), sde=float("nan"), snr=float("nan"),
+            ))
             continue
         out.append(refine_peak(time, flux, float(period), float(epoch), half_window_frac))
     return out

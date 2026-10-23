@@ -78,6 +78,30 @@ def _duration_days(period: float, duration_phase: float) -> float:
     return 0.05 * float(period)
 
 
+def monotransit_views(
+    time: np.ndarray, flux: np.ndarray, epoch: float, duration_days: float,
+) -> tuple:
+    """Time-domain views for a single event: the whole curve and a zoom on the dip.
+
+    Phase folding is meaningless without a period, so the global view bins the
+    unfolded curve and the local view bins +/- 3 durations around the event.
+    """
+    from .fold_features import GLOBAL_BINS, LOCAL_BINS, bin_phase_flux
+
+    t = np.asarray(time, dtype=np.float64)
+    f = np.asarray(flux, dtype=np.float64)
+    if len(t) < 10:
+        return np.ones(GLOBAL_BINS), np.ones(LOCAL_BINS)
+    span = float(np.nanmax(t) - np.nanmin(t)) or 1.0
+    global_vec = bin_phase_flux((t - np.nanmin(t)) / span * 0.999999, f, GLOBAL_BINS)
+    half = 3.0 * max(float(duration_days), 1.0 / 24.0)
+    mask = np.abs(t - float(epoch)) <= half
+    if int(np.sum(mask)) < 10:
+        return global_vec, bin_phase_flux((t - np.nanmin(t)) / span * 0.999999, f, LOCAL_BINS)
+    local_phase = (t[mask] - (float(epoch) - half)) / (2.0 * half) * 0.999999
+    return global_vec, bin_phase_flux(local_phase, f[mask], LOCAL_BINS)
+
+
 def _peak_dict(peak, vetting: dict, extras: dict) -> dict:
     flags = hard_flag_reasons(vetting)
     return {
@@ -166,10 +190,17 @@ def cached_bls(
     refine_nperiods: int = 3000,
 ) -> BLSResult:
     """Phase-2 cache lookup. A second call with the same TIC/sector/grid is free."""
-    from .cache_io import get_phase2, set_phase2
+    from .bls_gpu import _select_backend
+    from .cache_io import get_phase2, phase2_variant, set_phase2
 
+    variant = phase2_variant(
+        backend=_select_backend(len(time), backend),
+        rho=round(float(rho_star_solar), 3) if adaptive_duration else 1.0,
+        adaptive=bool(adaptive_duration), topk=int(topk), two_pass=bool(two_pass),
+        coarse=int(coarse_nperiods), refine=int(refine_nperiods), n=int(len(time)),
+    )
     if use_cache:
-        cached = get_phase2(tic_id, sector, period_min, period_max, nperiods)
+        cached = get_phase2(tic_id, sector, period_min, period_max, nperiods, variant=variant)
         if cached is not None:
             periods, power, best_period, epoch, peaks = cached
             sde_arr = compute_sde(power)
@@ -189,6 +220,7 @@ def cached_bls(
         set_phase2(
             tic_id, sector, period_min, period_max, nperiods,
             res.periods, res.power, res.best_period, res.epoch, peaks=res.peaks,
+            variant=variant,
         )
     return res
 
@@ -253,7 +285,7 @@ def search_with_masking(
             break
         if use_tls:
             refinements = tls_on_sde_peaks(time, work, passing, sde_threshold, max_peaks=3)
-            for peak, refined in zip(passing, refinements):
+            for peak, refined in zip(passing[:len(refinements)], refinements):
                 if getattr(refined, "available", False) and refined.sde > peak.sde:
                     peak.period = float(refined.period)
                     peak.epoch = float(refined.epoch)
@@ -293,6 +325,10 @@ def search_with_masking(
                 if dist < _duration_days(sig["period"], sig["duration_phase"]):
                     mono = None
                     break
+        if mono is not None:
+            gv, lv = monotransit_views(time, work, mono["epoch"], mono["duration_days"])
+            mono["global_view"] = gv
+            mono["local_view"] = lv
 
     return {
         "signals": signals,

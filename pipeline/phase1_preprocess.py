@@ -131,6 +131,8 @@ def load_tess_lightcurve(
         ("TEFF", "teff"),
         ("LOGG", "logg"),
         ("RADIUS", "radius"),
+        ("RA_OBJ", "ra"),
+        ("DEC_OBJ", "dec"),
     ]:
         try:
             meta[meta_key] = float(lc.meta.get(header_key, lc.meta.get(header_key.lower(), float("nan"))))

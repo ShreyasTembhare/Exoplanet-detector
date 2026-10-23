@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import logging
 import os
 import sys
@@ -95,6 +94,22 @@ def _append_log(
             f.write(line)
 
 
+def sky_coords(target, meta) -> tuple:
+    """(ra, dec) in degrees: catalog target record first, then light-curve header."""
+    def _num(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        return number
+
+    ra = _num(getattr(target, "ra", float("nan")))
+    dec = _num(getattr(target, "dec", float("nan")))
+    if not (ra == ra and dec == dec) and isinstance(meta, dict):
+        ra, dec = _num(meta.get("ra")), _num(meta.get("dec"))
+    return ra, dec
+
+
 def _is_nan(val):
     if val is None:
         return True
@@ -117,7 +132,12 @@ def _load_progress(log_file: str) -> dict:
         progress = {}
         for _, row in df.iterrows():
             tic = _normalize_tic(str(row["TIC_ID"]))
+            status = str(row.get("STATUS", ""))
+            attempts = progress.get(tic, {}).get("error_attempts", 0)
+            if status.startswith("ERROR"):
+                attempts += 1
             progress[tic] = {
+                "error_attempts": attempts,
                 "last_stage": str(row.get("LAST_STAGE", "")),
                 "status": str(row.get("STATUS", "")),
                 "best_period": float(row["BEST_PERIOD"]) if "BEST_PERIOD" in row and not _is_nan(row.get("BEST_PERIOD")) else None,
@@ -390,9 +410,19 @@ def _save_candidate_evidence(
         "plot": plot_path,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    json_path = os.path.join(candidate_dir, f"TIC_{safe_tic}_p{best_period:.2f}.json")
-    with open(json_path, "w") as f:
-        json.dump(meta, f, indent=2, default=str)
+    from strategy_profiles import DEFAULT_PROFILE, PROFILES, compute_candidate_score
+
+    profile = strategy_profile if strategy_profile in PROFILES else DEFAULT_PROFILE
+    meta["score"] = compute_candidate_score(
+        prob_planet, bls_power, centroid_offset, profile, vetting=vetting, sde=sde,
+    )
+    meta["demotion"] = vetting.get("demotion")
+    from pipeline.atomic import atomic_write_json
+
+    period_tag = best_period if best_period == best_period else 0.0
+    json_path = os.path.join(candidate_dir, f"TIC_{safe_tic}_p{period_tag:.2f}.json")
+    atomic_write_json(json_path, meta)
+    return json_path
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +459,10 @@ def _predict_batch(model, device, items):
     """
     if model is None or not items:
         return [None] * len(items)
+    if any(item.get("skip_classifier") for item in items):
+        scored = [item for item in items if not item.get("skip_classifier")]
+        probs = iter(_predict_batch(model, device, scored)) if scored else iter(())
+        return [None if item.get("skip_classifier") else next(probs) for item in items]
     try:
         import torch
 
@@ -467,10 +501,17 @@ def _predict_batch(model, device, items):
     return [probs[i, 1].item() for i in range(len(items))]
 
 
+MAX_ERROR_ATTEMPTS = 3
+
+
 def _should_skip_stage(progress: dict, tic_norm: str, stage: str) -> bool:
+    """Skip finished stars. Errors are retried up to ``MAX_ERROR_ATTEMPTS`` times."""
     if tic_norm not in progress:
         return False
-    last = progress[tic_norm].get("last_stage", "")
+    entry = progress[tic_norm]
+    if str(entry.get("status", "")).startswith("ERROR"):
+        return int(entry.get("error_attempts", 1)) >= MAX_ERROR_ATTEMPTS
+    last = entry.get("last_stage", "")
     if last == STAGE_DONE or last == "predict":
         return True
     try:
@@ -504,7 +545,7 @@ def run_hunt(
     target_list = ranked.search_order()
     if not target_list:
         logger.error("No targets for sector %s.", sector)
-        return {"completed": 0, "candidates": candidates_found}
+        return {"completed": 0, "candidates": candidates_found, "no_targets": True}
     logger.info(
         "Sector %s: %d primary + %d known-host second pass (limit %d means best N)",
         sector, len(ranked.primary), len(ranked.second_pass), limit,
@@ -527,6 +568,7 @@ def run_hunt(
     total = len(target_list)
     hunt_start = _time.time()
     completed_count = 0
+    skipped_count = 0
     timings_csv = Path("hunter_timings.csv")
     if not timings_csv.exists():
         with open(timings_csv, "w") as f:
@@ -598,6 +640,7 @@ def run_hunt(
         tic_norm = _normalize_tic(tic_id)
 
         if _should_skip_stage(progress, tic_norm, "predict"):
+            skipped_count += 1
             continue
 
         logger.info("[%s/%s] Processing %s...", i + 1, total, tic_id)
@@ -616,8 +659,8 @@ def run_hunt(
             )
             timings["phase1"] = (_time.time() - t0) * 1000
             if time_arr is None or len(time_arr) < 50:
-                status = "ERROR: Empty or too short light curve"
-                _append_log(log_file, tic_norm, "phase1", status, error=status)
+                status = "NO_DATA (empty or too short light curve)"
+                _append_log(log_file, tic_norm, STAGE_DONE, status)
                 progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
                 continue
 
@@ -651,8 +694,8 @@ def run_hunt(
                 sde_threshold=sde_threshold,
                 use_cache=True, use_tls=use_tls, max_planets=3,
                 tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
-                ra=float(meta.get("ra", float("nan"))) if isinstance(meta, dict) else float("nan"),
-                dec=float(meta.get("dec", float("nan"))) if isinstance(meta, dict) else float("nan"),
+                ra=sky_coords(target, meta)[0],
+                dec=sky_coords(target, meta)[1],
                 known_period=known_period if known_period == known_period else None,
                 known_epoch=known_epoch if known_epoch == known_epoch else None,
                 run_triceratops=True,
@@ -687,10 +730,11 @@ def run_hunt(
                         "kind": "monotransit",
                     },
                     "hard_flags": ["n_transits"],
-                    "global_view": np.zeros(2048),
-                    "local_view": np.zeros(256),
+                    "global_view": mono.get("global_view"),
+                    "local_view": mono.get("local_view"),
                     "centroid_offset": float("nan"),
                     "kind": "monotransit",
+                    "skip_classifier": True,
                 })
             peaks_list = [
                 {"period": s["period"], "epoch": s["epoch"], "power": s["power"], "sde": s["sde"]}
@@ -715,6 +759,7 @@ def run_hunt(
                     "global_view": signal.get("global_view"),
                     "local_view": signal.get("local_view"),
                     "centroid_offset": signal.get("centroid_offset"),
+                    "skip_classifier": bool(signal.get("skip_classifier")),
                     "peaks": peaks_list, "vetting": vetting_dict,
                     "timings": timings, "tic_start": tic_start,
                 })
@@ -726,8 +771,9 @@ def run_hunt(
             logger.exception("Failed for %s", tic_id)
             total_ms = (_time.time() - tic_start) * 1000
             _append_log(log_file, tic_norm, STAGE_DONE, status,
-                        best_period=best_period, sde=sde_val)
-            progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
+                        best_period=best_period, sde=sde_val, error=str(e))
+            attempts = int(progress.get(tic_norm, {}).get("error_attempts", 0)) + 1
+            progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status, "error_attempts": attempts}
             logger.info("  -> %s [%.0f ms]", status, total_ms)
             with open(timings_csv, "a") as f:
                 f.write(f"{tic_norm},{timings['phase1']:.0f},{timings['phase2']:.0f},"
@@ -735,28 +781,30 @@ def run_hunt(
             completed_count += 1
 
     _flush_predict_queue()
-    logger.info("Hunter run complete. Processed %d stars.", completed_count)
-    return {"completed": completed_count, "candidates": candidates_found}
+    logger.info("Hunter run complete. Processed %d stars (%d already done).", completed_count, skipped_count)
+    return {"completed": completed_count, "skipped": skipped_count, "candidates": candidates_found}
 
 
 def main():
     parser = argparse.ArgumentParser(description="TESS Hunter: autonomous sector pipeline")
     parser.add_argument("--sector", type=int, default=SECTOR_TO_HUNT)
     parser.add_argument("--limit", type=int, default=TARGET_LIMIT)
-    parser.add_argument("--threshold", type=float, default=PROBABILITY_THRESHOLD)
-    parser.add_argument("--bls-threshold", type=float, default=BLS_POWER_THRESHOLD,
+    parser.add_argument("--threshold", type=float, default=None,
+                        help=f"Classifier probability cut (default {PROBABILITY_THRESHOLD} or the profile's).")
+    parser.add_argument("--bls-threshold", type=float, default=None,
                         help="Legacy raw-power gate (default 0 = disabled). Use --sde-threshold instead.")
-    parser.add_argument("--sde-threshold", type=float, default=SDE_THRESHOLD,
-                        help="Signal Detection Efficiency gate (default 7).")
+    parser.add_argument("--sde-threshold", type=float, default=None,
+                        help=f"Signal Detection Efficiency gate (default {SDE_THRESHOLD} or the profile's).")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--log-file", type=str, default=LOG_FILE)
     parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
     parser.add_argument("--tic-list", type=str, default=None)
     parser.add_argument("--infer-batch-size", type=int, default=32)
-    parser.add_argument("--period-min", type=float, default=0.5)
-    parser.add_argument("--period-max", type=float, default=15.0)
-    parser.add_argument("--nperiods", type=int, default=10000)
-    parser.add_argument("--strategy-profile", type=str, default=None)
+    parser.add_argument("--period-min", type=float, default=None)
+    parser.add_argument("--period-max", type=float, default=None)
+    parser.add_argument("--nperiods", type=int, default=None)
+    parser.add_argument("--strategy-profile", type=str, default=None,
+                        help="balanced | ultra_short_period | single_transit_long_period | low_snr_m_dwarf")
     parser.add_argument("--no-tpf", action="store_true", help="Skip TPF download (faster but disables centroid vetting)")
     parser.add_argument("--no-prefilter", action="store_true", help="Skip cheap prefilter (CDPP/mag/contam)")
     parser.add_argument("--backend", type=str, default=None,
@@ -769,14 +817,19 @@ def main():
     parser.add_argument("--no-tls", action="store_true",
                         help="Do not run TLS, even on SDE-pass peaks.")
     args = parser.parse_args()
+    from strategy_profiles import DEFAULT_PROFILE, apply_profile_to_hunt_kwargs
+
+    search = apply_profile_to_hunt_kwargs(args.strategy_profile or DEFAULT_PROFILE, {
+        "threshold": args.threshold, "bls_threshold": args.bls_threshold,
+        "sde_threshold": args.sde_threshold, "period_min": args.period_min,
+        "period_max": args.period_max, "nperiods": args.nperiods,
+    })
     return run_hunt(
-        sector=args.sector, limit=args.limit, threshold=args.threshold,
-        bls_threshold=args.bls_threshold, sde_threshold=args.sde_threshold,
+        sector=args.sector, limit=args.limit,
         checkpoint=args.checkpoint, log_file=args.log_file,
         candidate_dir=args.candidate_dir, tic_list=args.tic_list,
         infer_batch_size=args.infer_batch_size,
-        period_min=args.period_min, period_max=args.period_max,
-        nperiods=args.nperiods, strategy_profile=args.strategy_profile,
+        strategy_profile=args.strategy_profile, **search,
         with_tpf=not args.no_tpf, prefilter=not args.no_prefilter,
         backend=args.backend, adaptive_duration=not args.no_adaptive_duration,
         use_tls=not args.no_tls,

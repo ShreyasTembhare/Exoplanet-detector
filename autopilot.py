@@ -99,49 +99,43 @@ def _bootstrap_model(checkpoint: str, max_per_class: int = 250, epochs: int = 30
 # Cross-match candidates against NASA TOI list
 # ---------------------------------------------------------------------------
 
-def _load_toi_tics() -> set:
-    """Fetch known TOI TIC IDs from the NASA Exoplanet Archive."""
-    try:
-        from astroquery.nasa_exoplanet_archive import NasaExoplanetArchive
-        toi_table = NasaExoplanetArchive.query_criteria(
-            table="toi", select="tid",
-        )
-        return set(str(t) for t in toi_table["tid"] if t)
-    except Exception as e:
-        logger.warning("Could not fetch TOI list for cross-matching: %s", e)
-        return set()
+def _load_toi_tics():
+    """Known TOI ephemerides from the NASA Exoplanet Archive, keyed by TIC."""
+    from pipeline.known_planets import load_known_ephemerides
+
+    return load_known_ephemerides()
 
 
-def _cross_match_candidates(candidate_dir: str, known_tics: set):
-    """Tag each candidate JSON as KNOWN or NEW_CANDIDATE."""
-    if not known_tics:
+def _cross_match_candidates(candidate_dir: str, known, since: float = 0.0):
+    """Tag candidate JSONs written after ``since`` by orbit, not by host star.
+
+    Returns ``(known_count, new_count)`` for those files only, so a sector
+    summary does not re-count earlier sectors.
+    """
+    from pipeline.atomic import atomic_write_json
+    from pipeline.known_planets import classify_candidate
+
+    if not known:
         return 0, 0
     known_count, new_count = 0, 0
-    json_files = list(Path(candidate_dir).glob("TIC_*.json"))
-    for jf in json_files:
+    for jf in Path(candidate_dir).glob("TIC_*.json"):
         try:
+            if jf.stat().st_mtime < since:
+                continue
             with open(jf, "r") as f:
                 meta = json.load(f)
         except Exception:
             continue
-        if "discovery_status" in meta:
-            if meta["discovery_status"] == "KNOWN":
-                known_count += 1
-            else:
-                new_count += 1
-            continue
-        tic_raw = str(meta.get("tic_id", ""))
-        tic_norm = tic_raw.strip().upper()
-        if tic_norm.startswith("TIC"):
-            tic_norm = tic_norm[3:].strip()
-        if tic_norm in known_tics:
-            meta["discovery_status"] = "KNOWN"
+        status, match = classify_candidate(
+            meta.get("tic_id", ""), meta.get("best_period"), meta.get("epoch"), known,
+        )
+        meta["discovery_status"] = status
+        meta["known_match"] = match
+        if status == "KNOWN":
             known_count += 1
         else:
-            meta["discovery_status"] = "NEW_CANDIDATE"
             new_count += 1
-        with open(jf, "w") as f:
-            json.dump(meta, f, indent=2)
+        atomic_write_json(jf, meta)
     return known_count, new_count
 
 
@@ -164,6 +158,13 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
     Phase 1/2/3 cache, so resume keeps working across mode changes.
     """
     log_file = f"processed_stars_s{sector:03d}.txt"
+    if strategy_profile:
+        from strategy_profiles import apply_profile_to_hunt_kwargs
+
+        tuned = apply_profile_to_hunt_kwargs(strategy_profile)
+        period_min, period_max = tuned["period_min"], tuned["period_max"]
+        nperiods, sde_threshold = tuned["nperiods"], tuned["sde_threshold"]
+        threshold = tuned["threshold"]
     try:
         if parallel:
             from hunter import _get_ranked_queue
@@ -172,7 +173,7 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
             targets = ranked.search_order()
             if not targets:
                 logger.error("No targets for sector %d.", sector)
-                return {"completed": 0, "candidates": []}
+                return {"completed": 0, "candidates": [], "no_targets": True}
             return run_parallel_hunt(
                 sector=sector, targets=targets,
                 period_min=period_min, period_max=period_max, nperiods=nperiods,
@@ -180,7 +181,7 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
                 checkpoint=checkpoint, candidate_dir=candidate_dir,
                 log_file=log_file,
                 download_workers=download_workers, cpu_workers=cpu_workers,
-                bls_backend=bls_backend,
+                bls_backend=bls_backend, strategy_profile=strategy_profile or "",
             )
         from hunter import run_hunt
         return run_hunt(
@@ -193,7 +194,20 @@ def _run_sector(sector: int, limit: int, checkpoint: str, threshold: float,
         )
     except Exception as e:
         logger.error("Sector %d failed: %s", sector, e)
-        return {"completed": 0, "candidates": []}
+        return {"completed": 0, "candidates": [], "error": str(e)}
+
+
+MAX_SECTOR_ATTEMPTS = 3
+
+
+def sector_outcome(result: dict) -> str:
+    """``done`` when the hunt ran; ``retry`` when it crashed or did no work."""
+    if not isinstance(result, dict) or result.get("error"):
+        return "retry"
+    worked = int(result.get("completed", 0)) + int(result.get("skipped", 0))
+    if worked == 0 and not result.get("no_targets"):
+        return "retry"
+    return "done"
 
 
 # ---------------------------------------------------------------------------
@@ -218,8 +232,10 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
     print_hw_report()
 
     if not _bootstrap_model(checkpoint, max_per_class, train_epochs):
-        logger.error("Cannot proceed without a trained model. Exiting.")
-        return {"sectors_done": 0, "total_candidates": 0, "elapsed_hours": 0}
+        logger.warning(
+            "No trained model; hunting anyway. SDE-pass stars are saved as "
+            "CANDIDATE_SDE and ranked by the vetting score instead of a classifier.",
+        )
 
     logger.info("Fetching known TOI list for cross-matching...")
     known_tics = _load_toi_tics()
@@ -247,8 +263,8 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
             logger.info("Shutdown requested — stopping before sector %d.", sector)
             break
 
-        if sector in completed:
-            logger.info("Sector %d already completed — skipping.", sector)
+        if sector in completed or sector in set(state.get("failed_sectors", [])):
+            logger.info("Sector %d already completed or parked — skipping.", sector)
             continue
 
         logger.info("")
@@ -260,7 +276,7 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
         _save_state(state_file, state)
 
         sector_start = _time.time()
-        _run_sector(
+        result = _run_sector(
             sector=sector, limit=limit, checkpoint=checkpoint,
             threshold=threshold, bls_threshold=bls_threshold,
             sde_threshold=sde_threshold,
@@ -274,10 +290,26 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
         )
         sector_elapsed = _time.time() - sector_start
 
-        known_count, new_count = _cross_match_candidates(candidate_dir, known_tics)
+        known_count, new_count = _cross_match_candidates(
+            candidate_dir, known_tics, since=sector_start - 1.0,
+        )
         total_candidates += known_count + new_count
 
-        completed.add(sector)
+        attempts = state.setdefault("sector_attempts", {})
+        if sector_outcome(result) == "done":
+            completed.add(sector)
+            attempts.pop(str(sector), None)
+        else:
+            attempts[str(sector)] = int(attempts.get(str(sector), 0)) + 1
+            if attempts[str(sector)] >= MAX_SECTOR_ATTEMPTS:
+                failed = set(state.get("failed_sectors", []))
+                failed.add(sector)
+                state["failed_sectors"] = sorted(failed)
+                logger.error("Sector %d failed %d times; parking it in failed_sectors.",
+                             sector, attempts[str(sector)])
+            else:
+                logger.warning("Sector %d did not finish (%s); it will be retried.",
+                               sector, result.get("error", "no stars completed"))
         state["completed_sectors"] = sorted(completed)
         state["current_sector"] = None
         _save_state(state_file, state)
@@ -288,7 +320,7 @@ def run_autopilot(start_sector=1, end_sector=MAX_SECTOR, limit=10000,
         logger.info("")
         logger.info("--- Sector %d Summary ---", sector)
         logger.info("  Time: %.1f minutes", sector_elapsed / 60)
-        logger.info("  Candidates (cumulative): %d total (%d known TOIs, %d new)",
+        logger.info("  Candidates this sector: %d (%d match known planets, %d new)",
                      known_count + new_count, known_count, new_count)
         if new_count > 0:
             logger.info("  *** %d NEW CANDIDATE(s) not in TOI list! Check candidates/ ***", new_count)

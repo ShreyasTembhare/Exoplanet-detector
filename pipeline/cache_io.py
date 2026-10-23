@@ -28,8 +28,25 @@ def _phase1_key(tic_id: str, sector: str) -> str:
     return _safe_key(f"{tic_id}_{sector}_phase1")
 
 
-def _phase2_key(tic_id: str, sector: str, period_min: float, period_max: float, nperiods: int) -> str:
-    return _safe_key(f"{tic_id}_{sector}_{period_min}_{period_max}_{nperiods}_phase2")
+def _phase2_key(
+    tic_id: str, sector: str, period_min: float, period_max: float, nperiods: int,
+    variant: str = "",
+) -> str:
+    base = f"{tic_id}_{sector}_{period_min}_{period_max}_{nperiods}"
+    if variant:
+        base += "_" + hashlib.md5(variant.encode()).hexdigest()[:12]
+    return _safe_key(f"{base}_phase2")
+
+
+def phase2_variant(**params: Any) -> str:
+    """Stable string over every setting that changes the periodogram."""
+    parts = []
+    for name in sorted(params):
+        value = params[name]
+        if isinstance(value, float):
+            value = f"{value:.6g}"
+        parts.append(f"{name}={value}")
+    return ";".join(parts)
 
 
 def _phase3_key(tic_id: str, sector: str, best_period: float) -> str:
@@ -150,13 +167,14 @@ def has_phase1(tic_id: str, sector: str) -> bool:
 
 def get_phase2(
     tic_id: str, sector: str, period_min: float, period_max: float, nperiods: int,
+    variant: str = "",
 ):
     """
     Returns ``(periods, power, best_period, epoch, peaks)`` where peaks is a
     list of :class:`pipeline.bls_gpu.BLSPeak`. Older cache entries without
     peaks return an empty list.
     """
-    key = _phase2_key(tic_id, sector, period_min, period_max, nperiods)
+    key = _phase2_key(tic_id, sector, period_min, period_max, nperiods, variant)
     path = CACHE_ROOT / "phase2" / f"{key}.npz"
     data = _read_npz(path)
     if data is None:
@@ -189,8 +207,9 @@ def set_phase2(
     tic_id: str, sector: str, period_min: float, period_max: float, nperiods: int,
     periods: np.ndarray, power: np.ndarray, best_period: float, epoch: float,
     peaks: Optional[list] = None,
+    variant: str = "",
 ) -> None:
-    key = _phase2_key(tic_id, sector, period_min, period_max, nperiods)
+    key = _phase2_key(tic_id, sector, period_min, period_max, nperiods, variant)
     path = CACHE_ROOT / "phase2" / f"{key}.npz"
     peaks_serial = []
     if peaks:

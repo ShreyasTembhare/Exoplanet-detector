@@ -243,18 +243,37 @@ def _bls_power_astropy(
     duration_phase: float = 0.05,
     n_phase_steps: int = 20,
 ) -> Tuple[np.ndarray, np.ndarray, float, float]:
-    """Astropy BoxLeastSquares — used as oracle in tests and CPU fallback."""
+    """Astropy BoxLeastSquares — used as oracle in tests and CPU fallback.
+
+    ``duration_phase`` is a fraction of the period, but Astropy takes absolute
+    durations. The grid is split into log-period bins no wider than 25% so the
+    box stays close to ``duration_phase * P`` across a wide period range.
+    """
     from astropy.timeseries import BoxLeastSquares
 
+    periods = np.asarray(periods, dtype=np.float64)
     bls = BoxLeastSquares(time, flux)
-    durations = np.array([duration_phase * float(np.median(periods))])
-    res = bls.power(periods, durations)
-    power = np.asarray(res.power, dtype=np.float64)
+    power = np.zeros(len(periods), dtype=np.float64)
+    transit_time = np.zeros(len(periods), dtype=np.float64)
+    if len(periods) == 0:
+        return periods, power, float("nan"), float("nan")
+    order = np.argsort(periods)
+    log_span = float(np.log(periods[order[-1]] / max(periods[order[0]], 1e-8)))
+    n_bins = max(1, int(np.ceil(log_span / np.log(1.25))))
+    for chunk in np.array_split(order, n_bins):
+        if len(chunk) == 0:
+            continue
+        p_chunk = periods[chunk]
+        duration = float(duration_phase) * float(np.median(p_chunk))
+        duration = min(duration, 0.99 * float(np.min(p_chunk)))
+        res = bls.power(p_chunk, np.array([duration]))
+        power[chunk] = np.asarray(res.power, dtype=np.float64)
+        transit_time[chunk] = np.asarray(res.transit_time, dtype=np.float64)
     # Clamp negative power (Astropy returns SR statistic that can be negative).
     power = np.maximum(power, 0.0)
     best_idx = int(np.argmax(power))
     best_period = float(periods[best_idx])
-    epoch = float(res.transit_time[best_idx])
+    epoch = float(transit_time[best_idx])
     return periods, power, best_period, epoch
 
 
