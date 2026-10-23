@@ -190,34 +190,44 @@ def _fetch_sector_records(sector: int, cap: int):
     try:
         from astroquery.mast import Observations
         logger.info("Querying MAST for sector %d timeseries observations...", sector)
-        obs = Observations.query_criteria(
-            obs_collection="TESS",
-            sequence_number=sector,
-            dataproduct_type="timeseries",
-        )
-        if obs is not None and len(obs) > 0:
-            rows = []
-            take = min(len(obs), cap)
-            for i in range(take):
+        # 2-min SPOC targets first, then FFI high-level science products
+        # (TESS-SPOC, QLP), which cover far more stars per sector.
+        sources = [
+            {"obs_collection": "TESS"},
+            {"obs_collection": "HLSP", "provenance_name": ["TESS-SPOC", "QLP"]},
+        ]
+        if os.environ.get("HUNT_SKIP_FFI") == "1":
+            sources = sources[:1]
+        unique_rows = []
+        seen = set()
+        for source in sources:
+            if len(unique_rows) >= cap:
+                break
+            try:
+                obs = Observations.query_criteria(
+                    sequence_number=sector, dataproduct_type="timeseries", **source,
+                )
+            except Exception as exc:
+                logger.info("MAST %s query failed: %s", source["obs_collection"], exc)
+                continue
+            if obs is None or len(obs) == 0:
+                continue
+            for i in range(len(obs)):
+                if len(unique_rows) >= cap:
+                    break
                 row = {name: obs[name][i] for name in obs.colnames}
                 name = row.get("target_name", row.get(obs.colnames[0]))
                 tic = _normalize_tic(str(name))
-                if not tic or not tic.isdigit():
+                if not tic or not tic.isdigit() or tic in seen:
                     continue
-                rows.append({
+                seen.add(tic)
+                unique_rows.append({
                     "tic_id": tic,
                     "ra": row.get("s_ra", float("nan")),
                     "dec": row.get("s_dec", float("nan")),
                     "tmag": row.get("t_mag", row.get("tess_mag", float("nan"))),
                 })
-            # Unique, preserving pull order for ties.
-            seen = set()
-            unique_rows = []
-            for row in rows:
-                if row["tic_id"] in seen:
-                    continue
-                seen.add(row["tic_id"])
-                unique_rows.append(row)
+        if unique_rows:
             logger.info("MAST returned %d numeric TICs for sector %d", len(unique_rows), sector)
             return records_from_rows(unique_rows)
     except Exception as e:
