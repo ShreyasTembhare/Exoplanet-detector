@@ -42,15 +42,24 @@ Hardware is auto-detected: CUDA (NVIDIA) > MPS (Apple Silicon) > CPU.
 
 ### Classifier checkpoint (optional)
 
-Without `models/checkpoints/resnet1d.pt`, SDE-pass stars are kept as candidates. To train from catalog ephemerides after a Zenodo / MAST fetch:
+Without `models/checkpoints/resnet1d.pt`, SDE-pass stars are kept as candidates. To train:
 
 ```bash
-python train_triage_v2.py --help
+# Triage-v2 labels (3 MB table from Zenodo 7411579) + our own Phase 1 light
+# curves, folded at BLS-recovered ephemerides, plus injected positives on quiet stars
+python train_triage_v2.py --fetch --limit 2000 --injections 500 --epochs 30
 python train_triage_v2.py --fixture-train   # proves the path offline
-python train_triage_v2.py --manifest data/triage_v2/manifest.csv --epochs 30
+
+# Second-stage ExoMiner vetter on the same manifest
+python -m pipeline.second_stage --data data/triage_v2/manifest.csv
+
+# Active learning: fine-tune on the planet / false-positive buttons from the desk
+python train_classifier.py --labels var/desk
 ```
 
-Do not invent a science checkpoint from Gaussian noise — the trainer refuses that path.
+Validation holds out the latest ~20% of sectors whole, and each checkpoint stores a temperature fitted on them, so probabilities are calibrated. When `models/checkpoints/exominer.pt` exists, it re-scores candidates, and the two probabilities are combined. Do not invent a science checkpoint from Gaussian noise: the trainer refuses that path.
+
+Completeness maps (injection-recovery over period × radius × Tmag) are refreshed daily by the worker, shown on the Throughput page, and used by the yield planner. To build one by hand, run `python -m pipeline.completeness --out var/desk/completeness.json`.
 
 ## Run online and always resume
 
