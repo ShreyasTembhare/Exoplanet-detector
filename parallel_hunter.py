@@ -95,7 +95,7 @@ def _phase1_worker(tic_id: str, sector: int, with_tpf: bool) -> Optional[dict]:
 def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: int,
                    sde_threshold: float, prefilter_on: bool, backend: Optional[str],
                    adaptive_duration: bool, use_tls: bool = True,
-                   run_triceratops: bool = False) -> Optional[dict]:
+                   run_triceratops: bool = False, known_table: Optional[dict] = None) -> Optional[dict]:
     """Prefilter, cached BLS, vet SDE-pass peaks, mask-and-research, monotransit MES.
 
     The phase-2 cache is consulted first so a second pass over the same
@@ -137,6 +137,7 @@ def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: i
             known_period=known_period,
             known_epoch=known_epoch,
             run_triceratops=run_triceratops,
+            known_table=known_table,
         )
         item["phase2_ms"] = (_time.time() - t0) * 1000
         item["bls"] = found.get("bls")
@@ -194,6 +195,7 @@ def run_parallel_hunt(
     strategy_profile: str = "",
     resume: bool = True,
     run_triceratops: bool = False,
+    shortlist_n: int = 5,
 ) -> Dict[str, Any]:
     """Run a sector hunt with the producer-consumer pipeline above.
 
@@ -229,6 +231,9 @@ def run_parallel_hunt(
             logger.info("Resume: %d of %d stars already done in %s", skipped, len(targets), log_file)
         targets = pending
 
+    from pipeline.known_planets import load_known_ephemerides
+
+    known_table = load_known_ephemerides()
     model, device = _load_model(checkpoint) if checkpoint else (None, None)
     if model is None:
         logger.warning(
@@ -303,7 +308,7 @@ def run_parallel_hunt(
             item = _phase2_worker(
                 item, period_min, period_max, nperiods,
                 sde_threshold, prefilter, bls_backend, adaptive_duration, use_tls,
-                run_triceratops,
+                run_triceratops, known_table,
             )
             if "status" in item:
                 _drain_failed(item, log_file, timings_path)
@@ -461,6 +466,14 @@ def run_parallel_hunt(
         t.start()
     for t in threads:
         t.join()
+
+    if shortlist_n and not run_triceratops:
+        try:
+            from pipeline.shortlist import validate_shortlist
+
+            validate_shortlist(candidate_dir, n=shortlist_n)
+        except Exception as exc:
+            logger.warning("Shortlist validation skipped: %s", exc)
 
     elapsed = _time.time() - hunt_start
     rate = completed / max(elapsed / 3600.0, 1e-6)

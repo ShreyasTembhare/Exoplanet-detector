@@ -121,13 +121,30 @@ def _peak_dict(peak, vetting: dict, extras: dict) -> dict:
     }
 
 
+def known_context(tic_id, period, epoch, known_table: Optional[dict]) -> dict:
+    """Discovery status of one orbit against the TOI / known-planet table."""
+    from .known_planets import classify_candidate
+
+    if not known_table:
+        return {}
+    status, match = classify_candidate(tic_id, period, epoch, known_table)
+    out = {"discovery_status": status, "matches_toi": status == "KNOWN"}
+    if match is not None:
+        out["known_match"] = match
+        out["matched_toi_id"] = match.get("toi", "")
+    return out
+
+
 def _vet_peak(
     time, flux, peak, *,
     tic_id, sector, tpf_time, tpf_flux_cube, ra, dec, bls_result: BLSResult,
     run_triceratops: bool,
+    use_gaia: bool = True,
+    known_table: Optional[dict] = None,
 ) -> dict:
     from .difference_image import difference_image_score
     from .fold_features import run_phase3
+    from .hard_flags import demotion
 
     global_view, local_view, centroid, phase3_extras = run_phase3(
         time, flux, peak.period, peak.epoch,
@@ -135,12 +152,18 @@ def _vet_peak(
         bls_sde=peak.sde, bls_periods=bls_result.periods, bls_power=bls_result.power,
         tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
         ra=ra, dec=dec,
-        skip_gaia=False,
+        skip_gaia=True,
     )
     vetting = {}
     if isinstance(phase3_extras, dict):
         vetting = dict(phase3_extras.get("vetting") or {})
     vetting.setdefault("transit_center_btjd", float(peak.epoch))
+    if use_gaia:
+        from .gaia_contamination import gaia_contamination
+
+        depth = vetting.get("depth")
+        vetting.update(gaia_contamination(ra, dec, depth=depth if isinstance(depth, (int, float)) else None))
+    vetting.update(known_context(tic_id, peak.period, peak.epoch, known_table))
     half = float(getattr(peak, "duration_phase", 0.05) or 0.05) / 2.0
     diff = {}
     if tpf_time is not None and tpf_flux_cube is not None:
@@ -160,6 +183,7 @@ def _vet_peak(
         )
         vetting["fpp"] = triceratops.get("fpp")
         vetting["nfpp"] = triceratops.get("nfpp")
+    vetting["demotion"] = demotion(vetting)
     return _peak_dict(peak, vetting, {
         "global_view": global_view,
         "local_view": local_view,
@@ -247,13 +271,18 @@ def search_with_masking(
     dec: float = float("nan"),
     known_period: Optional[float] = None,
     known_epoch: Optional[float] = None,
-    run_triceratops: bool = True,
+    run_triceratops: bool = False,
     run_monotransit: bool = True,
     two_pass: bool = True,
     coarse_nperiods: int = 2000,
     refine_nperiods: int = 3000,
+    use_gaia: bool = True,
+    known_table: Optional[dict] = None,
 ) -> dict:
     """BLS, vet every SDE-pass peak, mask accepted transits, then MES.
+
+    TRICERATOPS is off by default: it takes minutes per peak, so it runs on
+    the top-scored shortlist afterwards (:mod:`pipeline.shortlist`).
 
     Returns ``signals`` (periodic, possibly several), ``monotransit`` or
     None, and the first :class:`BLSResult` (``bls``).
@@ -298,6 +327,7 @@ def search_with_masking(
                 tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
                 ra=ra, dec=dec, bls_result=res,
                 run_triceratops=run_triceratops,
+                use_gaia=use_gaia, known_table=known_table,
             )
             signals.append(signal)
             if accepted is None and accepts_for_reseach(signal["vetting"], peak.sde, sde_threshold):

@@ -402,9 +402,13 @@ def _save_candidate_evidence(
     epoch: float = None,
 ):
     safe_tic = str(tic_id).replace(" ", "_").replace("/", "_")
+    from pipeline.hard_flags import demotion
+
     vetting = dict(vetting or {})
     if epoch is not None and epoch == epoch:
         vetting.setdefault("transit_center_btjd", float(epoch))
+    if not isinstance(vetting.get("demotion"), dict):
+        vetting["demotion"] = demotion(vetting)
     meta = {
         "tic_id": tic_id,
         "best_period": best_period,
@@ -427,6 +431,10 @@ def _save_candidate_evidence(
         prob_planet, bls_power, centroid_offset, profile, vetting=vetting, sde=sde,
     )
     meta["demotion"] = vetting.get("demotion")
+    if vetting.get("discovery_status"):
+        meta["discovery_status"] = vetting["discovery_status"]
+        if vetting.get("known_match"):
+            meta["known_match"] = vetting["known_match"]
     from pipeline.atomic import atomic_write_json
 
     period_tag = best_period if best_period == best_period else 0.0
@@ -543,9 +551,13 @@ def run_hunt(
     checkpoint=DEFAULT_CHECKPOINT, log_file=LOG_FILE, candidate_dir=CANDIDATE_DIR,
     tic_list=None, infer_batch_size=32, period_min=0.5, period_max=15.0,
     nperiods=10000, strategy_profile=None, with_tpf=True, prefilter=True,
-    backend=None, adaptive_duration=True, use_tls=True,
+    backend=None, adaptive_duration=True, use_tls=True, shortlist_n=5,
 ):
-    """Core hunt logic, callable without CLI arg parsing."""
+    """Core hunt logic, callable without CLI arg parsing.
+
+    ``shortlist_n`` best new candidates get a TRICERATOPS fit at the end
+    (when the package is installed) instead of every peak during the search.
+    """
     candidates_found = []
     _ensure_setup(log_file, candidate_dir)
     progress = _load_progress(log_file)
@@ -561,6 +573,9 @@ def run_hunt(
         sector, len(ranked.primary), len(ranked.second_pass), limit,
     )
 
+    from pipeline.known_planets import load_known_ephemerides
+
+    known_table = load_known_ephemerides()
     model, device = _load_model(checkpoint)
     if model is None:
         logger.warning(
@@ -708,7 +723,8 @@ def run_hunt(
                 dec=sky_coords(target, meta)[1],
                 known_period=known_period if known_period == known_period else None,
                 known_epoch=known_epoch if known_epoch == known_epoch else None,
-                run_triceratops=True,
+                run_triceratops=False,
+                known_table=known_table,
             )
             timings["phase2"] = (_time.time() - t0) * 1000
             res = found.get("bls")
@@ -791,6 +807,13 @@ def run_hunt(
             completed_count += 1
 
     _flush_predict_queue()
+    if shortlist_n:
+        try:
+            from pipeline.shortlist import validate_shortlist
+
+            validate_shortlist(candidate_dir, n=shortlist_n)
+        except Exception as exc:
+            logger.warning("Shortlist validation skipped: %s", exc)
     logger.info("Hunter run complete. Processed %d stars (%d already done).", completed_count, skipped_count)
     return {"completed": completed_count, "skipped": skipped_count, "candidates": candidates_found}
 
