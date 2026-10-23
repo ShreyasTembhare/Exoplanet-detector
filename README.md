@@ -82,9 +82,10 @@ python -m tool.checkpoint push --data var/desk   # back up by hand
 ## Architecture
 
 ```
-[MAST / lightkurve] -> Phase 1: download + quality_bitmask + same-author stitch + cadence-aware Savitzky-Golay flatten + 3-sigma clip + TPF cache
+[MAST / lightkurve] -> Phase 1: download + quality_bitmask + widest-coverage author stitch + biweight flatten + upper-only clip + TPF cache
                     -> Prefilter: CDPP, Tmag, contamination, sector count
-                    -> Phase 2: GPU BLS (JAX-jit / cuvarbase / Astropy / NumPy backends), top-k peaks with NMS, SDE > 7 gate
+                    -> Phase 2: GPU BLS on an Ofir f^(1/3) grid (JAX-jit / cuvarbase / Astropy / NumPy), top-k peaks with NMS, SDE > 7 gate,
+                                masked re-detrend per peak, monotransit + duotransit alias search
                     -> Phase 5: optional TLS refinement on BLS top peaks
                     -> Phase 3: fold (global 2048 + local 256 + local-centered 128 + periodogram 1024) + centroid + difference image + vetting metrics (SDE, depth, duration, n_transits, odd/even, secondary, V/U, Gaia neighbors, TOI ephemeris match)
                     -> Phase 4 model: TwoTowerResNet1D (1.07M params) -> binary planet/FP

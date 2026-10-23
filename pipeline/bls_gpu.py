@@ -103,6 +103,8 @@ def _bls_power_numpy(
     power_grid = np.zeros((n_periods, n_phase_steps), dtype=np.float64)
     flux = np.asarray(flux, dtype=np.float64)
     time = np.asarray(time, dtype=np.float64)
+    t0 = float(np.nanmin(time))
+    time = time - t0
     n_total = len(flux)
 
     for i, period in enumerate(periods):
@@ -129,7 +131,6 @@ def _bls_power_numpy(
     best_period = float(periods[best_idx])
     best_phase_idx = int(np.argmax(power_grid[best_idx]))
     best_phase = best_phase_idx / n_phase_steps
-    t0 = float(np.nanmin(time))
     epoch = t0 + best_phase * best_period
     return periods, power, best_period, float(epoch)
 
@@ -208,7 +209,9 @@ def _bls_power_jax(
         kernel = _build_jax_kernel(n_phase_steps, duration_phase)
         _JAX_KERNEL_CACHE[key] = kernel
 
-    time_j = jnp.asarray(time, dtype=jnp.float32)
+    # float32 cannot resolve minutes at BTJD ~3000, so phase from a local origin.
+    t0 = float(np.nanmin(time))
+    time_j = jnp.asarray(np.asarray(time, dtype=np.float64) - t0, dtype=jnp.float32)
     flux_j = jnp.asarray(flux, dtype=jnp.float32)
 
     powers = []
@@ -226,9 +229,124 @@ def _bls_power_jax(
     best_idx = int(np.argmax(power))
     best_period = float(periods[best_idx])
     best_phase = float(best_phi_per_period[best_idx])
-    t0 = float(np.nanmin(time))
     epoch = t0 + best_phase * best_period
     return periods, power, best_period, float(epoch)
+
+
+# ---------------------------------------------------------------------------
+# Multi-star batching: many short light curves share one compiled kernel
+# ---------------------------------------------------------------------------
+
+
+def _build_jax_batch_kernel(n_phase_steps: int, duration_phase: float):
+    if not JAX_AVAILABLE:  # pragma: no cover
+        return None
+
+    phase_offsets = jnp.linspace(
+        0.0, 1.0 - 1.0 / n_phase_steps, n_phase_steps, dtype=jnp.float32
+    )
+
+    def power_one(period, phi, time, flux, weight):
+        phase = (time % period) / period
+        high = phi + duration_phase
+        in_no_wrap = (phase >= phi) & (phase < high)
+        in_wrap = (phase >= phi) | (phase < high - 1.0)
+        in_transit = jnp.where(high > 1.0, in_wrap, in_no_wrap)
+        w_in = jnp.where(in_transit, weight, 0.0)
+        w_out = weight - w_in
+        n_in = jnp.sum(w_in)
+        n_out = jnp.sum(w_out)
+        y_in = jnp.sum(w_in * flux) / (n_in + 1e-6)
+        y_out = jnp.sum(w_out * flux) / (n_out + 1e-6)
+        depth = jnp.maximum(y_out - y_in, 0.0)
+        ok = (n_in >= 2) & (n_out >= 2)
+        return jnp.where(ok, depth ** 2 * n_in * n_out / (n_in + n_out + 1e-6), 0.0)
+
+    def power_one_period(period, time, flux, weight):
+        ps = jax.vmap(lambda phi: power_one(period, phi, time, flux, weight))(phase_offsets)
+        i = jnp.argmax(ps)
+        return ps[i], phase_offsets[i]
+
+    @jit
+    def power_batch(periods_chunk, times, fluxes, weights):
+        per_star = lambda t, f, w: jax.vmap(  # noqa: E731
+            lambda P: power_one_period(P, t, f, w)
+        )(periods_chunk)
+        return jax.vmap(per_star)(times, fluxes, weights)
+
+    return power_batch
+
+
+_JAX_BATCH_CACHE: dict = {}
+
+
+def bls_power_batch(
+    curves,
+    periods: np.ndarray,
+    duration_phase: float = 0.05,
+    n_phase_steps: int = 20,
+    chunk_size: int = 256,
+    backend: Optional[str] = None,
+) -> list:
+    """BLS power for many (time, flux) light curves on one shared period grid.
+
+    Curves are zero-padded to a common length with a weight mask so a single
+    compiled JAX kernel evaluates the whole batch per period chunk; this keeps
+    a GPU saturated on short (single-sector) targets that are individually too
+    small to fill it. Without JAX each curve runs through the NumPy reference.
+
+    Returns a list of dicts ``{power, best_period, epoch, sde}`` in input order.
+    """
+    periods = np.asarray(periods, dtype=np.float64)
+    use_jax = JAX_AVAILABLE and backend in (None, "jax")
+    out = []
+    if not curves:
+        return out
+    if not use_jax:
+        for time, flux in curves:
+            _, power, best_p, epoch = _bls_power_numpy(
+                time, flux, periods, duration_phase, n_phase_steps
+            )
+            out.append({"power": power, "best_period": best_p, "epoch": epoch,
+                        "sde": float(np.max(compute_sde(power)))})
+        return out
+
+    key = (n_phase_steps, float(duration_phase))
+    kernel = _JAX_BATCH_CACHE.get(key)
+    if kernel is None:
+        kernel = _build_jax_batch_kernel(n_phase_steps, duration_phase)
+        _JAX_BATCH_CACHE[key] = kernel
+
+    n_max = max(len(t) for t, _ in curves)
+    times = np.zeros((len(curves), n_max), dtype=np.float32)
+    fluxes = np.zeros_like(times)
+    weights = np.zeros_like(times)
+    origins = []
+    for k, (t, f) in enumerate(curves):
+        t = np.asarray(t, dtype=np.float64)
+        t0 = float(np.nanmin(t))
+        origins.append(t0)
+        times[k, : len(t)] = t - t0
+        fluxes[k, : len(t)] = np.asarray(f, dtype=np.float64) - np.nanmedian(f)
+        weights[k, : len(t)] = 1.0
+
+    tj, fj, wj = jnp.asarray(times), jnp.asarray(fluxes), jnp.asarray(weights)
+    powers, phis = [], []
+    for start in range(0, len(periods), chunk_size):
+        chunk = jnp.asarray(periods[start:start + chunk_size], dtype=jnp.float32)
+        p, phi = kernel(chunk, tj, fj, wj)
+        powers.append(np.asarray(p))
+        phis.append(np.asarray(phi))
+    power_all = np.concatenate(powers, axis=1).astype(np.float64)
+    phi_all = np.concatenate(phis, axis=1).astype(np.float64)
+    for k in range(len(curves)):
+        power = power_all[k]
+        i = int(np.argmax(power))
+        best_p = float(periods[i])
+        out.append({"power": power, "best_period": best_p,
+                    "epoch": origins[k] + phi_all[k, i] * best_p,
+                    "sde": float(np.max(compute_sde(power)))})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +672,9 @@ def _refine_period(
     return grid, power, used
 
 
+MAX_OFIR_PERIODS = 20000
+
+
 def compute_bls_periodogram(
     time: np.ndarray,
     flux: np.ndarray,
@@ -570,9 +691,13 @@ def compute_bls_periodogram(
     topk: int = 5,
     rho_star_solar: Optional[float] = None,
     n_durations: int = 4,
+    grid: str = "ofir",
 ) -> BLSResult:
     """
     Compute BLS periodogram and return a :class:`BLSResult` with top-k peaks.
+
+    ``grid="ofir"`` spaces the (coarse) trial periods uniformly in
+    ``f**(1/3)`` (Ofir 2014); ``"log"`` is the old log-uniform grid.
 
     The previous signature returned a 4-tuple ``(periods, power, best_period, epoch)``;
     callers that still need that should use :func:`compute_bls_legacy`.
@@ -619,8 +744,23 @@ def compute_bls_periodogram(
             sde=float(np.max(sde)) if len(sde) else 0.0, peaks=peaks,
         )
 
+    from .period_grid import make_grid, ofir_count
+
+    span = float(np.nanmax(time) - np.nanmin(time)) if len(time) > 1 else 27.0
+    optimal = ofir_count(span, period_min, period_max, rho)
+
+    def _grid(n: int) -> np.ndarray:
+        # The f^(1/3) grid is only better than log spacing once it has its
+        # full budget; an undersampled one starves long periods. Grow to the
+        # optimal count up to MAX_OFIR_PERIODS, otherwise keep log spacing.
+        if grid == "ofir":
+            if optimal <= max(int(n), MAX_OFIR_PERIODS):
+                return make_grid("ofir", period_min, period_max, max(int(n), optimal))
+            logger.info("Ofir grid needs %d periods (> %d); using log spacing", optimal, MAX_OFIR_PERIODS)
+        return make_grid("log", period_min, period_max, n)
+
     if not two_pass:
-        periods = np.exp(np.linspace(np.log(period_min), np.log(period_max), nperiods))
+        periods = _grid(nperiods)
         power, used = _power_on_grid(
             bls_fn, ds_time, ds_flux, periods, duration_phase, rho, n_durations,
         )
@@ -628,7 +768,7 @@ def compute_bls_periodogram(
 
     # Pass A: coarse log-spaced grid.
     t0 = _time.time()
-    coarse_periods = np.exp(np.linspace(np.log(period_min), np.log(period_max), coarse_nperiods))
+    coarse_periods = _grid(coarse_nperiods)
     coarse_power, coarse_used = _power_on_grid(
         bls_fn, ds_time, ds_flux, coarse_periods, duration_phase, rho, n_durations,
     )
@@ -636,7 +776,7 @@ def compute_bls_periodogram(
     coarse_best = float(coarse_periods[int(np.argmax(coarse_power))])
     logger.info(
         "  Coarse pass: %d periods in %.0f ms -> peak=%.4f d (SDE=%.2f)",
-        coarse_nperiods, (_time.time() - t0) * 1000, coarse_best, float(np.max(coarse_sde)),
+        len(coarse_periods), (_time.time() - t0) * 1000, coarse_best, float(np.max(coarse_sde)),
     )
 
     coarse_peaks = _select_topk_peaks(coarse_periods, coarse_power, coarse_sde, k=topk)

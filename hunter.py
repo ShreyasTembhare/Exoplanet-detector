@@ -309,7 +309,7 @@ def _get_ranked_queue(
     period_min: float = 0.5, period_max: float = 15.0,
 ):
     """Best-N primary targets, then a masked second pass for known CP/KP hosts."""
-    from pipeline.target_rank import rank_targets
+    from pipeline.target_rank import default_objective, rank_targets
     from pipeline.tic_enrich import enrich_records
 
     if tic_list_path and os.path.exists(tic_list_path):
@@ -326,6 +326,7 @@ def _get_ranked_queue(
     enrich_records(records)
     return rank_targets(
         records, limit=limit, period_min=period_min, period_max=period_max,
+        objective=default_objective(),
     )
 
 
@@ -743,6 +744,7 @@ def run_hunt(
                 known_epoch=known_epoch if known_epoch == known_epoch else None,
                 run_triceratops=False,
                 known_table=known_table,
+                trend=(meta or {}).get("trend"),
             )
             timings["phase2"] = (_time.time() - t0) * 1000
             res = found.get("bls")
@@ -768,16 +770,18 @@ def run_hunt(
                     "vetting": {
                         "depth": mono["depth"],
                         "duration_hours": mono["duration_days"] * 24.0,
-                        "n_transits": 1,
+                        "n_transits": len(mono.get("epochs") or [mono["epoch"]]),
                         "transit_center_btjd": mono["epoch"],
                         "mes": mono["mes"],
-                        "kind": "monotransit",
+                        "kind": mono.get("kind", "monotransit"),
+                        "epochs": mono.get("epochs"),
+                        "aliases": mono.get("aliases"),
                     },
-                    "hard_flags": ["n_transits"],
+                    "hard_flags": [] if mono.get("kind") == "duotransit" else ["n_transits"],
                     "global_view": mono.get("global_view"),
                     "local_view": mono.get("local_view"),
                     "centroid_offset": float("nan"),
-                    "kind": "monotransit",
+                    "kind": mono.get("kind", "monotransit"),
                     "skip_classifier": True,
                 })
             peaks_list = [

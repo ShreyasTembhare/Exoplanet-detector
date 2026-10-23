@@ -312,7 +312,7 @@ class Desk:
         }
 
     def rank(self, rows: list, *, limit: int, period_min: float, period_max: float) -> dict:
-        from pipeline.target_rank import rank_targets, records_from_rows
+        from pipeline.target_rank import default_objective, rank_targets, records_from_rows
         from pipeline.tic_enrich import enrich_records
 
         cache = self.root / "tic_enrich.json"
@@ -334,6 +334,7 @@ class Desk:
             provided[id(record)] = flags
         ranked = rank_targets(
             records, limit=int(limit), period_min=period_min, period_max=period_max,
+            objective=default_objective(),
         )
         payload = {
             "limit": int(limit),

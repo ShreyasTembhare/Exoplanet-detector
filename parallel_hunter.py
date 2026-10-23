@@ -138,6 +138,7 @@ def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: i
             known_epoch=known_epoch,
             run_triceratops=run_triceratops,
             known_table=known_table,
+            trend=meta.get("trend"),
         )
         item["phase2_ms"] = (_time.time() - t0) * 1000
         item["bls"] = found.get("bls")
@@ -163,6 +164,40 @@ def _phase3_worker(item: dict) -> Optional[dict]:
         return item
     item["phase3_ms"] = item.get("phase3_ms", 0.0)
     return item
+
+
+def triage_keep(items: List[dict], period_min: float, period_max: float,
+                min_sde: float, n_periods: int = 2000, max_points: int = 4000) -> List[bool]:
+    """Coarse batched BLS over many stars; True for stars worth a full search.
+
+    Curves are binned to ``max_points`` so padding stays small; a failure in
+    the batch keeps every star rather than silently dropping them.
+    """
+    import numpy as np
+
+    from pipeline.bls_gpu import bls_power_batch
+    from pipeline.period_grid import log_periods
+
+    if not items:
+        return []
+    curves = []
+    for item in items:
+        t = np.asarray(item["time"], dtype=np.float64)
+        f = np.asarray(item["flux"], dtype=np.float64)
+        ok = np.isfinite(t) & np.isfinite(f)
+        t, f = t[ok], f[ok]
+        if len(t) > max_points:
+            step = int(np.ceil(len(t) / max_points))
+            n = (len(t) // step) * step
+            t = t[:n].reshape(-1, step).mean(axis=1)
+            f = f[:n].reshape(-1, step).mean(axis=1)
+        curves.append((t, f))
+    try:
+        results = bls_power_batch(curves, log_periods(period_min, period_max, n_periods))
+    except Exception as exc:
+        logger.warning("triage batch failed, keeping all %d stars: %s", len(items), exc)
+        return [True] * len(items)
+    return [r["sde"] >= min_sde for r in results]
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +231,15 @@ def run_parallel_hunt(
     resume: bool = True,
     run_triceratops: bool = False,
     shortlist_n: int = 5,
+    triage_sde: float = 0.0,
+    triage_batch: int = 64,
 ) -> Dict[str, Any]:
     """Run a sector hunt with the producer-consumer pipeline above.
+
+    ``triage_sde > 0`` enables a batched coarse BLS pass (one compiled kernel
+    over ``triage_batch`` stars) that drops stars whose best coarse SDE is
+    below the threshold before the full search. It trades sensitivity to
+    single transits for throughput, so it is off by default.
 
     With ``resume`` (default) stars already finished in ``log_file`` are
     skipped and errored stars are retried up to ``MAX_ERROR_ATTEMPTS`` times.
@@ -271,7 +313,23 @@ def run_parallel_hunt(
             )
         item["ra"], item["dec"] = sky_coords(target, item.get("meta"))
         item["tic_start"] = _time.time()
-        q_phase2.put(item)
+        if triage_sde > 0:
+            triage_buffer.append(item)
+            if len(triage_buffer) >= triage_batch:
+                _flush_triage()
+        else:
+            q_phase2.put(item)
+
+    triage_buffer: List[dict] = []
+
+    def _flush_triage():
+        batch = list(triage_buffer)
+        triage_buffer.clear()
+        for item, keep in zip(batch, triage_keep(batch, period_min, period_max, triage_sde)):
+            if keep:
+                q_phase2.put(item)
+            else:
+                _append_log(log_file, item["tic_id"], STAGE_DONE, "TRIAGED: coarse SDE below threshold")
 
     def producer():
         # Bounded in-flight downloads: submitting the whole sector at once
@@ -285,6 +343,8 @@ def run_parallel_hunt(
                     _handle_download(*inflight.popleft())
             while inflight:
                 _handle_download(*inflight.popleft())
+        if triage_buffer:
+            _flush_triage()
         q_phase2.put(SENTINEL)
 
     # --- Stage 2: BLS. One worker owns the GPU; CPU backends get several. ---
@@ -365,13 +425,15 @@ def run_parallel_hunt(
                 "vetting": {
                     "depth": mono["depth"],
                     "duration_hours": mono["duration_days"] * 24.0,
-                    "n_transits": 1,
+                    "n_transits": len(mono.get("epochs") or [mono["epoch"]]),
                     "transit_center_btjd": mono["epoch"],
                     "mes": mono["mes"],
-                    "kind": "monotransit",
+                    "kind": mono.get("kind", "monotransit"),
+                    "epochs": mono.get("epochs"),
+                    "aliases": mono.get("aliases"),
                 },
-                "hard_flags": ["n_transits"],
-                "kind": "monotransit",
+                "hard_flags": [] if mono.get("kind") == "duotransit" else ["n_transits"],
+                "kind": mono.get("kind", "monotransit"),
             })
         rows = []
         for sig in signals:

@@ -141,10 +141,21 @@ def _vet_peak(
     run_triceratops: bool,
     use_gaia: bool = True,
     known_table: Optional[dict] = None,
+    trend: Optional[np.ndarray] = None,
 ) -> dict:
     from .difference_image import difference_image_score
     from .fold_features import run_phase3
     from .hard_flags import demotion
+
+    redetrended = False
+    if trend is not None and len(trend) == len(flux):
+        from .detrend import masked_redetrend
+
+        dur = _duration_days(peak.period, float(getattr(peak, "duration_phase", 0.05) or 0.05))
+        refit = masked_redetrend(time, flux, trend, peak.period, peak.epoch, dur)
+        if np.isfinite(refit).sum() > 0.9 * len(refit):
+            flux = refit
+            redetrended = True
 
     global_view, local_view, centroid, phase3_extras = run_phase3(
         time, flux, peak.period, peak.epoch,
@@ -158,6 +169,7 @@ def _vet_peak(
     if isinstance(phase3_extras, dict):
         vetting = dict(phase3_extras.get("vetting") or {})
     vetting.setdefault("transit_center_btjd", float(peak.epoch))
+    vetting["masked_redetrend"] = redetrended
     if use_gaia:
         from .gaia_contamination import gaia_contamination
 
@@ -221,7 +233,7 @@ def cached_bls(
         backend=_select_backend(len(time), backend),
         rho=round(float(rho_star_solar), 3) if adaptive_duration else 1.0,
         adaptive=bool(adaptive_duration), topk=int(topk), two_pass=bool(two_pass),
-        coarse=int(coarse_nperiods), refine=int(refine_nperiods), n=int(len(time)),
+        coarse=int(coarse_nperiods), refine=int(refine_nperiods), n=int(len(time)), grid="ofir",
     )
     if use_cache:
         cached = get_phase2(tic_id, sector, period_min, period_max, nperiods, variant=variant)
@@ -278,6 +290,8 @@ def search_with_masking(
     refine_nperiods: int = 3000,
     use_gaia: bool = True,
     known_table: Optional[dict] = None,
+    trend: Optional[np.ndarray] = None,
+    run_duotransit: bool = True,
 ) -> dict:
     """BLS, vet every SDE-pass peak, mask accepted transits, then MES.
 
@@ -327,7 +341,7 @@ def search_with_masking(
                 tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
                 ra=ra, dec=dec, bls_result=res,
                 run_triceratops=run_triceratops,
-                use_gaia=use_gaia, known_table=known_table,
+                use_gaia=use_gaia, known_table=known_table, trend=trend,
             )
             signals.append(signal)
             if accepted is None and accepts_for_reseach(signal["vetting"], peak.sde, sde_threshold):
@@ -355,6 +369,13 @@ def search_with_masking(
                 if dist < _duration_days(sig["period"], sig["duration_phase"]):
                     mono = None
                     break
+        if mono is not None and run_duotransit:
+            from .duotransit import find_duotransit
+
+            duo = find_duotransit(time, work, min_alias_period=max(period_max, 15.0) / 2.0,
+                                  rho_star_solar=rho_star_solar)
+            if duo is not None:
+                mono = duo
         if mono is not None:
             gv, lv = monotransit_views(time, work, mono["epoch"], mono["duration_days"])
             mono["global_view"] = gv

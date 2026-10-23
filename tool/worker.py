@@ -70,7 +70,8 @@ def resume_config(state: dict, args) -> dict:
             config["local_dir"] = state.get("local_dir")
         return config
     config["mode"] = "sectors"
-    config["sector"] = max(int(state.get("sector") or 0), int(args.sector or 1))
+    walked = state.get("walk_sector") or state.get("sector") or 0
+    config["sector"] = max(int(walked), int(args.sector or 1))
     return config
 
 

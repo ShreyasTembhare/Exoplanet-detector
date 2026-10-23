@@ -21,6 +21,7 @@ from pathlib import Path
 
 from pipeline.atomic import atomic_write_json
 from services import HuntConfig, mast_requirement, run_hunt, run_local_lightcurve
+from tool import sector_watch
 from tool.state import default_owner
 
 STATE_KEY = "continuous"
@@ -92,6 +93,11 @@ class ContinuousSearch:
         self.desk = desk
         self.store = desk.store
         self.owner = default_owner()
+        # Tests and offline runs set HUNT_SECTOR_WATCH=0 so the walk never touches MAST.
+        self.sector_fetcher = (
+            None if os.environ.get("HUNT_SECTOR_WATCH", "1").lower() in {"0", "off", "false"}
+            else sector_watch.query_latest_sector
+        )
         self.path = desk.root / "continuous.json"
         self.log_path = desk.root / "continuous.log"
         self.progress_path = desk.root / "continuous_progress.json"
@@ -222,7 +228,7 @@ class ContinuousSearch:
             mode = self.state.get("mode")
             resume_plan = mode in {"local", "queue"} and not self.state.get("pass_complete")
             config = dict(self.state.get("config") or {})
-            sector = int(self.state.get("sector") or 1)
+            sector = int(self.state.get("walk_sector") or self.state.get("sector") or 1)
         try:
             if resume_plan:
                 if mode == "local":
@@ -291,6 +297,10 @@ class ContinuousSearch:
                         "auto_start": True,
                         "last_log_line": plan["message"],
                     }
+                if plan["mode"] == "sectors":
+                    self.state["walk_sector"] = int(
+                        config.get("sector") or self.state.get("walk_sector") or self.state.get("sector") or 1
+                    )
                 self._persist()
                 self._ensure_thread()
                 state = copy.deepcopy(self.state)
@@ -410,12 +420,22 @@ class ContinuousSearch:
 
     def _next_item(self) -> dict | None:
         plan = self.state.get("plan")
+        sectors_mode = self.state.get("mode") == "sectors"
+        latest = None
+        if sectors_mode and self.sector_fetcher is not None:
+            latest = sector_watch.latest_sector(self.store, fetcher=self.sector_fetcher)
+            for sector in sector_watch.enqueue_new_sectors(self.store, plan, latest):
+                self._append_unlocked({
+                    "sector": sector, "phase": "new_sector",
+                    "message": f"Sector {sector} was just released; searching it next.",
+                })
         item = self.store.claim(self.owner, plan=plan, lease_seconds=LEASE_SECONDS)
-        if item is None and self.state.get("mode") == "sectors":
-            done = [row.get("sector") or 0 for row in self.store.items(plan=plan, limit=1000)]
-            following = max([int(self.state.get("sector") or 1) - 1] + done) + 1
+        if item is None and sectors_mode:
+            seen = {int(row.get("sector") or 0) for row in self.store.items(plan=plan, limit=100000)}
+            start = int(self.state.get("walk_sector") or self.state.get("sector") or 1)
+            following = sector_watch.next_walk_sector(start, seen, latest)
             end_sector = (self.state.get("config") or {}).get("end_sector")
-            if end_sector and following > int(end_sector):
+            if following is None or (end_sector and following > int(end_sector)):
                 return None
             self.store.enqueue(plan, [{"kind": "sector", "target": f"sector {following}", "sector": following}])
             item = self.store.claim(self.owner, plan=plan, lease_seconds=LEASE_SECONDS)
@@ -441,6 +461,8 @@ class ContinuousSearch:
                         return
                     if item.get("kind") == "sector":
                         self.state["sector"] = int(item.get("sector") or 1)
+                        if float(item.get("priority") or 0) < sector_watch.NEW_SECTOR_PRIORITY:
+                            self.state["walk_sector"] = self.state["sector"]
                         self._persist()
                 self._run_item(item)
         finally:

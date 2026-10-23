@@ -230,10 +230,16 @@ def load_tess_lightcurve(
     return lc, sector_label, meta
 
 
+DETREND_METHOD = "biweight"
+
+
 def preprocess_lightcurve(lc, cadence_minutes: Optional[float] = None):
     """
     Drop NaN cadences, flatten with cadence-aware Savitzky-Golay window,
-    and remove 3-sigma outliers.
+    and clip upward outliers. Transits are downward, so a symmetric 3-sigma
+    clip would delete the in-transit cadences of any dip deeper than 3x the
+    noise; only flares/cosmic rays above the trend and gross negative
+    glitches are removed.
     """
     lc = lc.remove_nans()
     if cadence_minutes is None:
@@ -244,7 +250,30 @@ def preprocess_lightcurve(lc, cadence_minutes: Optional[float] = None):
     except Exception as exc:
         logger.warning("flatten(window=%d) failed (%s); retrying with 101", window, exc)
         lc_flat = lc.flatten(window_length=101)
-    return lc_flat.remove_outliers(sigma=3)
+    return lc_flat.remove_outliers(sigma_upper=3, sigma_lower=20)
+
+
+def detrend_arrays(time: np.ndarray, flux: np.ndarray, flux_err: np.ndarray, window_days: float = 0.75):
+    """Biweight-detrend normalised arrays; returns ``(time, flat, err, trend)``.
+
+    Upward 3-sigma outliers are dropped (flares, cosmic rays); downward ones
+    are kept unless absurd, so transits survive.
+    """
+    from .detrend import biweight_detrend
+
+    keep = np.isfinite(time) & np.isfinite(flux)
+    time, flux, flux_err = time[keep], flux[keep], flux_err[keep]
+    median = np.nanmedian(flux)
+    if median and np.isfinite(median):
+        flux = flux / median
+        flux_err = flux_err / median
+    flat, trend = biweight_detrend(time, flux, window_days=window_days)
+    resid = flat - np.nanmedian(flat)
+    sigma = 1.4826 * np.nanmedian(np.abs(resid))
+    good = np.isfinite(flat)
+    if sigma > 0:
+        good &= (resid < 3.0 * sigma) & (resid > -20.0 * sigma)
+    return time[good], flat[good], flux_err[good], trend[good]
 
 
 def _maybe_download_tpf(tic_id: str, sector: Optional[int]):  # pragma: no cover - network
@@ -296,17 +325,24 @@ def run_phase1(
     use_cache: bool = True,
     quality_bitmask: str = "default",
     with_tpf: bool = False,
+    detrend: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, dict]:
     """
     Run Phase 1 and return ``(time, flux, flux_err, sector_label, meta)``.
+
+    ``detrend`` is ``"biweight"`` (default; ``meta["trend"]`` keeps the fitted
+    trend so a candidate can be re-flattened with its transits masked) or
+    ``"savgol"`` for the old lightkurve flatten.
 
     ``meta`` includes ``cadence_minutes``, ``crowdsap``, ``tmag``, ``author``,
     ``n_sectors``, and ``with_tpf`` (bool indicating cache had TPF).
     """
     sector_label = "all" if sector is None else str(sector)
+    method = detrend or DETREND_METHOD
+    cache_label = sector_label if method == "savgol" else f"{sector_label}@{method}"
 
     if use_cache:
-        cached = get_phase1(tic_id, sector_label)
+        cached = get_phase1(tic_id, cache_label)
         if cached is not None:
             time, flux, flux_err, meta = cached
             if with_tpf:
@@ -319,18 +355,27 @@ def run_phase1(
     time_full = _time_to_array(lc.time)
     cadence_min = _cadence_minutes(time_full)
     meta["cadence_minutes"] = cadence_min
+    meta["detrend"] = method
 
-    lc_clean = preprocess_lightcurve(lc, cadence_minutes=cadence_min)
-
-    time = _time_to_array(lc_clean.time)
-    flux = _flux_to_array(lc_clean.flux)
-    if lc_clean.flux_err is not None:
-        flux_err = _flux_to_array(lc_clean.flux_err)
+    if method == "biweight":
+        lc_nan = lc.remove_nans()
+        raw_err = lc_nan.flux_err
+        time, flux, flux_err, trend = detrend_arrays(
+            _time_to_array(lc_nan.time), _flux_to_array(lc_nan.flux),
+            _flux_to_array(raw_err) if raw_err is not None else np.full(len(lc_nan.time), np.nan),
+        )
+        meta["trend"] = trend.astype(np.float32)
     else:
-        flux_err = np.full_like(flux, np.nan)
+        lc_clean = preprocess_lightcurve(lc, cadence_minutes=cadence_min)
+        time = _time_to_array(lc_clean.time)
+        flux = _flux_to_array(lc_clean.flux)
+        if lc_clean.flux_err is not None:
+            flux_err = _flux_to_array(lc_clean.flux_err)
+        else:
+            flux_err = np.full_like(flux, np.nan)
 
     if use_cache:
-        set_phase1(tic_id, sector_label, time, flux, flux_err, meta=meta)
+        set_phase1(tic_id, cache_label, time, flux, flux_err, meta=meta)
 
     if with_tpf:
         try:
