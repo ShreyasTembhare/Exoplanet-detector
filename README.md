@@ -52,6 +52,31 @@ python train_triage_v2.py --manifest data/triage_v2/manifest.csv --epochs 30
 
 Do not invent a science checkpoint from Gaussian noise — the trainer refuses that path.
 
+## Run online and always resume
+
+All progress lives in one SQLite file, `var/desk/state.db` (work items with leases and retry counts, the live log, loop state, runs, labels), next to the candidate evidence and per-sector hunter logs. A crash, redeploy or move to another machine picks up at the next unfinished item; stars a half-finished sector already searched are skipped.
+
+`python -m tool.worker` is the headless entry point. It restores the last checkpoint, resumes the loop, pushes a checkpoint every 15 minutes, and on SIGTERM or when `--budget-minutes` is nearly spent it stops claiming work, drains, writes a static status page and pushes a final checkpoint.
+
+Checkpoints (`tool/checkpoint.py`) go to:
+
+| Setting | Destination |
+|---|---|
+| `STATE_BUCKET=s3://bucket/prefix` (+ `AWS_*`, `STATE_ENDPOINT_URL` for R2/B2) | S3-compatible object storage |
+| `STATE_BUCKET=file:///mnt/backup` | a directory |
+| `STATE_GIT_BRANCH=hunt-state` (default in GitHub Actions) | a force-pushed single-commit orphan branch |
+
+Hosting options:
+
+- **GitHub Actions (free):** [`.github/workflows/hunt.yml`](.github/workflows/hunt.yml) runs every 6 hours with a 330-minute budget and one-at-a-time concurrency, and publishes the status page to GitHub Pages. Optional repository variables: `HUNT_START_SECTOR`, `HUNT_END_SECTOR`, `HUNT_PROFILE`, `HUNT_LIMIT`.
+- **Docker anywhere:** `docker build -t transit-hunt .`, then `docker run -e STATE_BUCKET=... transit-hunt worker` (headless) or `docker run -p 8765:8765 -e DESK_TOKEN=... -v $PWD/var:/app/var transit-hunt` (desk and UI).
+- **Fly.io always-on:** copy [`fly.toml.example`](fly.toml.example) to `fly.toml`; the volume keeps `state.db` and `STATE_BUCKET` adds off-machine backups.
+
+```bash
+python -m tool.checkpoint pull --data var/desk   # restore by hand
+python -m tool.checkpoint push --data var/desk   # back up by hand
+```
+
 ## Architecture
 
 ```

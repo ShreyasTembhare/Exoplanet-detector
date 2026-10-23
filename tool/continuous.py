@@ -315,6 +315,7 @@ class ContinuousSearch:
             "nperiods": pick("nperiods", 400, int),
             "sde_threshold": pick("sde_threshold", 7.0, float),
             "strategy_profile": pick("strategy_profile", "balanced", str),
+            "end_sector": pick("end_sector", None, lambda v: None if v in (None, "") else int(v)),
         }
 
     def pause(self) -> dict:
@@ -413,6 +414,9 @@ class ContinuousSearch:
         if item is None and self.state.get("mode") == "sectors":
             done = [row.get("sector") or 0 for row in self.store.items(plan=plan, limit=1000)]
             following = max([int(self.state.get("sector") or 1) - 1] + done) + 1
+            end_sector = (self.state.get("config") or {}).get("end_sector")
+            if end_sector and following > int(end_sector):
+                return None
             self.store.enqueue(plan, [{"kind": "sector", "target": f"sector {following}", "sector": following}])
             item = self.store.claim(self.owner, plan=plan, lease_seconds=LEASE_SECONDS)
         return item

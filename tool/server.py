@@ -28,6 +28,7 @@ class ContinuousBody(BaseModel):
     rescan: bool = False
     strategy_profile: str | None = None
     sector: int = 1
+    end_sector: int | None = None
     limit: int = 20
     period_min: float = 0.5
     period_max: float = 15.0
