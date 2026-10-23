@@ -84,14 +84,29 @@ def _safe_members(tar: tarfile.TarFile, dest: Path):
 
 
 def restore_archive(data: bytes, root: Path) -> list:
-    """Unpack a checkpoint into ``root``; existing files with the same name are replaced."""
+    """Unpack a checkpoint into ``root``; existing files with the same name are replaced.
+
+    The archive is fully extracted into a staging directory first, so a
+    truncated or corrupt download raises before any live file is touched.
+    """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
-    for stale in ("state.db-wal", "state.db-shm"):
-        (root / stale).unlink(missing_ok=True)
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-        members = list(_safe_members(tar, root))
-        tar.extractall(root, members=members)
+    staging = Path(tempfile.mkdtemp(prefix=".restore-", dir=root))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+            members = list(_safe_members(tar, staging))
+            tar.extractall(staging, members=members)
+        for stale in ("state.db-wal", "state.db-shm"):
+            (root / stale).unlink(missing_ok=True)
+        # Merge file by file: local files the checkpoint does not have are kept.
+        for path in sorted(staging.rglob("*")):
+            if not path.is_file():
+                continue
+            target = root / path.relative_to(staging)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(path, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return [m.name for m in members]
 
 
