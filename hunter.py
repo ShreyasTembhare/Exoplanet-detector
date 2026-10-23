@@ -309,6 +309,7 @@ def _get_ranked_queue(
     period_min: float = 0.5, period_max: float = 15.0,
 ):
     """Best-N primary targets, then a masked second pass for known CP/KP hosts."""
+    from pipeline.completeness import load_map as load_completeness
     from pipeline.target_rank import default_objective, rank_targets
     from pipeline.tic_enrich import enrich_records
 
@@ -326,7 +327,7 @@ def _get_ranked_queue(
     enrich_records(records)
     return rank_targets(
         records, limit=limit, period_min=period_min, period_max=period_max,
-        objective=default_objective(),
+        objective=default_objective(), completeness=load_completeness(),
     )
 
 
@@ -400,8 +401,10 @@ def _save_candidate_evidence(
     candidate_dir: str, tic_id: str, best_period: float, prob_planet: float,
     bls_power: float, sde: float, centroid_offset: float,
     plot_path: str, vetting: dict, peaks: list, strategy_profile: str,
-    epoch: float = None, evidence: dict = None,
+    epoch: float = None, evidence: dict = None, views: dict = None,
 ):
+    """Write the candidate JSON; ``views`` (global/local fold) go to a sidecar
+    ``.views.npz`` so desk labels can later fine-tune the classifier."""
     safe_tic = str(tic_id).replace(" ", "_").replace("/", "_")
     from pipeline.hard_flags import demotion
 
@@ -442,6 +445,17 @@ def _save_candidate_evidence(
 
     period_tag = best_period if best_period == best_period else 0.0
     json_path = os.path.join(candidate_dir, f"TIC_{safe_tic}_p{period_tag:.2f}.json")
+    views = views or {}
+    if views.get("global_view") is not None and views.get("local_view") is not None:
+        views_path = json_path[:-5] + ".views.npz"
+        co = views.get("centroid_offset")
+        np.savez_compressed(
+            views_path,
+            global_view=np.asarray(views["global_view"], dtype=np.float32),
+            local_view=np.asarray(views["local_view"], dtype=np.float32),
+            centroid_offset=np.float32(co if co is not None and co == co else np.nan),
+        )
+        meta["views_path"] = views_path
     atomic_write_json(json_path, meta)
     return json_path
 
@@ -508,6 +522,7 @@ def _predict_batch(model, device, items):
         return [None] * len(items)
 
     two_tower = isinstance(model, TwoTowerResNet1D) or hasattr(model, "global_tower")
+    temperature = max(float(getattr(model, "temperature", 1.0) or 1.0), 1e-3)
     cos = []
     if two_tower:
         globals_, locals_ = [], []
@@ -522,7 +537,7 @@ def _predict_batch(model, device, items):
         co_t = torch.tensor(cos, device=device, dtype=torch.float32)
         with torch.inference_mode():
             logits = model(global_t, local_t, centroid_offset=co_t)
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits / temperature, dim=1)
         return [probs[i, 1].item() for i in range(len(items))]
 
     xs = []
@@ -534,7 +549,7 @@ def _predict_batch(model, device, items):
     co_t = torch.tensor(cos, device=device, dtype=torch.float32)
     with torch.inference_mode():
         logits = model(stacked, centroid_offset=co_t)
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits / temperature, dim=1)
     return [probs[i, 1].item() for i in range(len(items))]
 
 
@@ -596,6 +611,9 @@ def run_hunt(
 
     known_table = load_known_ephemerides()
     model, device = _load_model(checkpoint)
+    from pipeline import second_stage
+
+    vetter = second_stage.load_vetter()
     if model is None:
         logger.warning(
             "No checkpoint at %s. SDE-pass stars will be saved as CANDIDATE_SDE with vetting JSON.",
@@ -626,6 +644,14 @@ def run_hunt(
             return
         t0 = _time.time()
         probs = _predict_batch(model, device, predict_queue)
+        if vetter is not None:
+            second = second_stage.vet(vetter, [
+                item if not item.get("skip_classifier") else {} for item in predict_queue
+            ])
+            for item, p2 in zip(predict_queue, second):
+                if p2 is not None:
+                    item.setdefault("vetting", {})["exominer_prob"] = p2
+            probs = [second_stage.combine(p, p2) for p, p2 in zip(probs, second)]
         batch_ms = (_time.time() - t0) * 1000
         per_item_ms = batch_ms / len(predict_queue) if predict_queue else 0
 
@@ -646,7 +672,7 @@ def run_hunt(
                     item["max_power"] or 0.0, item["sde"], item["centroid_offset"] or 0.0,
                     plot_path, vetting=item["vetting"], peaks=item["peaks"],
                     strategy_profile=strategy_profile or "",
-                    epoch=item["epoch"], evidence=item.get("evidence"),
+                    epoch=item["epoch"], evidence=item.get("evidence"), views=item,
                 )
                 candidates_found.append({
                     "tic_id": tic_id_q, "period": best_period_q,

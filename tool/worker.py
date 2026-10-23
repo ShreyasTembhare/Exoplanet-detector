@@ -50,6 +50,9 @@ def parse_args(argv=None):
     parser.add_argument("--strategy-profile", default=os.environ.get("HUNT_PROFILE", "balanced"))
     parser.add_argument("--dashboard", default=os.environ.get("HUNT_DASHBOARD_DIR", ""),
                         help="Also write the static status page here (default: <data>/dashboard)")
+    parser.add_argument("--completeness-hours", type=float,
+                        default=float(os.environ.get("HUNT_COMPLETENESS_HOURS", 24)),
+                        help="Refresh the injection-recovery completeness map when older than this (0 = never)")
     parser.add_argument("--no-pull", action="store_true", help="Do not restore a checkpoint first")
     parser.add_argument("--no-push", action="store_true", help="Do not upload checkpoints")
     return parser.parse_args(argv)
@@ -122,6 +125,22 @@ class Worker:
         except Exception as exc:
             log.error("Checkpoint push failed: %s", exc)
 
+    def refresh_completeness(self) -> None:
+        """Daily injection-recovery map; it lives in the checkpoint like the rest of the state."""
+        path = self.root / "completeness.json"
+        os.environ.setdefault("HUNT_COMPLETENESS_MAP", str(path))
+        if self.args.completeness_hours <= 0:
+            return
+        try:
+            from pipeline.completeness import refresh_if_stale
+
+            budget = 300.0
+            if self.args.budget_minutes:
+                budget = min(budget, self.args.budget_minutes * 60.0 * 0.05)
+            refresh_if_stale(path, max_age_hours=self.args.completeness_hours, budget_s=budget)
+        except Exception as exc:
+            log.warning("Completeness refresh failed: %s", exc)
+
     def start_loop(self) -> None:
         from tool.desk import Desk
 
@@ -143,6 +162,7 @@ class Worker:
         interval = max(60.0, self.args.checkpoint_minutes * 60.0)
 
         self.restore()
+        self.refresh_completeness()
         self.start_loop()
         cont = self.desk.continuous
         next_checkpoint = time.monotonic() + interval

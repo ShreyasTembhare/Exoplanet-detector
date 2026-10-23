@@ -208,13 +208,28 @@ def _stellar_terms(record: TargetRecord):
     return radius, rho, max(cdpp, 1.0), dilution
 
 
-def _detect_grid(record: TargetRecord, periods: np.ndarray, radii: np.ndarray, n_sectors: float) -> np.ndarray:
-    """Detection probability on a (period, radius) grid for ``n_sectors`` of data."""
+def _detect_grid(record: TargetRecord, periods: np.ndarray, radii: np.ndarray, n_sectors: float,
+                 completeness: Optional[dict] = None) -> np.ndarray:
+    """Detection probability on a (period, radius) grid for ``n_sectors`` of data.
+
+    With a measured ``completeness`` map (``pipeline.completeness``) and a
+    known Tmag the injection-recovery fraction is used; otherwise a logistic
+    in analytic SNR.
+    """
     if n_sectors <= 0:
         return np.zeros((len(periods), len(radii)))
     radius, rho, cdpp, dilution = _stellar_terms(record)
     baseline = n_sectors * SECTOR_DAYS
     n_tr = baseline / periods
+    if completeness is not None and _finite(record.tmag):
+        from pipeline.completeness import detection_probability as measured
+
+        grid = np.array([
+            [measured(completeness, p, r * np.sqrt(dilution), float(record.tmag), radius, n_sectors)
+             for r in radii] for p in periods
+        ], dtype=object)
+        if all(v is not None for v in grid.ravel()):
+            return np.where((n_tr >= 2.0)[:, None], grid.astype(float), 0.0)
     # Central-transit duration in hours for this stellar density.
     dur_h = 13.0 * (periods / 365.25) ** (1.0 / 3.0) * rho ** (-1.0 / 3.0)
     depth_ppm = (radii[None, :] * R_EARTH_OVER_R_SUN / radius) ** 2 * 1e6 * dilution
@@ -231,6 +246,7 @@ def expected_yield(
     period_max: float = 15.0,
     prior_sectors: Optional[float] = None,
     n_period: int = 24,
+    completeness: Optional[dict] = None,
 ) -> float:
     """Expected number of *new* detectable planets this target adds.
 
@@ -258,8 +274,8 @@ def expected_yield(
     a_over_r = (periods / 365.25) ** (2.0 / 3.0) * rho ** (1.0 / 3.0) * A_OVER_RSTAR_1AU
     p_transit = np.clip(1.0 / a_over_r, 0.0, 1.0)
     occ = np.array([[occurrence_rate(p, r, radius) for r in radii] for p in periods])
-    gain = _detect_grid(record, periods, radii, n_sectors) - _detect_grid(
-        record, periods, radii, min(prior_sectors, n_sectors)
+    gain = _detect_grid(record, periods, radii, n_sectors, completeness) - _detect_grid(
+        record, periods, radii, min(prior_sectors, n_sectors), completeness
     )
     cell = occ * p_transit[:, None] * np.clip(gain, 0.0, 1.0) * dlnp * dlnr[None, :]
     return float(np.sum(cell))
@@ -276,6 +292,7 @@ def rank_targets(
     min_crowdsap: float = DEFAULT_MIN_CROWDSAP,
     second_pass_limit: Optional[int] = None,
     objective: str = "snr",
+    completeness: Optional[dict] = None,
 ) -> RankedQueue:
     """Rank before download. ``limit`` keeps the best N primary targets.
 
@@ -291,7 +308,8 @@ def rank_targets(
         if not passes_tic_cuts(record, max_tmag=max_tmag, min_crowdsap=min_crowdsap):
             continue
         if objective == "yield":
-            record.score = expected_yield(record, period_min=period_min, period_max=period_max)
+            record.score = expected_yield(record, period_min=period_min, period_max=period_max,
+                                          completeness=completeness)
         else:
             record.score = expected_snr(
                 record, period_min=period_min, period_max=period_max, rp_rearth=rp_rearth,

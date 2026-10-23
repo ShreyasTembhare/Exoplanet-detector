@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import csv
 import io
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -219,6 +220,9 @@ class Desk:
         self.exports = self.root / "exports"
         self.candidates.mkdir(parents=True, exist_ok=True)
         self.exports.mkdir(parents=True, exist_ok=True)
+        self.completeness_path = self.root / "completeness.json"
+        # Hunts launched from this desk rank targets with its completeness map.
+        os.environ.setdefault("HUNT_COMPLETENESS_MAP", str(self.completeness_path))
         self.allowed_dirs = None if allowed_dirs is None else [
             Path(p).expanduser().resolve() for p in [self.root, *allowed_dirs]
         ]
@@ -272,6 +276,17 @@ class Desk:
             "auto_start": bool(progress.get("auto_start", True)),
         }
 
+    def completeness(self) -> dict:
+        from pipeline.completeness import load_map
+
+        data = load_map(self.completeness_path)
+        if not data:
+            return {"available": False,
+                    "hint": "The worker refreshes it daily; or run python -m pipeline.completeness "
+                            f"--out {self.completeness_path}"}
+        data.pop("_array", None)
+        return {"available": True, **data}
+
     def stats(self, hours: int = 24) -> dict:
         """Throughput per hour (from the log), work-queue health, inbox makeup."""
         now = datetime.now(timezone.utc)
@@ -312,6 +327,7 @@ class Desk:
         }
 
     def rank(self, rows: list, *, limit: int, period_min: float, period_max: float) -> dict:
+        from pipeline.completeness import load_map as load_completeness
         from pipeline.target_rank import default_objective, rank_targets, records_from_rows
         from pipeline.tic_enrich import enrich_records
 
@@ -334,7 +350,7 @@ class Desk:
             provided[id(record)] = flags
         ranked = rank_targets(
             records, limit=int(limit), period_min=period_min, period_max=period_max,
-            objective=default_objective(),
+            objective=default_objective(), completeness=load_completeness(self.root / "completeness.json"),
         )
         payload = {
             "limit": int(limit),
@@ -458,6 +474,7 @@ class Desk:
         snapshot = {
             "tic_id": meta.get("tic_id"), "best_period": meta.get("best_period"),
             "epoch": meta.get("epoch"), "sde": meta.get("sde"), "json_path": meta.get("_json_path"),
+            "views_path": meta.get("views_path"),
         }
         self.store.set_label(candidate_id, label, note, snapshot)
         return {"candidate_id": candidate_id, "label": label, "note": note}

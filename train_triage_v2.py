@@ -110,10 +110,11 @@ def build_from_label_table(labels_csv: Path, lc_dir: Path, out_dir: Path) -> str
     return manifest
 
 
-def try_fetch_remote(out_dir: Path) -> str | None:
+def try_fetch_remote(out_dir: Path, limit: int | None = 300, injections: int = 100) -> str | None:
+    """Triage-v2 labels + our Phase 1 light curves, folded at BLS-recovered ephemerides."""
     from pipeline.catalog_labels import try_remote_catalog_subset
 
-    return try_remote_catalog_subset(out_dir=str(out_dir))
+    return try_remote_catalog_subset(out_dir=str(out_dir), limit=limit, n_injections=injections)
 
 
 def train_manifest(manifest: str, out: Path, epochs: int, batch_size: int) -> dict:
@@ -152,7 +153,10 @@ def main(argv=None):
     parser.add_argument("--build-from", type=str, default=None, help="Labels CSV to fold at catalog ephemerides")
     parser.add_argument("--light-curves", type=str, default=None, help="Directory of {tic}.csv light curves")
     parser.add_argument("--out-dir", type=str, default="data/triage_v2", help="Where to write folds + manifest")
-    parser.add_argument("--fetch", action="store_true", help="Try Zenodo Triage-v2 remote subset first")
+    parser.add_argument("--fetch", action="store_true",
+                        help="Download the Triage-v2 label table and fold our own light curves for it")
+    parser.add_argument("--limit", type=int, default=300, help="TCEs to fetch with --fetch (0 = all)")
+    parser.add_argument("--injections", type=int, default=100, help="Injected positives on quiet stars")
     parser.add_argument(
         "--fixture-train",
         action="store_true",
@@ -173,7 +177,7 @@ def main(argv=None):
         manifest = build_fixture_dataset(fixture_dir)
         logger.info("Fixture manifest at %s (not a science dataset).", manifest)
     elif args.fetch:
-        remote = try_fetch_remote(out_dir)
+        remote = try_fetch_remote(out_dir, limit=args.limit or None, injections=args.injections)
         if remote:
             manifest = remote
         else:

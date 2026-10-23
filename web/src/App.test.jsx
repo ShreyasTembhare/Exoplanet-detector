@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import App from "./App.jsx";
+import App, { CompletenessMap } from "./App.jsx";
 
 function respond(body, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } }));
@@ -54,5 +54,17 @@ describe("App", () => {
     await act(async () => { render(<App />); });
     expect(await screen.findByText("Desk token")).toBeTruthy();
     routes["/api/health"] = { ...routes["/api/health"], auth_required: false };
+  });
+
+  it("draws the completeness map on the throughput page", async () => {
+    routes["/api/completeness"] = {
+      available: true, periods: [1, 5], radii: [2], tmags: [10], trials: 6,
+      recovery: [[[0.9], [null]]], frame: "single sector", generated_at: "2026-01-01",
+    };
+    await act(async () => { render(<CompletenessMap />); });
+    expect(await screen.findByText("Tmag 10")).toBeTruthy();
+    expect(screen.getByLabelText("P 1 d, 2 Earth radii: 90%")).toBeTruthy();
+    expect(screen.getByLabelText("P 5 d, 2 Earth radii: not run")).toBeTruthy();
+    delete routes["/api/completeness"];
   });
 });

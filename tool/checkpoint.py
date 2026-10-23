@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Optional
 
 ARCHIVE_NAME = "state.tar.gz"
-INCLUDE = ("candidates", "exports", "hunt_logs", "queue.json", "continuous.log", "dashboard")
+INCLUDE = ("candidates", "exports", "hunt_logs", "queue.json", "continuous.log", "dashboard", "completeness.json")
 GIT_SIZE_LIMIT = 95 * 1024 * 1024
 
 

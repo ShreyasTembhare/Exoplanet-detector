@@ -13,6 +13,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("HUNT_SECTOR_WATCH", "0")
+os.environ.setdefault("HUNT_COMPLETENESS_HOURS", "0")
 
 
 @pytest.fixture

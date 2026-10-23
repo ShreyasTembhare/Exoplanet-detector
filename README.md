@@ -94,6 +94,16 @@ python -m tool.checkpoint push --data var/desk   # back up by hand
                     -> Save candidates with full vetting JSON; export TFOP discovery packets
 ```
 
+Search switches (environment variables):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `HUNT_RANK_OBJECTIVE` | `yield` | `yield` ranks targets by expected new detections (occurrence × transit probability × detection-probability gain over sectors already searched); `snr` uses the older expected-SNR score |
+| `HUNT_SECTOR_WATCH` | `1` | Check MAST (cached 12 h) for newly released sectors, search them ahead of the backlog, and stop the sector walk at the release frontier |
+| `HUNT_SKIP_FFI` | unset | `1` skips the QLP / TESS-SPOC full-frame-image targets |
+
+`run_parallel_hunt(..., triage_sde=6)` adds an opt-in batched coarse BLS pass that runs many stars through one compiled GPU kernel and drops flat ones before the full search.
+
 Self-supervised pretraining (Phase 8) of the two-tower or transformer encoders is supported via `python run.py pretrain {mlm,simclr}`.
 
 ## Pipeline modules
@@ -102,7 +112,11 @@ Self-supervised pretraining (Phase 8) of the two-tower or transformer encoders i
 |---|---|
 | [`pipeline/phase1_preprocess.py`](pipeline/phase1_preprocess.py) | Download + quality + same-author stitch + cadence-aware flatten + TPF |
 | [`pipeline/prefilter.py`](pipeline/prefilter.py) | Cheap O(N) gates on CDPP / magnitude / contamination |
-| [`pipeline/bls_gpu.py`](pipeline/bls_gpu.py) | Multi-backend BLS, top-k peaks, SDE |
+| [`pipeline/bls_gpu.py`](pipeline/bls_gpu.py) | Multi-backend BLS, multi-star batching, top-k peaks, SDE |
+| [`pipeline/period_grid.py`](pipeline/period_grid.py) | Ofir (2014) optimal period grid |
+| [`pipeline/detrend.py`](pipeline/detrend.py) | Tukey biweight (wotan or NumPy) and masked re-detrend |
+| [`pipeline/duotransit.py`](pipeline/duotransit.py) | Two-transit search with surviving period aliases |
+| [`tool/sector_watch.py`](tool/sector_watch.py) | New-sector release watcher |
 | [`pipeline/physical_priors.py`](pipeline/physical_priors.py) | Kepler-3rd-law adaptive transit duration grid |
 | [`pipeline/tls_refine.py`](pipeline/tls_refine.py) | Phase 5 Transit Least Squares refiner |
 | [`pipeline/fold_features.py`](pipeline/fold_features.py) | Global / local / local-centered / periodogram views |

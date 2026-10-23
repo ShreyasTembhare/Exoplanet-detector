@@ -458,3 +458,21 @@ tr.hit td { background: rgba(30, 92, 69, 0.06); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+.completeness-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 1rem;
+}
+
+table.completeness caption {
+  text-align: left;
+  font-weight: 600;
+  padding-bottom: 0.25rem;
+}
+
+table.completeness td,
+table.completeness th {
+  padding: 0.2rem 0.4rem;
+  text-align: center;
+}

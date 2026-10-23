@@ -321,5 +321,6 @@ def load_checkpoint(
     model.load_state_dict(mapped, strict=strict)
     model.to(device)
     model.eval()
+    model.temperature = float(ckpt.get("temperature", 1.0)) if isinstance(ckpt, dict) else 1.0
     logger.info(f"Loaded checkpoint from {path} ({count_parameters(model):,} params)")
     return model

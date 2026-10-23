@@ -278,6 +278,9 @@ def run_parallel_hunt(
 
     known_table = load_known_ephemerides()
     model, device = _load_model(checkpoint) if checkpoint else (None, None)
+    from pipeline import second_stage
+
+    vetter = second_stage.load_vetter()
     if model is None:
         logger.warning(
             "No checkpoint at %s. SDE-pass stars will be saved as CANDIDATE_SDE with vetting JSON.",
@@ -482,6 +485,12 @@ def run_parallel_hunt(
             pred_probs = [None] * len(predictable)
         else:
             pred_probs = _predict_batch(model, device, predictable)
+        if vetter is not None and predictable:
+            second = second_stage.vet(vetter, predictable)
+            for row, p2 in zip(predictable, second):
+                if p2 is not None:
+                    row["vetting"]["exominer_prob"] = p2
+            pred_probs = [second_stage.combine(p, p2) for p, p2 in zip(pred_probs, second)]
         per_item_ms = (_time.time() - t0) * 1000 / max(len(rows), 1)
         prob_by_id = {id(row): prob for row, prob in zip(predictable, pred_probs)}
         seen_tics = set()
@@ -500,7 +509,7 @@ def run_parallel_hunt(
                     row["centroid_offset"] if row["centroid_offset"] == row["centroid_offset"] else 0.0,
                     plot_path, vetting=row["vetting"], peaks=row["peaks"],
                     strategy_profile=strategy_profile or "balanced", epoch=row["epoch"],
-                    evidence=row.get("evidence"),
+                    evidence=row.get("evidence"), views=row,
                 )
                 candidates.append({
                     "tic_id": row["tic_id"], "period": row["period"],

@@ -932,6 +932,63 @@ function StatsView({ report, action }) {
           </tbody>
         </table>
       ) : <p className="quiet">No failed items. Errors are retried automatically up to three times.</p>}
+      <CompletenessMap />
     </section>
+  );
+}
+
+export function CompletenessMap() {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    api("/api/completeness").then(setData).catch(() => setData({ available: false }));
+  }, []);
+  if (!data) return null;
+  return (
+    <>
+      <h2>Search completeness</h2>
+      {!data.available ? (
+        <p className="quiet">{data.hint || "No completeness map yet."}</p>
+      ) : (
+        <>
+          <p className="quiet">
+            Share of injected planets this pipeline recovers ({data.frame}; {data.trials} trials,
+            generated {data.generated_at}). Target ranking uses this map.
+          </p>
+          <div className="completeness-grid">
+            {data.tmags.map((tmag, ti) => (
+              <table key={tmag} className="completeness">
+                <caption>Tmag {tmag}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">P (d) \ R (R⊕)</th>
+                    {data.radii.map((r) => <th scope="col" key={r} className="num">{r}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.periods.map((period, pi) => (
+                    <tr key={period}>
+                      <th scope="row" className="num">{period}</th>
+                      {data.radii.map((r, ri) => {
+                        const v = data.recovery[ti][pi][ri];
+                        return (
+                          <td
+                            key={r}
+                            className="num"
+                            style={v == null ? undefined : { background: `rgba(74, 124, 89, ${0.12 + 0.75 * v})` }}
+                            aria-label={`P ${period} d, ${r} Earth radii: ${v == null ? "not run" : Math.round(v * 100) + "%"}`}
+                          >
+                            {v == null ? "·" : `${Math.round(v * 100)}`}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ))}
+          </div>
+        </>
+      )}
+    </>
   );
 }

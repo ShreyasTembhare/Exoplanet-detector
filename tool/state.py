@@ -445,3 +445,18 @@ class StateStore:
     def labels(self) -> dict:
         rows = self._conn().execute("SELECT candidate_id, label, note, updated_at FROM labels").fetchall()
         return {row["candidate_id"]: dict(row) for row in rows}
+
+    def label_rows(self) -> List[dict]:
+        """Labels with their snapshot payload decoded (for fine-tuning)."""
+        rows = self._conn().execute(
+            "SELECT candidate_id, label, note, payload, updated_at FROM labels ORDER BY updated_at"
+        ).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["payload"] = json.loads(item.get("payload") or "{}")
+            except ValueError:
+                item["payload"] = {}
+            out.append(item)
+        return out

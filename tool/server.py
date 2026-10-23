@@ -142,6 +142,10 @@ def create_app(
     def stats():
         return app.state.desk.stats()
 
+    @app.get("/api/completeness")
+    def completeness():
+        return app.state.desk.completeness()
+
     @app.get("/api/stream")
     def stream(after_id: int = 0):
         """Server-sent events: new log lines and a progress frame whenever something changes."""
