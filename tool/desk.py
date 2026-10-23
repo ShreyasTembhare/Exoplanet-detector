@@ -5,14 +5,16 @@ from __future__ import annotations
 import copy
 import csv
 import io
-import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from services import HuntConfig, load_candidates, mast_requirement, run_hunt, run_local_lightcurve
+from pipeline.atomic import atomic_write_json, read_json
+from services import HuntConfig, mast_requirement, run_hunt, run_local_lightcurve
+from tool.candidate_index import CandidateIndex
 from tool.continuous import ContinuousSearch
+from tool.state import StateStore
 
 
 def _json_ready(value):
@@ -147,6 +149,8 @@ def candidate_label(meta: dict) -> str:
     vetting = meta.get("vetting") or {}
     if status == "KNOWN" or vetting.get("matches_toi"):
         return "Known TOI"
+    if status == "NEW_ON_KNOWN_HOST":
+        return "New on known host"
     if status == "LOCAL_CURVE" or meta.get("source") == "local_light_curve":
         return "Local curve"
     return "New"
@@ -186,26 +190,74 @@ def present_candidate(meta: dict) -> dict:
         "secondary_significance": _finite(vetting.get("secondary_significance")),
         "centroid_offset_px": _finite(vetting.get("centroid_offset_px", meta.get("centroid_offset"))),
         "n_transits": vetting.get("n_transits"),
+        "duration_hours": _finite(vetting.get("duration_hours")),
+        "score": _finite(meta.get("score")),
+        "demotion": meta.get("demotion") or vetting.get("demotion"),
+        "discovery_status": meta.get("discovery_status") or "",
+        "fpp": _finite(vetting.get("fpp")),
+        "kind": vetting.get("kind") or "periodic",
+        "timestamp": meta.get("timestamp") or "",
     }
 
 
 class Desk:
-    def __init__(self, root: Path, *, enable_auto_start: bool = True):
-        self.root = Path(root)
+    def __init__(
+        self,
+        root: Path,
+        *,
+        enable_auto_start: bool = True,
+        allowed_dirs: Optional[list] = None,
+    ):
+        """``allowed_dirs=None`` lets path inputs read anywhere (local laptop use).
+
+        A list jails every path input to the data directory plus those
+        directories; :mod:`tool.__main__` turns this on whenever the desk is
+        bound to a non-loopback address.
+        """
+        self.root = Path(root).expanduser().resolve()
         self.candidates = self.root / "candidates"
         self.exports = self.root / "exports"
         self.candidates.mkdir(parents=True, exist_ok=True)
         self.exports.mkdir(parents=True, exist_ok=True)
+        self.allowed_dirs = None if allowed_dirs is None else [
+            Path(p).expanduser().resolve() for p in [self.root, *allowed_dirs]
+        ]
+        self.store = StateStore(self.root / "state.db")
+        self.store.release_stale()
         self.lock = threading.Lock()
-        self.queue: Optional[dict] = None
-        self.run: Optional[dict] = None
-        saved = self.root / "queue.json"
-        if saved.is_file():
-            try:
-                self.queue = json.loads(saved.read_text())
-            except json.JSONDecodeError:
-                self.queue = None
+        self.queue: Optional[dict] = read_json(self.root / "queue.json")
+        self.run: Optional[dict] = self.store.latest_run()
+        if self.run and self.run.get("status") == "running":
+            # The process that owned this run is gone; say so instead of spinning.
+            self.run.update(status="failed", error="Interrupted by a restart.", finished_at=_now(),
+                            message="Search was interrupted by a restart.")
+            self.store.save_run(self.run)
+        self._index = CandidateIndex(self.candidates)
         self.continuous = ContinuousSearch(self, enable_auto_start=enable_auto_start)
+
+    def resolve_user_path(self, raw: str, *, must_be_dir: bool = False) -> Path:
+        path = Path(str(raw)).expanduser()
+        if not path.is_absolute():
+            path = self.root / path
+        path = path.resolve()
+        if self.allowed_dirs is not None and not any(
+            path == base or base in path.parents for base in self.allowed_dirs
+        ):
+            raise ValueError("Path is outside the directories this desk may read.")
+        if must_be_dir and not path.is_dir():
+            raise ValueError(f"Local curve directory not found: {raw}")
+        if not must_be_dir and not path.is_file():
+            raise ValueError(f"File not found: {raw}")
+        return path
+
+    def read_user_file(self, raw: str) -> str:
+        file = self.resolve_user_path(raw)
+        if file.stat().st_size > 20_000_000:
+            raise ValueError("File is larger than 20 MB.")
+        return file.read_text()
+
+    def shutdown(self, timeout: Optional[float] = None):
+        self.continuous.shutdown(timeout)
 
     def health(self) -> dict:
         checkpoint = Path("models/checkpoints/resnet1d.pt")
@@ -253,47 +305,141 @@ class Desk:
             "note": "limit is the best N, not the first N. Sky position is not used.",
         }
         self.queue = payload
-        (self.root / "queue.json").write_text(json.dumps(payload, indent=2))
+        atomic_write_json(self.root / "queue.json", payload)
         return payload
 
-    def list_candidates(self) -> list:
+    def list_candidates(self, **query) -> list:
+        return self.query_candidates(**query)["candidates"]
+
+    def query_candidates(
+        self,
+        *,
+        q: str = "",
+        status: str = "",
+        label: str = "",
+        flags: str = "",
+        min_sde: Optional[float] = None,
+        min_prob: Optional[float] = None,
+        min_period: Optional[float] = None,
+        max_period: Optional[float] = None,
+        min_depth_ppm: Optional[float] = None,
+        max_depth_ppm: Optional[float] = None,
+        sort: str = "score",
+        order: str = "desc",
+        offset: int = 0,
+        limit: int = 0,
+    ) -> dict:
+        labels = self.store.labels()
         rows = []
-        for meta in load_candidates(str(self.candidates)):
-            meta["_id"] = Path(meta["_json_path"]).stem
-            rows.append(present_candidate(meta))
+        for meta in self._index.refresh():
+            row = present_candidate(meta)
+            row["review_label"] = (labels.get(row["id"]) or {}).get("label")
+            rows.append(row)
+
+        def keep(row) -> bool:
+            if q and q.strip().lower() not in f"{row['tic_id']} {row['id']}".lower():
+                return False
+            if status and status.lower() not in str(row.get("status") or "").lower():
+                return False
+            if label:
+                wanted = label.lower()
+                if wanted == "unreviewed":
+                    if row.get("review_label"):
+                        return False
+                elif wanted not in {str(row.get("label") or "").lower(), str(row.get("review_label") or "").lower(),
+                                    str(row.get("discovery_status") or "").lower()}:
+                    return False
+            if flags == "none" and row["hard_flags"]:
+                return False
+            if flags == "any" and not row["hard_flags"]:
+                return False
+            for key, bound, cmp in (
+                ("sde", min_sde, "ge"), ("prob_planet", min_prob, "ge"),
+                ("period_days", min_period, "ge"), ("period_days", max_period, "le"),
+                ("depth_ppm", min_depth_ppm, "ge"), ("depth_ppm", max_depth_ppm, "le"),
+            ):
+                if bound is None:
+                    continue
+                value = row.get(key)
+                if value is None:
+                    return False
+                if cmp == "ge" and value < bound:
+                    return False
+                if cmp == "le" and value > bound:
+                    return False
+            return True
+
+        rows = [row for row in rows if keep(row)]
+        sortable = {"score", "sde", "prob_planet", "period_days", "depth_ppm", "tic_id", "updated"}
+        field = sort if sort in sortable else "score"
+        missing_last = -1e30 if order != "asc" else 1e30
 
         def sort_key(row):
-            sde = row["sde"] if row["sde"] is not None else -1e30
-            return (-sde, row["tic_id"])
+            value = row.get(field)
+            if field == "tic_id":
+                return (str(value or ""), row["id"])
+            if field == "updated":
+                return (str(row.get("timestamp") or ""), row["id"])
+            if field == "score" and value is None:
+                value = row.get("sde")
+            return (value if value is not None else missing_last, row["tic_id"])
 
-        rows.sort(key=sort_key)
-        return [_json_ready(row) for row in rows]
+        rows.sort(key=sort_key, reverse=(order != "asc"))
+        total = len(rows)
+        if limit and limit > 0:
+            rows = rows[max(offset, 0): max(offset, 0) + limit]
+        elif offset:
+            rows = rows[offset:]
+        return {"candidates": [_json_ready(row) for row in rows], "total": total}
 
     def get_candidate(self, candidate_id: str) -> Optional[dict]:
-        for meta in load_candidates(str(self.candidates)):
-            stem = Path(meta["_json_path"]).stem
-            if stem != candidate_id:
-                continue
-            meta["_id"] = stem
-            public = present_candidate(meta)
-            public["phase_curve"] = meta.get("phase_curve") or {"phase": [], "flux": []}
-            public["vetting"] = meta.get("vetting") or {}
-            return _json_ready(public)
-        return None
+        meta = self._index.get(candidate_id)
+        if meta is None:
+            return None
+        public = present_candidate(meta)
+        public["phase_curve"] = meta.get("phase_curve") or {"phase": [], "flux": []}
+        public["light_curve"] = meta.get("light_curve") or {"time": [], "flux": []}
+        public["periodogram"] = meta.get("periodogram") or {"period": [], "power": []}
+        public["odd_even_curve"] = meta.get("odd_even_curve") or {}
+        public["secondary_curve"] = meta.get("secondary_curve") or {}
+        public["vetting"] = meta.get("vetting") or {}
+        public["alt_peaks"] = meta.get("alt_peaks") or []
+        public["known_match"] = meta.get("known_match")
+        public["review"] = self.store.labels().get(candidate_id)
+        return _json_ready(public)
+
+    def label_candidate(self, candidate_id: str, label: str, note: str = "") -> dict:
+        allowed = {"planet", "false_positive", "unsure"}
+        if label not in allowed:
+            raise ValueError(f"label must be one of {sorted(allowed)}")
+        meta = self._index.get(candidate_id)
+        if meta is None:
+            raise KeyError(candidate_id)
+        snapshot = {
+            "tic_id": meta.get("tic_id"), "best_period": meta.get("best_period"),
+            "epoch": meta.get("epoch"), "sde": meta.get("sde"), "json_path": meta.get("_json_path"),
+        }
+        self.store.set_label(candidate_id, label, note, snapshot)
+        return {"candidate_id": candidate_id, "label": label, "note": note}
 
     def candidate_file(self, candidate_id: str, kind: str) -> Optional[Path]:
-        for meta in load_candidates(str(self.candidates)):
-            if Path(meta["_json_path"]).stem != candidate_id:
-                continue
-            if kind == "plot":
-                raw = meta.get("plot") or meta.get("_plot_path")
-            else:
-                raw = meta.get("difference_image")
-            if not raw:
-                return None
-            path = Path(str(raw)).resolve()
-            if path.is_file() and self._allowed(path):
-                return path
+        meta = self._index.get(candidate_id)
+        if meta is None:
+            return None
+        if kind == "plot":
+            raw = meta.get("plot") or meta.get("_plot_path")
+        elif kind == "export":
+            raw = str(self.exports / f"{candidate_id}_tfop.json")
+        else:
+            raw = meta.get("difference_image")
+        if not raw:
+            return None
+        path = Path(str(raw))
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        if path.is_file() and self._allowed(path):
+            return path
         return None
 
     def _allowed(self, path: Path) -> bool:
@@ -305,10 +451,7 @@ class Desk:
         return True
 
     def raw_candidate(self, candidate_id: str) -> Optional[dict]:
-        for meta in load_candidates(str(self.candidates)):
-            if Path(meta["_json_path"]).stem == candidate_id:
-                return meta
-        return None
+        return self._index.get(candidate_id)
 
     def export_candidate(self, candidate_id: str) -> dict:
         from exports.tfop_packet import (
@@ -351,8 +494,11 @@ class Desk:
             "candidates": [item],
         })
         out = self.exports / f"{candidate_id}_tfop.json"
-        out.write_text(json.dumps(packet, indent=2))
-        return {"epoch_btjd": epoch, "path": str(out), "packet": packet}
+        atomic_write_json(out, packet)
+        return {
+            "epoch_btjd": epoch, "path": str(out), "packet": packet,
+            "download_url": f"/api/candidates/{candidate_id}/export.json",
+        }
 
     def current_run(self) -> Optional[dict]:
         with self.lock:
@@ -377,8 +523,9 @@ class Desk:
                 "candidate_ids": [],
             }
             self.run = run
+            self.store.save_run(run)
             snapshot = copy.deepcopy(run)
-        thread = threading.Thread(target=self._execute, args=(run["id"], payload), daemon=True)
+        thread = threading.Thread(target=self._execute, args=(run["id"], payload), name=run["id"])
         thread.start()
         return snapshot
 
@@ -402,7 +549,7 @@ class Desk:
         tic_list = None
         text = payload.get("tic_csv") or ""
         if payload.get("tic_path"):
-            text = _read_user_file(payload["tic_path"])
+            text = self.read_user_file(payload["tic_path"])
         if text.strip():
             path = self.root / "tic_list.csv"
             path.write_text(text)
@@ -434,7 +581,7 @@ class Desk:
     def _execute_local(self, run_id: str, payload: dict):
         text = payload.get("light_curve_csv") or ""
         if payload.get("light_curve_path"):
-            text = _read_user_file(payload["light_curve_path"])
+            text = self.read_user_file(payload["light_curve_path"])
         if not text.strip():
             raise ValueError("A local search needs a time, flux file.")
         time, flux = read_time_flux(text)
@@ -455,6 +602,7 @@ class Desk:
         with self.lock:
             if self.run and self.run.get("id") == run_id:
                 self.run.update(fields)
+                self.store.save_run(_json_ready(self.run))
 
     def _finish(self, run_id: str, status: str, **fields):
         fields["status"] = status
@@ -462,10 +610,3 @@ class Desk:
         self._set(run_id, **fields)
 
 
-def _read_user_file(path: str) -> str:
-    file = Path(path).expanduser()
-    if not file.is_file():
-        raise ValueError(f"File not found: {path}")
-    if file.stat().st_size > 20_000_000:
-        raise ValueError("File is larger than 20 MB.")
-    return file.read_text()

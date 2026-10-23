@@ -49,6 +49,9 @@ class HuntConfig:
     with_tpf: bool = True
     prefilter: bool = True
     sequential: bool = False
+    download_workers: int = 8
+    cpu_workers: int = 4
+    bls_backend: Optional[str] = None
 
 
 @dataclass
@@ -125,11 +128,20 @@ def run_scan(config: ScanConfig) -> dict:
 
 def run_hunt(config: HuntConfig) -> dict:
     """Run the sector hunter. Parallel search is the default."""
+    from dataclasses import fields
+
     from strategy_profiles import apply_profile_to_hunt_kwargs
 
-    profile_kw = apply_profile_to_hunt_kwargs(config.strategy_profile)
-    period_min = profile_kw.get("period_min", config.period_min)
-    period_max = profile_kw.get("period_max", config.period_max)
+    # Settings the caller changed from the dataclass defaults win over the profile.
+    defaults = {f.name: f.default for f in fields(HuntConfig)}
+    explicit = {
+        name: getattr(config, name)
+        for name in ("period_min", "period_max", "nperiods", "sde_threshold", "threshold", "bls_threshold")
+        if getattr(config, name) != defaults[name]
+    }
+    profile_kw = apply_profile_to_hunt_kwargs(config.strategy_profile, explicit)
+    period_min = profile_kw["period_min"]
+    period_max = profile_kw["period_max"]
     if config.sequential:
         from hunter import run_hunt as _hunt
         return _hunt(
@@ -170,6 +182,10 @@ def run_hunt(config: HuntConfig) -> dict:
         log_file=config.log_file,
         with_tpf=config.with_tpf,
         prefilter=config.prefilter,
+        strategy_profile=config.strategy_profile,
+        download_workers=config.download_workers,
+        cpu_workers=config.cpu_workers,
+        bls_backend=config.bls_backend,
     )
 
 
@@ -414,8 +430,9 @@ def run_local_lightcurve(
         "phase_curve": _phase_curve(time, flux, period, epoch),
         "hard_flags": flags,
     })
-    with open(json_path, "w") as handle:
-        json.dump(payload, handle, indent=2, default=str)
+    from pipeline.atomic import atomic_write_json
+
+    atomic_write_json(json_path, payload)
     return {
         "saved": True,
         "id": os.path.splitext(os.path.basename(json_path))[0],
