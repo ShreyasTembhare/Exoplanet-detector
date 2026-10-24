@@ -4,18 +4,14 @@ End-to-end TESS pipeline: download light curves, detrend, run BLS (and optionall
 
 ## Run on your computer
 
-Plain `python3` and `pip` — no `uv` required.
+One command (creates `.venv`, installs deps if needed, serves the UI):
 
 ```bash
-# One-time install (creates .venv and installs requirements)
-make bootstrap
-
-# Default: one process, built UI, continuous search auto-starts
-make desk
-# then open http://127.0.0.1:8765
+./run
+# open http://127.0.0.1:8765
 ```
 
-`make desk` is the local operator UI. Continuous search starts with the desk process. Progress stays visible on every page. Pause and Stop still work; Stop turns auto-start off until you Start or Resume again.
+That is the local operator UI. Continuous search starts with it. Progress stays visible on every page. Pause and Stop still work; Stop turns auto-start off until you Start or Resume again. Data lives in `var/desk/` (override with `DESK_DATA=…`). `make desk` / `make run` call the same script.
 
 For Vite hot reload during UI work:
 

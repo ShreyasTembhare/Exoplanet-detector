@@ -1,4 +1,4 @@
-.PHONY: bootstrap test lint web-test ci hunt phunt scan train pretrain autopilot clean smoke tool desk dev completeness
+.PHONY: bootstrap test lint web-test ci hunt phunt scan train pretrain autopilot clean smoke tool desk run dev completeness
 
 PY := .venv/bin/python
 PIP := .venv/bin/pip
@@ -50,11 +50,9 @@ smoke:
 	$(PY) -m pytest tests/test_cache.py tests/test_bls.py tests/test_vetting.py -q
 
 # Default local run: one process, built UI, continuous search auto-starts.
-desk: bootstrap
-	cd web && npm install && npm run build
-	$(PY) -m tool --host 127.0.0.1 --port 8765 --auto-start
-
-tool: desk
+# Prefer: ./run
+run desk tool:
+	./run
 
 dev: bootstrap
 	cd web && npm install
