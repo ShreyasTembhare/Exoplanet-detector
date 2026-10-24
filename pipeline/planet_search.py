@@ -78,6 +78,30 @@ def _duration_days(period: float, duration_phase: float) -> float:
     return 0.05 * float(period)
 
 
+def monotransit_views(
+    time: np.ndarray, flux: np.ndarray, epoch: float, duration_days: float,
+) -> tuple:
+    """Time-domain views for a single event: the whole curve and a zoom on the dip.
+
+    Phase folding is meaningless without a period, so the global view bins the
+    unfolded curve and the local view bins +/- 3 durations around the event.
+    """
+    from .fold_features import GLOBAL_BINS, LOCAL_BINS, bin_phase_flux
+
+    t = np.asarray(time, dtype=np.float64)
+    f = np.asarray(flux, dtype=np.float64)
+    if len(t) < 10:
+        return np.ones(GLOBAL_BINS), np.ones(LOCAL_BINS)
+    span = float(np.nanmax(t) - np.nanmin(t)) or 1.0
+    global_vec = bin_phase_flux((t - np.nanmin(t)) / span * 0.999999, f, GLOBAL_BINS)
+    half = 3.0 * max(float(duration_days), 1.0 / 24.0)
+    mask = np.abs(t - float(epoch)) <= half
+    if int(np.sum(mask)) < 10:
+        return global_vec, bin_phase_flux((t - np.nanmin(t)) / span * 0.999999, f, LOCAL_BINS)
+    local_phase = (t[mask] - (float(epoch) - half)) / (2.0 * half) * 0.999999
+    return global_vec, bin_phase_flux(local_phase, f[mask], LOCAL_BINS)
+
+
 def _peak_dict(peak, vetting: dict, extras: dict) -> dict:
     flags = hard_flag_reasons(vetting)
     return {
@@ -97,13 +121,41 @@ def _peak_dict(peak, vetting: dict, extras: dict) -> dict:
     }
 
 
+def known_context(tic_id, period, epoch, known_table: Optional[dict]) -> dict:
+    """Discovery status of one orbit against the TOI / known-planet table."""
+    from .known_planets import classify_candidate
+
+    if not known_table:
+        return {}
+    status, match = classify_candidate(tic_id, period, epoch, known_table)
+    out = {"discovery_status": status, "matches_toi": status == "KNOWN"}
+    if match is not None:
+        out["known_match"] = match
+        out["matched_toi_id"] = match.get("toi", "")
+    return out
+
+
 def _vet_peak(
     time, flux, peak, *,
     tic_id, sector, tpf_time, tpf_flux_cube, ra, dec, bls_result: BLSResult,
     run_triceratops: bool,
+    use_gaia: bool = True,
+    known_table: Optional[dict] = None,
+    trend: Optional[np.ndarray] = None,
 ) -> dict:
     from .difference_image import difference_image_score
     from .fold_features import run_phase3
+    from .hard_flags import demotion
+
+    redetrended = False
+    if trend is not None and len(trend) == len(flux):
+        from .detrend import masked_redetrend
+
+        dur = _duration_days(peak.period, float(getattr(peak, "duration_phase", 0.05) or 0.05))
+        refit = masked_redetrend(time, flux, trend, peak.period, peak.epoch, dur)
+        if np.isfinite(refit).sum() > 0.9 * len(refit):
+            flux = refit
+            redetrended = True
 
     global_view, local_view, centroid, phase3_extras = run_phase3(
         time, flux, peak.period, peak.epoch,
@@ -111,12 +163,19 @@ def _vet_peak(
         bls_sde=peak.sde, bls_periods=bls_result.periods, bls_power=bls_result.power,
         tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
         ra=ra, dec=dec,
-        skip_gaia=False,
+        skip_gaia=True,
     )
     vetting = {}
     if isinstance(phase3_extras, dict):
         vetting = dict(phase3_extras.get("vetting") or {})
     vetting.setdefault("transit_center_btjd", float(peak.epoch))
+    vetting["masked_redetrend"] = redetrended
+    if use_gaia:
+        from .gaia_contamination import gaia_contamination
+
+        depth = vetting.get("depth")
+        vetting.update(gaia_contamination(ra, dec, depth=depth if isinstance(depth, (int, float)) else None))
+    vetting.update(known_context(tic_id, peak.period, peak.epoch, known_table))
     half = float(getattr(peak, "duration_phase", 0.05) or 0.05) / 2.0
     diff = {}
     if tpf_time is not None and tpf_flux_cube is not None:
@@ -136,6 +195,7 @@ def _vet_peak(
         )
         vetting["fpp"] = triceratops.get("fpp")
         vetting["nfpp"] = triceratops.get("nfpp")
+    vetting["demotion"] = demotion(vetting)
     return _peak_dict(peak, vetting, {
         "global_view": global_view,
         "local_view": local_view,
@@ -166,10 +226,17 @@ def cached_bls(
     refine_nperiods: int = 3000,
 ) -> BLSResult:
     """Phase-2 cache lookup. A second call with the same TIC/sector/grid is free."""
-    from .cache_io import get_phase2, set_phase2
+    from .bls_gpu import _select_backend
+    from .cache_io import get_phase2, phase2_variant, set_phase2
 
+    variant = phase2_variant(
+        backend=_select_backend(len(time), backend),
+        rho=round(float(rho_star_solar), 3) if adaptive_duration else 1.0,
+        adaptive=bool(adaptive_duration), topk=int(topk), two_pass=bool(two_pass),
+        coarse=int(coarse_nperiods), refine=int(refine_nperiods), n=int(len(time)), grid="ofir",
+    )
     if use_cache:
-        cached = get_phase2(tic_id, sector, period_min, period_max, nperiods)
+        cached = get_phase2(tic_id, sector, period_min, period_max, nperiods, variant=variant)
         if cached is not None:
             periods, power, best_period, epoch, peaks = cached
             sde_arr = compute_sde(power)
@@ -189,6 +256,7 @@ def cached_bls(
         set_phase2(
             tic_id, sector, period_min, period_max, nperiods,
             res.periods, res.power, res.best_period, res.epoch, peaks=res.peaks,
+            variant=variant,
         )
     return res
 
@@ -215,13 +283,20 @@ def search_with_masking(
     dec: float = float("nan"),
     known_period: Optional[float] = None,
     known_epoch: Optional[float] = None,
-    run_triceratops: bool = True,
+    run_triceratops: bool = False,
     run_monotransit: bool = True,
     two_pass: bool = True,
     coarse_nperiods: int = 2000,
     refine_nperiods: int = 3000,
+    use_gaia: bool = True,
+    known_table: Optional[dict] = None,
+    trend: Optional[np.ndarray] = None,
+    run_duotransit: bool = True,
 ) -> dict:
     """BLS, vet every SDE-pass peak, mask accepted transits, then MES.
+
+    TRICERATOPS is off by default: it takes minutes per peak, so it runs on
+    the top-scored shortlist afterwards (:mod:`pipeline.shortlist`).
 
     Returns ``signals`` (periodic, possibly several), ``monotransit`` or
     None, and the first :class:`BLSResult` (``bls``).
@@ -253,7 +328,7 @@ def search_with_masking(
             break
         if use_tls:
             refinements = tls_on_sde_peaks(time, work, passing, sde_threshold, max_peaks=3)
-            for peak, refined in zip(passing, refinements):
+            for peak, refined in zip(passing[:len(refinements)], refinements):
                 if getattr(refined, "available", False) and refined.sde > peak.sde:
                     peak.period = float(refined.period)
                     peak.epoch = float(refined.epoch)
@@ -266,6 +341,7 @@ def search_with_masking(
                 tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
                 ra=ra, dec=dec, bls_result=res,
                 run_triceratops=run_triceratops,
+                use_gaia=use_gaia, known_table=known_table, trend=trend,
             )
             signals.append(signal)
             if accepted is None and accepts_for_reseach(signal["vetting"], peak.sde, sde_threshold):
@@ -293,6 +369,17 @@ def search_with_masking(
                 if dist < _duration_days(sig["period"], sig["duration_phase"]):
                     mono = None
                     break
+        if mono is not None and run_duotransit:
+            from .duotransit import find_duotransit
+
+            duo = find_duotransit(time, work, min_alias_period=max(period_max, 15.0) / 2.0,
+                                  rho_star_solar=rho_star_solar)
+            if duo is not None:
+                mono = duo
+        if mono is not None:
+            gv, lv = monotransit_views(time, work, mono["epoch"], mono["duration_days"])
+            mono["global_view"] = gv
+            mono["local_view"] = lv
 
     return {
         "signals": signals,

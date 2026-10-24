@@ -90,14 +90,29 @@ def transit_depth_and_duration(
     return float(max(best_depth, 0.0)), float(best_dur)
 
 
-def count_transits(time: np.ndarray, period: float, epoch: float) -> int:
-    """How many transit *events* fall within the time series."""
+def count_transits(
+    time: np.ndarray, period: float, epoch: float,
+    duration_days: Optional[float] = None, min_points: int = 3,
+) -> int:
+    """How many transit events were actually observed.
+
+    An event counts only when at least ``min_points`` cadences fall inside its
+    window, so data gaps (sector breaks, momentum dumps) do not inflate the
+    count the way ``span / period`` does.
+    """
     t = np.asarray(time, dtype=np.float64)
-    if len(t) == 0 or period <= 0:
+    t = t[np.isfinite(t)]
+    if len(t) == 0 or not np.isfinite(period) or period <= 0 or not np.isfinite(epoch):
         return 0
-    n_min = int(np.floor((np.nanmin(t) - epoch) / period))
-    n_max = int(np.ceil((np.nanmax(t) - epoch) / period))
-    return max(0, n_max - n_min)
+    if duration_days is None or not np.isfinite(duration_days) or duration_days <= 0:
+        duration_days = 0.05 * period
+    half = 0.5 * float(duration_days)
+    cycle = np.round((t - epoch) / period)
+    in_window = np.abs(t - (epoch + cycle * period)) <= half
+    if not np.any(in_window):
+        return 0
+    _, counts = np.unique(cycle[in_window], return_counts=True)
+    return int(np.sum(counts >= int(min_points)))
 
 
 def odd_even_depth_ratio(
@@ -311,7 +326,8 @@ def compute_vetting_metrics(
     m.depth = depth
     m.duration_phase = dur_phase
     m.duration_hours = float(dur_phase * period * 24.0) if np.isfinite(dur_phase) else float("nan")
-    m.n_transits = count_transits(time, period, epoch)
+    dur_days = dur_phase * period if np.isfinite(dur_phase) and dur_phase > 0 else None
+    m.n_transits = count_transits(time, period, epoch, duration_days=dur_days)
     m.odd_even_ratio = odd_even_depth_ratio(time, flux, period, epoch, half_width=half_width)
     m.secondary_depth, m.secondary_significance = secondary_eclipse(time, flux, period, epoch, half_width=half_width)
     m.v_shape_score = v_shape_score(time, flux, period, epoch, half_width=half_width)

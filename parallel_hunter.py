@@ -37,13 +37,14 @@ queue depth and per-stage throughput are written to ``hunter_timings.csv``.
 from __future__ import annotations
 
 import argparse
+import collections
 import gc
 import logging
 import queue
 import sys
 import threading
 import time as _time
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -93,7 +94,8 @@ def _phase1_worker(tic_id: str, sector: int, with_tpf: bool) -> Optional[dict]:
 
 def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: int,
                    sde_threshold: float, prefilter_on: bool, backend: Optional[str],
-                   adaptive_duration: bool, use_tls: bool = True) -> Optional[dict]:
+                   adaptive_duration: bool, use_tls: bool = True,
+                   run_triceratops: bool = False, known_table: Optional[dict] = None) -> Optional[dict]:
     """Prefilter, cached BLS, vet SDE-pass peaks, mask-and-research, monotransit MES.
 
     The phase-2 cache is consulted first so a second pass over the same
@@ -130,10 +132,13 @@ def _phase2_worker(item: dict, period_min: float, period_max: float, nperiods: i
             use_tls=use_tls,
             tpf_time=item.get("tpf_time"),
             tpf_flux_cube=item.get("tpf_flux_cube"),
-            ra=float(meta.get("ra", float("nan"))),
-            dec=float(meta.get("dec", float("nan"))),
+            ra=item.get("ra", float("nan")),
+            dec=item.get("dec", float("nan")),
             known_period=known_period,
             known_epoch=known_epoch,
+            run_triceratops=run_triceratops,
+            known_table=known_table,
+            trend=meta.get("trend"),
         )
         item["phase2_ms"] = (_time.time() - t0) * 1000
         item["bls"] = found.get("bls")
@@ -159,6 +164,40 @@ def _phase3_worker(item: dict) -> Optional[dict]:
         return item
     item["phase3_ms"] = item.get("phase3_ms", 0.0)
     return item
+
+
+def triage_keep(items: List[dict], period_min: float, period_max: float,
+                min_sde: float, n_periods: int = 2000, max_points: int = 4000) -> List[bool]:
+    """Coarse batched BLS over many stars; True for stars worth a full search.
+
+    Curves are binned to ``max_points`` so padding stays small; a failure in
+    the batch keeps every star rather than silently dropping them.
+    """
+    import numpy as np
+
+    from pipeline.bls_gpu import bls_power_batch
+    from pipeline.period_grid import log_periods
+
+    if not items:
+        return []
+    curves = []
+    for item in items:
+        t = np.asarray(item["time"], dtype=np.float64)
+        f = np.asarray(item["flux"], dtype=np.float64)
+        ok = np.isfinite(t) & np.isfinite(f)
+        t, f = t[ok], f[ok]
+        if len(t) > max_points:
+            step = int(np.ceil(len(t) / max_points))
+            n = (len(t) // step) * step
+            t = t[:n].reshape(-1, step).mean(axis=1)
+            f = f[:n].reshape(-1, step).mean(axis=1)
+        curves.append((t, f))
+    try:
+        results = bls_power_batch(curves, log_periods(period_min, period_max, n_periods))
+    except Exception as exc:
+        logger.warning("triage batch failed, keeping all %d stars: %s", len(items), exc)
+        return [True] * len(items)
+    return [r["sde"] >= min_sde for r in results]
 
 
 # ---------------------------------------------------------------------------
@@ -188,17 +227,36 @@ def run_parallel_hunt(
     infer_batch_size: int = 32,
     queue_depth: int = 32,
     use_tls: bool = True,
+    strategy_profile: str = "",
+    resume: bool = True,
+    run_triceratops: bool = False,
+    shortlist_n: int = 5,
+    triage_sde: float = 0.0,
+    triage_batch: int = 64,
 ) -> Dict[str, Any]:
-    """Run a sector hunt with the producer-consumer pipeline above."""
+    """Run a sector hunt with the producer-consumer pipeline above.
+
+    ``triage_sde > 0`` enables a batched coarse BLS pass (one compiled kernel
+    over ``triage_batch`` stars) that drops stars whose best coarse SDE is
+    below the threshold before the full search. It trades sensitivity to
+    single transits for throughput, so it is off by default.
+
+    With ``resume`` (default) stars already finished in ``log_file`` are
+    skipped and errored stars are retried up to ``MAX_ERROR_ATTEMPTS`` times.
+    """
     from hunter import (
         STAGE_DONE,
         _append_log,
         _ensure_setup,
+        _evidence_for,
         _load_model,
+        _load_progress,
         _normalize_tic,
         _predict_batch,
         _save_candidate_evidence,
         _save_candidate_plot,
+        _should_skip_stage,
+        sky_coords,
         status_for_probability,
     )
     from pipeline.target_rank import TargetRecord
@@ -207,8 +265,22 @@ def run_parallel_hunt(
         targets = [TargetRecord(tic_id=str(tic)) for tic in (tics or [])]
     log_file = log_file or f"processed_stars_s{sector:03d}.txt"
     _ensure_setup(log_file, candidate_dir)
+    skipped = 0
+    if resume:
+        progress = _load_progress(log_file)
+        pending = [t for t in targets if not _should_skip_stage(progress, t.tic_norm, "predict")]
+        skipped = len(targets) - len(pending)
+        if skipped:
+            logger.info("Resume: %d of %d stars already done in %s", skipped, len(targets), log_file)
+        targets = pending
 
+    from pipeline.known_planets import load_known_ephemerides
+
+    known_table = load_known_ephemerides()
     model, device = _load_model(checkpoint) if checkpoint else (None, None)
+    from pipeline import second_stage
+
+    vetter = second_stage.load_vetter()
     if model is None:
         logger.warning(
             "No checkpoint at %s. SDE-pass stars will be saved as CANDIDATE_SDE with vetting JSON.",
@@ -228,73 +300,101 @@ def run_parallel_hunt(
         timings_path.write_text("TIC_ID,PHASE1_MS,PHASE2_MS,PHASE3_MS,PREDICT_MS,TOTAL_MS,SDE,STATUS\n")
 
     # --- Stage 1: download pool ---
-    def producer():
-        with ThreadPoolExecutor(max_workers=download_workers) as ex:
-            futures = {
-                ex.submit(_phase1_worker, f"TIC {target.tic_norm}", sector, with_tpf): target
-                for target in targets
-            }
-            for fut in futures:
-                target = futures[fut]
-                try:
-                    item = fut.result()
-                except Exception as exc:
-                    logger.warning("download fail %s: %s", target.tic_norm, exc)
-                    item = None
-                if item is None:
-                    _append_log(log_file, target.tic_norm, STAGE_DONE, "ERROR: phase1 failed")
-                    continue
-                if target.queue == "second_pass" and target.known_period == target.known_period:
-                    item["mask_period"] = float(target.known_period)
-                    item["mask_epoch"] = (
-                        float(target.known_epoch) if target.known_epoch == target.known_epoch else None
-                    )
-                item["tic_start"] = _time.time()
+    def _handle_download(fut, target):
+        try:
+            item = fut.result()
+        except Exception as exc:
+            logger.warning("download fail %s: %s", target.tic_norm, exc)
+            item = None
+        if item is None:
+            _append_log(log_file, target.tic_norm, STAGE_DONE, "ERROR: phase1 failed")
+            return
+        if target.queue == "second_pass" and target.known_period == target.known_period:
+            item["mask_period"] = float(target.known_period)
+            item["mask_epoch"] = (
+                float(target.known_epoch) if target.known_epoch == target.known_epoch else None
+            )
+        item["ra"], item["dec"] = sky_coords(target, item.get("meta"))
+        item["tic_start"] = _time.time()
+        if triage_sde > 0:
+            triage_buffer.append(item)
+            if len(triage_buffer) >= triage_batch:
+                _flush_triage()
+        else:
+            q_phase2.put(item)
+
+    triage_buffer: List[dict] = []
+
+    def _flush_triage():
+        batch = list(triage_buffer)
+        triage_buffer.clear()
+        for item, keep in zip(batch, triage_keep(batch, period_min, period_max, triage_sde)):
+            if keep:
                 q_phase2.put(item)
+            else:
+                _append_log(log_file, item["tic_id"], STAGE_DONE, "TRIAGED: coarse SDE below threshold")
+
+    def producer():
+        # Bounded in-flight downloads: submitting the whole sector at once
+        # spikes memory and MAST load while BLS is the real bottleneck.
+        max_inflight = max(download_workers * 2, 1)
+        with ThreadPoolExecutor(max_workers=download_workers) as ex:
+            inflight: "collections.deque" = collections.deque()
+            for target in targets:
+                inflight.append((ex.submit(_phase1_worker, f"TIC {target.tic_norm}", sector, with_tpf), target))
+                while len(inflight) >= max_inflight:
+                    _handle_download(*inflight.popleft())
+            while inflight:
+                _handle_download(*inflight.popleft())
+        if triage_buffer:
+            _flush_triage()
         q_phase2.put(SENTINEL)
 
-    # --- Stage 2: BLS in main thread (single GPU) ---
+    # --- Stage 2: BLS. One worker owns the GPU; CPU backends get several. ---
+    from pipeline.bls_gpu import _select_backend
+
+    gpu_backend = _select_backend(0, bls_backend) in ("jax", "cuvarbase")
+    n_bls_workers = 1 if gpu_backend else max(int(cpu_workers), 1)
+    bls_done = {"count": 0}
+    bls_lock = threading.Lock()
+
     def bls_consumer():
         while True:
             item = q_phase2.get()
             if item is SENTINEL:
-                q_phase3.put(SENTINEL)
+                q_phase2.put(SENTINEL)
+                with bls_lock:
+                    bls_done["count"] += 1
+                    last = bls_done["count"] == n_bls_workers
+                if last:
+                    q_phase3.put(SENTINEL)
                 return
             item = _phase2_worker(
                 item, period_min, period_max, nperiods,
                 sde_threshold, prefilter, bls_backend, adaptive_duration, use_tls,
+                run_triceratops, known_table,
             )
             if "status" in item:
                 _drain_failed(item, log_file, timings_path)
                 continue
             q_phase3.put(item)
 
-    # --- Stage 3: folding + vetting on CPU pool ---
+    # --- Stage 3: folding + vetting already ran per peak inside stage 2, so
+    # this stage streams items through instead of pickling them to a pool.
     def fold_consumer():
-        with ProcessPoolExecutor(max_workers=cpu_workers) if cpu_workers > 1 else _NullPool() as ex:
-            inflight = []
-            while True:
-                item = q_phase3.get()
-                if item is SENTINEL:
-                    break
-                if isinstance(ex, _NullPool):
-                    inflight.append((_phase3_worker(item), item))
-                else:
-                    inflight.append((ex.submit(_phase3_worker, item), item))
-
-            for fut, _orig in inflight:
-                try:
-                    if hasattr(fut, "result"):
-                        result_item = fut.result()
-                    else:
-                        result_item = fut
-                except Exception as exc:
-                    logger.warning("fold worker error: %s", exc)
-                    continue
-                if "status" in result_item:
-                    _drain_failed(result_item, log_file, timings_path)
-                    continue
-                q_predict.put(result_item)
+        while True:
+            item = q_phase3.get()
+            if item is SENTINEL:
+                break
+            try:
+                result_item = _phase3_worker(item)
+            except Exception as exc:
+                logger.warning("fold worker error: %s", exc)
+                continue
+            if "status" in result_item:
+                _drain_failed(result_item, log_file, timings_path)
+                continue
+            q_predict.put(result_item)
         q_predict.put(SENTINEL)
 
     # --- Stage 4: batched inference on GPU ---
@@ -321,19 +421,22 @@ def run_parallel_hunt(
                 "epoch": mono["epoch"],
                 "sde": mono["mes"],
                 "power": 0.0,
-                "global_view": None,
-                "local_view": None,
+                "global_view": mono.get("global_view"),
+                "local_view": mono.get("local_view"),
+                "skip_classifier": True,
                 "centroid_offset": float("nan"),
                 "vetting": {
                     "depth": mono["depth"],
                     "duration_hours": mono["duration_days"] * 24.0,
-                    "n_transits": 1,
+                    "n_transits": len(mono.get("epochs") or [mono["epoch"]]),
                     "transit_center_btjd": mono["epoch"],
                     "mes": mono["mes"],
-                    "kind": "monotransit",
+                    "kind": mono.get("kind", "monotransit"),
+                    "epochs": mono.get("epochs"),
+                    "aliases": mono.get("aliases"),
                 },
-                "hard_flags": ["n_transits"],
-                "kind": "monotransit",
+                "hard_flags": [] if mono.get("kind") == "duotransit" else ["n_transits"],
+                "kind": mono.get("kind", "monotransit"),
             })
         rows = []
         for sig in signals:
@@ -342,12 +445,14 @@ def run_parallel_hunt(
             rows.append({
                 "global_view": sig.get("global_view"),
                 "local_view": sig.get("local_view"),
+                "skip_classifier": bool(sig.get("skip_classifier")),
                 "centroid_offset": sig.get("centroid_offset"),
                 "period": sig.get("period"),
                 "epoch": sig.get("epoch"),
                 "sde": sig.get("sde"),
                 "power": sig.get("power") or 0.0,
                 "vetting": vetting,
+                "evidence": _evidence_for(item["time"], item["flux"], sig, item.get("bls")),
                 "tic_id": item["tic_id"],
                 "time": item["time"],
                 "flux": item["flux"],
@@ -373,12 +478,19 @@ def run_parallel_hunt(
         predictable = [
             row for row in rows
             if row["global_view"] is not None and row["local_view"] is not None
+            and not row.get("skip_classifier")
         ]
         t0 = _time.time()
         if model is None or not predictable:
             pred_probs = [None] * len(predictable)
         else:
             pred_probs = _predict_batch(model, device, predictable)
+        if vetter is not None and predictable:
+            second = second_stage.vet(vetter, predictable)
+            for row, p2 in zip(predictable, second):
+                if p2 is not None:
+                    row["vetting"]["exominer_prob"] = p2
+            pred_probs = [second_stage.combine(p, p2) for p, p2 in zip(pred_probs, second)]
         per_item_ms = (_time.time() - t0) * 1000 / max(len(rows), 1)
         prob_by_id = {id(row): prob for row, prob in zip(predictable, pred_probs)}
         seen_tics = set()
@@ -396,7 +508,8 @@ def run_parallel_hunt(
                     prob, float(row["power"] or 0.0), float(row["sde"]),
                     row["centroid_offset"] if row["centroid_offset"] == row["centroid_offset"] else 0.0,
                     plot_path, vetting=row["vetting"], peaks=row["peaks"],
-                    strategy_profile="parallel", epoch=row["epoch"],
+                    strategy_profile=strategy_profile or "balanced", epoch=row["epoch"],
+                    evidence=row.get("evidence"), views=row,
                 )
                 candidates.append({
                     "tic_id": row["tic_id"], "period": row["period"],
@@ -418,34 +531,32 @@ def run_parallel_hunt(
         gc.collect()
 
     threads = [
-        threading.Thread(target=producer, name="downloader", daemon=True),
-        threading.Thread(target=bls_consumer, name="bls", daemon=True),
-        threading.Thread(target=fold_consumer, name="fold", daemon=True),
-        threading.Thread(target=predict_consumer, name="predict", daemon=True),
+        threading.Thread(target=producer, name="downloader"),
+        *[threading.Thread(target=bls_consumer, name=f"bls-{i}") for i in range(n_bls_workers)],
+        threading.Thread(target=fold_consumer, name="fold"),
+        threading.Thread(target=predict_consumer, name="predict"),
     ]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
 
+    if shortlist_n and not run_triceratops:
+        try:
+            from pipeline.shortlist import validate_shortlist
+
+            validate_shortlist(candidate_dir, n=shortlist_n)
+        except Exception as exc:
+            logger.warning("Shortlist validation skipped: %s", exc)
+
     elapsed = _time.time() - hunt_start
     rate = completed / max(elapsed / 3600.0, 1e-6)
     logger.info("Parallel hunt complete: %d stars in %.1f min (%.0f stars/h, %d candidates)",
                 completed, elapsed / 60, rate, len(candidates))
     return {
-        "completed": completed, "candidates": candidates,
+        "completed": completed, "skipped": skipped, "candidates": candidates,
         "elapsed_seconds": elapsed, "stars_per_hour": rate,
     }
-
-
-class _NullPool:
-    """Fallback "pool" that runs work in the calling thread (cpu_workers=1)."""
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        return False
 
 
 def _drain_failed(item: dict, log_file: str, timings_path: Path):
@@ -478,11 +589,12 @@ def main():
     parser.add_argument("--download-workers", type=int, default=8)
     parser.add_argument("--cpu-workers", type=int, default=4)
     parser.add_argument("--queue-depth", type=int, default=32)
-    parser.add_argument("--threshold", type=float, default=0.85)
-    parser.add_argument("--sde-threshold", type=float, default=7.0)
-    parser.add_argument("--period-min", type=float, default=0.5)
-    parser.add_argument("--period-max", type=float, default=15.0)
-    parser.add_argument("--nperiods", type=int, default=10000)
+    parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--sde-threshold", type=float, default=None)
+    parser.add_argument("--period-min", type=float, default=None)
+    parser.add_argument("--period-max", type=float, default=None)
+    parser.add_argument("--nperiods", type=int, default=None)
+    parser.add_argument("--strategy-profile", type=str, default=None)
     parser.add_argument("--checkpoint", type=str, default="models/checkpoints/resnet1d.pt")
     parser.add_argument("--candidate-dir", type=str, default="candidates")
     parser.add_argument("--no-tpf", action="store_true")
@@ -493,8 +605,15 @@ def main():
     args = parser.parse_args()
 
     from hunter import _get_ranked_queue
+    from strategy_profiles import DEFAULT_PROFILE, apply_profile_to_hunt_kwargs
+
+    search = apply_profile_to_hunt_kwargs(args.strategy_profile or DEFAULT_PROFILE, {
+        "threshold": args.threshold, "sde_threshold": args.sde_threshold,
+        "period_min": args.period_min, "period_max": args.period_max,
+        "nperiods": args.nperiods,
+    })
     ranked = _get_ranked_queue(
-        args.sector, args.limit, args.tic_list, args.period_min, args.period_max,
+        args.sector, args.limit, args.tic_list, search["period_min"], search["period_max"],
     )
     targets = ranked.search_order()
     if not targets:
@@ -503,11 +622,12 @@ def main():
     return run_parallel_hunt(
         sector=args.sector,
         targets=targets,
-        period_min=args.period_min,
-        period_max=args.period_max,
-        nperiods=args.nperiods,
-        sde_threshold=args.sde_threshold,
-        threshold=args.threshold,
+        period_min=search["period_min"],
+        period_max=search["period_max"],
+        nperiods=search["nperiods"],
+        sde_threshold=search["sde_threshold"],
+        threshold=search["threshold"],
+        strategy_profile=args.strategy_profile or DEFAULT_PROFILE,
         checkpoint=args.checkpoint,
         candidate_dir=args.candidate_dir,
         download_workers=args.download_workers,

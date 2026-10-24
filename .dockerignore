@@ -1,0 +1,12 @@
+.git
+.venv
+venv
+web/node_modules
+var
+cache
+candidates
+data
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache

@@ -7,6 +7,18 @@ on:
     branches: [main, master]
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Ruff
+        run: |
+          pip install ruff
+          ruff check .
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -22,18 +34,40 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install lightweight test dependencies
+      - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas scipy astropy pytest ruff batman-package fastapi httpx
-          # Skip heavy deps (jax, lightkurve) for unit tests; the test
-          # suite only needs them in optional codepaths and gracefully degrades.
+          pip install "numpy<2" pandas scipy astropy pytest batman-package fastapi httpx \
+            matplotlib scikit-learn tqdm
+          # jax, lightkurve and TLS are optional at test time; their code paths degrade.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Lint
-        run: |
-          ruff check . || true
-
       - name: Run unit tests
+        env:
+          HUNT_SECTOR_WATCH: "0"
+          HUNT_COMPLETENESS_HOURS: "0"
         run: |
           python -m pytest tests -q
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: Vitest
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Built UI is committed
+        working-directory: .
+        run: |
+          git diff --stat --exit-code -- tool/static || {
+            echo "tool/static is stale: run 'npm run build' in web/ and commit the result."; exit 1; }

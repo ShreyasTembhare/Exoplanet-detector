@@ -1,10 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { AuthError, api, authed, getToken, setToken } from "./api.js";
+import { Bars, Chart } from "./charts.jsx";
+import {
+  INBOX_DEFAULTS, demotionText, fmt, fmtDuration, formatHash, inboxQuery, mergeLines, parseHash, statusLabel,
+} from "./lib.js";
 
 const STEPS = [
   { id: "live", title: "Live" },
   { id: "queue", title: "Queue" },
   { id: "inbox", title: "Inbox" },
   { id: "review", title: "Review" },
+  { id: "stats", title: "Throughput" },
 ];
 
 const FLAG_LABEL = {
@@ -14,389 +20,291 @@ const FLAG_LABEL = {
   n_transits: "n transits",
 };
 
-function fmt(value, digits) {
-  if (value === null || value === undefined || Number.isNaN(Number(value))) return "—";
-  return Number(value).toFixed(digits);
+const PAGE_SIZE = 50;
+
+function useHashRoute() {
+  const [route, setRoute] = useState(() => parseHash(window.location.hash));
+  useEffect(() => {
+    const onChange = () => setRoute(parseHash(window.location.hash));
+    window.addEventListener("hashchange", onChange);
+    return () => window.removeEventListener("hashchange", onChange);
+  }, []);
+  const go = useCallback((view, options) => {
+    const next = formatHash(view, options);
+    if (window.location.hash !== next) window.location.hash = next;
+    else setRoute(parseHash(next));
+  }, []);
+  return [route, go];
 }
 
-function statusLabel(status) {
-  const raw = (status || "idle").toLowerCase();
-  if (raw === "running") return "RUNNING";
-  if (raw === "paused") return "PAUSED";
-  if (raw === "stopped") return "STOPPED";
-  if (raw === "failed") return "FAILED";
-  if (raw === "done") return "DONE";
-  return "IDLE";
+// Live log + progress over server-sent events, with a polling fallback.
+function useLiveStream(enabled, onError) {
+  const [lines, setLines] = useState([]);
+  const [progress, setProgress] = useState(null);
+  const [state, setState] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const lastId = useRef(0);
+
+  const refreshState = useCallback(async () => {
+    const body = await api("/api/continuous?limit=300");
+    setState(body);
+    setProgress(body.progress || null);
+    setLines((prev) => {
+      const merged = mergeLines(prev, body.lines || []);
+      if (merged.length) lastId.current = merged[merged.length - 1].id || lastId.current;
+      return merged;
+    });
+    return body;
+  }, []);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    let source = null;
+    let poll = null;
+    let retry = null;
+    let closed = false;
+    refreshState().catch(onError);
+
+    const open = () => {
+      if (closed) return;
+      if (typeof window.EventSource !== "function") {
+        poll = setInterval(() => refreshState().catch(onError), 3000);
+        return;
+      }
+      source = new window.EventSource(authed(`/api/stream?after_id=${lastId.current}`));
+      source.addEventListener("open", () => setConnected(true));
+      source.addEventListener("lines", (event) => {
+        const incoming = JSON.parse(event.data);
+        setLines((prev) => mergeLines(prev, incoming));
+        if (incoming.length) lastId.current = incoming[incoming.length - 1].id;
+      });
+      source.addEventListener("progress", (event) => setProgress(JSON.parse(event.data)));
+      source.addEventListener("error", () => {
+        setConnected(false);
+        source.close();
+        // Reopen from the newest id we have, so nothing is replayed.
+        retry = setTimeout(open, 3000);
+      });
+    };
+    open();
+    const stateTimer = setInterval(() => refreshState().catch(() => {}), 15000);
+    return () => {
+      closed = true;
+      if (source) source.close();
+      clearInterval(poll);
+      clearTimeout(retry);
+      clearInterval(stateTimer);
+    };
+  }, [enabled, refreshState, onError]);
+
+  const loadOlder = useCallback(async () => {
+    const first = lines.length ? lines[0].id : null;
+    if (!first) return 0;
+    const body = await api(`/api/continuous/events?before_id=${first}&limit=200`);
+    setLines((prev) => mergeLines(body.lines || [], prev, 5000));
+    return (body.lines || []).length;
+  }, [lines]);
+
+  return { lines, progress, state, setState, connected, refreshState, loadOlder };
 }
 
-async function api(path, options) {
-  const response = await fetch(path, options);
-  const text = await response.text();
-  let body = null;
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = { detail: text.slice(0, 240) };
-    }
-  }
-  if (!response.ok) {
-    const detail = body && body.detail ? body.detail : response.statusText;
-    throw new Error(typeof detail === "string" ? detail : "Request failed");
-  }
-  return body;
-}
-
-function PhaseChart({ curve }) {
-  const phase = (curve && curve.phase) || [];
-  const flux = (curve && curve.flux) || [];
-  if (phase.length < 2) {
-    return <p className="quiet">No phase curve was saved with this candidate.</p>;
-  }
-  const width = 720;
-  const height = 220;
-  const pad = { l: 44, r: 12, t: 12, b: 28 };
-  const min = Math.min(...flux);
-  const max = Math.max(...flux);
-  const span = Math.max(max - min, 1e-6);
-  const x = (p) => pad.l + p * (width - pad.l - pad.r);
-  const y = (f) => pad.t + ((max - f) / span) * (height - pad.t - pad.b);
-  const d = phase.map((p, i) => `${i === 0 ? "M" : "L"}${x(p).toFixed(1)},${y(flux[i]).toFixed(1)}`).join(" ");
+function TokenGate({ onSaved }) {
+  const [value, setValue] = useState("");
   return (
-    <svg className="fold" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Phase-folded light curve">
-      <line x1={pad.l} y1={height - pad.b} x2={width - pad.r} y2={height - pad.b} />
-      <line x1={pad.l} y1={pad.t} x2={pad.l} y2={height - pad.b} />
-      <path d={d} />
-      <text x={pad.l} y={height - 8}>0</text>
-      <text x={width - pad.r - 8} y={height - 8}>1</text>
-      <text x={8} y={pad.t + 8}>flux</text>
-    </svg>
+    <section className="gate">
+      <h1>Desk token</h1>
+      <p className="lede">This desk is reachable over the network, so it asks for the token set in <code>DESK_TOKEN</code>.</p>
+      <form
+        className="form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          setToken(value.trim());
+          onSaved();
+        }}
+      >
+        <label className="wide">
+          Token
+          <input type="password" autoComplete="current-password" value={value} onChange={(e) => setValue(e.target.value)} />
+        </label>
+        <button type="submit" disabled={!value.trim()}>Unlock</button>
+      </form>
+    </section>
   );
 }
 
-function ProgressStrip({ continuous, candidates }) {
-  const progress = (continuous && continuous.progress) || continuous || {};
-  const status = statusLabel(progress.status || (continuous && continuous.status) || "idle");
-  const target = progress.current_target || continuous?.current_target || "—";
-  const stars = progress.stars_done ?? continuous?.stars_done ?? 0;
-  const found = progress.candidates_found ?? continuous?.candidates_found ?? candidates.length;
-  const last = progress.last_log_line || continuous?.last_log_line || continuous?.message || "Waiting for the first log line.";
-  const rate = progress.stars_per_hour;
+function ProgressStrip({ progress, connected }) {
+  const p = progress || {};
+  const raw = (p.status || "idle").toLowerCase();
   return (
-    <header className={`strip status-${(progress.status || continuous?.status || "idle").toLowerCase()}`}>
-      <p className={`pill ${(progress.status || continuous?.status || "idle").toLowerCase()}`}>{status}</p>
+    <header className={`strip status-${raw}`}>
+      <p className={`pill ${raw}`}>{statusLabel(raw)}</p>
       <div className="strip-metrics">
-        <span><em>Target</em> {target || "—"}</span>
-        <span><em>Stars</em> {stars}</span>
-        <span><em>Candidates</em> {found}</span>
-        {rate != null && rate > 0 ? <span><em>Rate</em> {fmt(rate, 1)}/h</span> : null}
+        <span><em>Target</em> {p.current_target || "—"}</span>
+        <span><em>Stars</em> {p.stars_done ?? 0}</span>
+        <span><em>Candidates</em> {p.candidates_found ?? 0}</span>
+        {p.stars_per_hour > 0 ? <span><em>Rate</em> {fmt(p.stars_per_hour, 1)}/h</span> : null}
+        {p.eta_seconds ? <span><em>ETA</em> {fmtDuration(p.eta_seconds)}</span> : null}
+        <span className={connected ? "live-dot on" : "live-dot"} title={connected ? "Live stream connected" : "Reconnecting"}>
+          {connected ? "live" : "offline"}
+        </span>
       </div>
-      <p className="strip-log" title={last}>{last}</p>
+      <p className="strip-log" title={p.last_log_line || ""}>{p.last_log_line || p.message || "Waiting for the first log line."}</p>
     </header>
   );
 }
 
 export default function App() {
-  const [step, setStep] = useState("live");
+  const [route, go] = useHashRoute();
   const [health, setHealth] = useState(null);
+  const [needToken, setNeedToken] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
   const [queue, setQueue] = useState(null);
-  const [candidates, setCandidates] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [detail, setDetail] = useState(null);
   const [run, setRun] = useState(null);
   const [limit, setLimit] = useState(10);
-  const [tableText, setTableText] = useState("");
-  const [tablePath, setTablePath] = useState("");
   const [sector, setSector] = useState(1);
   const [sde, setSde] = useState(7);
-  const [curveText, setCurveText] = useState("");
-  const [curvePath, setCurvePath] = useState("");
-  const [ticId, setTicId] = useState("local");
-  const [notice, setNotice] = useState("");
-  const [exportResult, setExportResult] = useState(null);
-  const [busy, setBusy] = useState(false);
-  const [continuous, setContinuous] = useState(null);
-  const [curveDir, setCurveDir] = useState("");
 
-  const refreshCandidates = useCallback(async () => {
-    const body = await api("/api/candidates");
-    setCandidates(body.candidates);
-    return body.candidates;
-  }, []);
-
-  const refreshContinuous = useCallback(async () => {
-    const body = await api("/api/continuous");
-    setContinuous(body);
-    return body;
+  const report = useCallback((error) => {
+    if (error instanceof AuthError) return;
+    setNotice(error && error.message ? error.message : String(error));
   }, []);
 
   useEffect(() => {
-    api("/api/health").then(setHealth).catch((error) => setNotice(error.message));
-    api("/api/queue").then((body) => setQueue(body.queue)).catch(() => {});
-    api("/api/runs/current").then((body) => setRun(body.run)).catch(() => {});
-    refreshContinuous().catch(() => {});
-    refreshCandidates().catch((error) => setNotice(error.message));
-  }, [refreshCandidates, refreshContinuous]);
+    const onAuth = () => setNeedToken(true);
+    window.addEventListener("desk-auth-required", onAuth);
+    return () => window.removeEventListener("desk-auth-required", onAuth);
+  }, []);
 
-  const continuousStatus = continuous ? continuous.status : "idle";
-
-  useEffect(() => {
-    const timer = setInterval(() => {
-      refreshContinuous()
-        .then(() => refreshCandidates().catch(() => {}))
-        .catch((error) => setNotice(error.message));
-      if (run && run.status === "running") {
-        api("/api/runs/current")
-          .then((body) => {
-            setRun(body.run);
-            if (body.run && body.run.status !== "running") refreshCandidates();
-          })
-          .catch(() => {});
-      }
-    }, 1200);
-    return () => clearInterval(timer);
-  }, [refreshContinuous, refreshCandidates, run]);
-
-  useEffect(() => {
-    if (!selected) {
-      setDetail(null);
-      return undefined;
-    }
-    let cancelled = false;
-    api(`/api/candidates/${selected}`)
+  const boot = useCallback(() => {
+    api("/api/health")
       .then((body) => {
-        if (!cancelled) setDetail(body);
+        setHealth(body);
+        setNeedToken(Boolean(body.auth_required && !getToken()));
       })
-      .catch((error) => setNotice(error.message));
-    return () => {
-      cancelled = true;
-    };
-  }, [selected]);
+      .catch(report);
+  }, [report]);
+  useEffect(boot, [boot]);
 
-  async function onRank(event) {
-    event.preventDefault();
+  const ready = Boolean(health) && !needToken;
+  const live = useLiveStream(ready, report);
+
+  useEffect(() => {
+    if (!ready) return;
+    api("/api/queue").then((body) => setQueue(body.queue)).catch(report);
+    api("/api/runs/current").then((body) => setRun(body.run)).catch(report);
+  }, [ready, report]);
+
+  useEffect(() => {
+    if (!ready || !run || run.status !== "running") return undefined;
+    const timer = setInterval(() => {
+      api("/api/runs/current").then((body) => setRun(body.run)).catch(report);
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [ready, run, report]);
+
+  async function action(fn) {
     setNotice("");
     setBusy(true);
     try {
-      const body = await api("/api/queue/rank", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          csv: tableText,
-          path: tablePath || null,
-          limit: Number(limit),
-          period_min: 0.5,
-          period_max: 15,
-        }),
-      });
-      setQueue(body);
+      return await fn();
     } catch (error) {
-      setNotice(error.message);
+      report(error);
+      return null;
     } finally {
       setBusy(false);
     }
   }
 
-  async function onFile(event, setter) {
-    const file = event.target.files && event.target.files[0];
-    if (!file) return;
-    setter(await file.text());
-  }
+  const status = (live.progress && live.progress.status) || "idle";
+  const candidateCount = (live.progress && live.progress.candidates_found) || 0;
 
-  async function start(mode) {
-    setNotice("");
-    setBusy(true);
-    try {
-      const payload = {
-        mode,
-        sector: Number(sector),
-        limit: Number(limit),
-        sde_threshold: Number(sde),
-        period_min: 0.5,
-        period_max: 15,
-        nperiods: mode === "local" ? 600 : 2000,
-        tic_csv: tableText,
-        tic_path: tablePath || null,
-        light_curve_csv: curveText,
-        light_curve_path: curvePath || null,
-        tic_id: ticId,
-      };
-      const body = await api("/api/runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      setRun(body.run);
-      setStep("live");
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setBusy(false);
-    }
+  if (needToken) {
+    return (
+      <div className="shell single">
+        <main>
+          <TokenGate onSaved={() => { setNeedToken(false); boot(); }} />
+        </main>
+      </div>
+    );
   }
-
-  async function keepSearching() {
-    setNotice("");
-    setBusy(true);
-    try {
-      const body = await api("/api/continuous/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          local_dir: curveDir.trim() || null,
-          sector: Number(sector),
-          limit: Number(limit),
-          sde_threshold: Number(sde),
-          period_min: 0.5,
-          period_max: 15,
-          nperiods: curveDir.trim() ? 400 : 2000,
-        }),
-      });
-      setContinuous(body);
-      setStep("live");
-    } catch (error) {
-      setNotice(error.message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function pauseSearching() {
-    setNotice("");
-    try {
-      setContinuous(await api("/api/continuous/pause", { method: "POST" }));
-    } catch (error) {
-      setNotice(error.message);
-    }
-  }
-
-  async function stopSearching() {
-    setNotice("");
-    try {
-      setContinuous(await api("/api/continuous/stop", { method: "POST" }));
-      refreshCandidates().catch(() => {});
-    } catch (error) {
-      setNotice(error.message);
-    }
-  }
-
-  function openCandidate(id) {
-    setSelected(id);
-    setExportResult(null);
-    setStep("review");
-  }
-
-  async function onExport() {
-    if (!selected) return;
-    setNotice("");
-    try {
-      const body = await api(`/api/candidates/${selected}/export`, { method: "POST" });
-      setExportResult(body);
-    } catch (error) {
-      setExportResult(null);
-      setNotice(error.message);
-    }
-  }
-
-  const checkpoint = health && health.checkpoint;
-  const showModel = checkpoint || candidates.some((row) => row.model_score != null || row.prob_planet != null);
 
   return (
     <div className="shell">
+      <a className="skip" href="#main">Skip to content</a>
       <aside>
         <p className="brand">Transit desk</p>
         <p className="brand-sub">Always-on search</p>
-        <nav>
+        <nav aria-label="Sections">
           {STEPS.map((item) => (
-            <button
+            <a
               key={item.id}
-              type="button"
-              className={step === item.id ? "step on" : "step"}
-              onClick={() => setStep(item.id)}
+              href={formatHash(item.id, item.id === "review" && route.id ? { id: route.id } : {})}
+              className={route.view === item.id ? "step on" : "step"}
+              aria-current={route.view === item.id ? "page" : undefined}
             >
               {item.title}
-              {item.id === "inbox" ? <em>{candidates.length}</em> : null}
-              {item.id === "live" && continuousStatus === "running" ? <em className="pulse">●</em> : null}
-            </button>
+              {item.id === "live" && status === "running" ? <em className="pulse" aria-label="running">●</em> : null}
+            </a>
           ))}
         </nav>
         <p className="rail-note">
-          {checkpoint
-            ? "Classifier checkpoint loaded. Inbox shows model scores when present."
-            : "No classifier checkpoint. An SDE pass is kept as a candidate."}
+          {health && health.checkpoint
+            ? "Classifier checkpoint loaded."
+            : "No classifier checkpoint. Candidates are ranked by detection strength and vetting."}
         </p>
-        <details>
-          <summary>Command line</summary>
-          <p>
-            Training, autopilot, and SSL pretrain stay on <code>python run.py</code>.
-            Catalog train path: <code>python train_triage_v2.py</code>.
-          </p>
-        </details>
+        {health && health.mast === false ? <p className="rail-note warn">{health.mast_message}</p> : null}
+        {getToken() ? (
+          <button type="button" className="text-button" onClick={() => { setToken(""); setNeedToken(true); }}>
+            Forget token
+          </button>
+        ) : null}
       </aside>
-      <main>
-        <ProgressStrip continuous={continuous} candidates={candidates} />
-        {notice ? <p className="banner">{notice}</p> : null}
-        {step === "live" ? (
+      <main id="main" tabIndex={-1}>
+        <ProgressStrip progress={live.progress} connected={live.connected} />
+        {notice ? (
+          <div className="banner" role="alert">
+            <span>{notice}</span>
+            <button type="button" className="text-button" onClick={() => setNotice("")} aria-label="Dismiss">Dismiss</button>
+          </div>
+        ) : null}
+        {route.view === "live" ? (
           <LiveView
-            sector={sector}
-            setSector={setSector}
-            limit={limit}
-            setLimit={setLimit}
-            sde={sde}
-            setSde={setSde}
-            curveText={curveText}
-            setCurveText={setCurveText}
-            curvePath={curvePath}
-            setCurvePath={setCurvePath}
-            ticId={ticId}
-            setTicId={setTicId}
-            onFile={onFile}
-            start={start}
-            run={run}
-            busy={busy}
-            curveDir={curveDir}
-            setCurveDir={setCurveDir}
-            continuous={continuous}
-            keepSearching={keepSearching}
-            pauseSearching={pauseSearching}
-            stopSearching={stopSearching}
+            live={live} busy={busy} run={run} setRun={setRun} action={action}
+            sector={sector} setSector={setSector} limit={limit} setLimit={setLimit} sde={sde} setSde={setSde}
           />
         ) : null}
-        {step === "queue" ? (
-          <QueueView
-            queue={queue}
-            limit={limit}
-            setLimit={setLimit}
-            tableText={tableText}
-            setTableText={setTableText}
-            tablePath={tablePath}
-            setTablePath={setTablePath}
-            onFile={onFile}
-            onRank={onRank}
-            busy={busy}
+        {route.view === "queue" ? (
+          <QueueView queue={queue} setQueue={setQueue} limit={limit} setLimit={setLimit} busy={busy} action={action} />
+        ) : null}
+        {route.view === "inbox" ? (
+          <InboxView
+            params={route.params} go={go} report={report} showModel={Boolean(health && health.checkpoint)}
+            refreshKey={candidateCount}
           />
         ) : null}
-        {step === "inbox" ? (
-          <InboxView candidates={candidates} onOpen={openCandidate} showModel={showModel} />
-        ) : null}
-        {step === "review" ? (
-          <ReviewView
-            detail={detail}
-            onExport={onExport}
-            exportResult={exportResult}
-            showModel={showModel}
-          />
-        ) : null}
+        {route.view === "review" ? <ReviewView id={route.id} report={report} go={go} /> : null}
+        {route.view === "stats" ? <StatsView report={report} action={action} /> : null}
       </main>
     </div>
   );
 }
 
-function QueueView({ queue, limit, setLimit, tableText, setTableText, tablePath, setTablePath, onFile, onRank, busy }) {
+function QueueView({ queue, setQueue, limit, setLimit, busy, action }) {
+  const [tableText, setTableText] = useState("");
+  const [tablePath, setTablePath] = useState("");
+  async function onRank(event) {
+    event.preventDefault();
+    const body = await action(() => api("/api/queue/rank", {
+      method: "POST",
+      json: { csv: tableText, path: tablePath || null, limit: Number(limit), period_min: 0.5, period_max: 15 },
+    }));
+    if (body) setQueue(body);
+  }
   return (
     <section>
       <h1>Queue</h1>
-      <p className="lede">Rank who is next before any light curve is downloaded. Bare TIC lists are enriched for radius, sectors, CROWDSAP, and Tmag when the cache or catalog can fill them.</p>
+      <p className="lede">Rank who is next before any light curve is downloaded. Bare TIC lists are enriched for radius, CROWDSAP, and Tmag in one batched catalog query.</p>
       <form onSubmit={onRank} className="form">
         <label>
           Best N
@@ -404,25 +312,23 @@ function QueueView({ queue, limit, setLimit, tableText, setTableText, tablePath,
         </label>
         <label className="wide">
           TIC table
-          <textarea
-            rows={4}
-            value={tableText}
-            onChange={(event) => setTableText(event.target.value)}
-            placeholder="tic,radius,n_sectors,crowdsap,tmag,disposition"
-          />
+          <textarea rows={4} value={tableText} onChange={(event) => setTableText(event.target.value)} placeholder="tic,radius,n_sectors,crowdsap,tmag,disposition" />
         </label>
         <label className="wide">
           File
-          <input type="file" accept=".csv,.txt" onChange={(event) => onFile(event, setTableText)} />
+          <input type="file" accept=".csv,.txt" onChange={async (event) => {
+            const file = event.target.files && event.target.files[0];
+            if (file) setTableText(await file.text());
+          }} />
         </label>
         <label className="wide">
-          Path on this machine
+          Path on the desk machine
           <input value={tablePath} onChange={(event) => setTablePath(event.target.value)} placeholder="/path/targets.csv" />
         </label>
         <button type="submit" disabled={busy}>Rank</button>
       </form>
       {!queue || ((queue.primary || []).length === 0 && (queue.second_pass || []).length === 0) ? (
-        <p className="empty">No target table yet. Rank a TIC file before download. The best N come first. Sky position is not a factor.</p>
+        <p className="empty">No target table yet. Rank a TIC file before download; the best N come first.</p>
       ) : (
         <>
           <p className="quiet">{queue.note}</p>
@@ -441,13 +347,7 @@ function TargetTable({ title, rows }) {
       <h2>{title}</h2>
       <table>
         <thead>
-          <tr>
-            <th>#</th>
-            <th>TIC</th>
-            <th>Why this star is next</th>
-            <th>SNR</th>
-            <th>Disposition</th>
-          </tr>
+          <tr><th scope="col">#</th><th scope="col">TIC</th><th scope="col">Why this star is next</th><th scope="col">SNR</th><th scope="col">Disposition</th></tr>
         </thead>
         <tbody>
           {rows.map((row, index) => (
@@ -465,83 +365,130 @@ function TargetTable({ title, rows }) {
   );
 }
 
-function LiveView({
-  sector, setSector, limit, setLimit, sde, setSde,
-  curveText, setCurveText, curvePath, setCurvePath, ticId, setTicId,
-  onFile, start, run, busy,
-  curveDir, setCurveDir, continuous, keepSearching, pauseSearching, stopSearching,
-}) {
+function LiveView({ live, busy, run, setRun, action, sector, setSector, limit, setLimit, sde, setSde }) {
   const logRef = useRef(null);
-  const lines = (continuous && continuous.lines) || [];
-  const status = continuous ? continuous.status : "idle";
-  const progress = (continuous && continuous.progress) || {};
+  const stick = useRef(true);
+  const [curveDir, setCurveDir] = useState("");
+  const [curveText, setCurveText] = useState("");
+  const [curvePath, setCurvePath] = useState("");
+  const [ticId, setTicId] = useState("local");
+  const [profile, setProfile] = useState("balanced");
+  const { lines, progress, state } = live;
+  const p = progress || {};
+  const status = p.status || "idle";
+  const work = p.work || {};
+  const runBusy = busy || status === "running" || (run && run.status === "running");
+
   useEffect(() => {
     const node = logRef.current;
-    if (node) node.scrollTop = node.scrollHeight;
+    if (node && stick.current) node.scrollTop = node.scrollHeight;
   }, [lines.length]);
+
+  async function control(path, body) {
+    const result = await action(() => api(path, { method: "POST", json: body }));
+    if (result) {
+      live.setState(result);
+      live.refreshState().catch(() => {});
+    }
+  }
+
+  async function startRun(mode) {
+    const body = await action(() => api("/api/runs", {
+      method: "POST",
+      json: {
+        mode, sector: Number(sector), limit: Number(limit), sde_threshold: Number(sde),
+        period_min: 0.5, period_max: 15, nperiods: mode === "local" ? 600 : 2000,
+        light_curve_csv: curveText, light_curve_path: curvePath || null, tic_id: ticId,
+      },
+    }));
+    if (body) setRun(body.run);
+  }
+
   return (
     <section className="live">
-      <h1>Live Run</h1>
+      <h1>Live run</h1>
       <p className="lede">
-        Continuous search starts with the desk. Closing this page does not stop it.
-        {continuous?.auto_start === false ? " Auto-start is off until Start or Resume." : ""}
+        The search keeps going when this page is closed and resumes from the same item after a restart.
+        {state && state.auto_start === false ? " Auto-start is off until Start or Resume." : ""}
       </p>
-      <div className="live-metrics">
+      <dl className="live-metrics">
         <div><dt>Status</dt><dd className={status}>{statusLabel(status)}</dd></div>
-        <div><dt>Target</dt><dd>{progress.current_target || continuous?.current_target || "—"}</dd></div>
-        <div><dt>Sector / cursor</dt><dd className="num">{continuous?.sector ?? "—"} / {continuous?.cursor ?? 0}</dd></div>
-        <div><dt>Stars done</dt><dd className="num">{progress.stars_done ?? continuous?.stars_done ?? 0}</dd></div>
-        <div><dt>Candidates</dt><dd className="num">{progress.candidates_found ?? continuous?.candidates_found ?? 0}</dd></div>
-        <div><dt>Last SDE</dt><dd className="num">{fmt(progress.last_sde ?? continuous?.last_sde, 2)}</dd></div>
-        <div><dt>Stars / hour</dt><dd className="num">{fmt(progress.stars_per_hour, 1)}</dd></div>
-        <div><dt>Elapsed</dt><dd className="num">{fmt(progress.elapsed_seconds, 0)} s</dd></div>
-      </div>
+        <div><dt>Target</dt><dd>{p.current_target || "—"}</dd></div>
+        <div><dt>Sector</dt><dd className="num">{p.sector ?? "—"}</dd></div>
+        <div><dt>Stars done</dt><dd className="num">{p.stars_done ?? 0}</dd></div>
+        <div><dt>Candidates</dt><dd className="num">{p.candidates_found ?? 0}</dd></div>
+        <div><dt>Stars / hour</dt><dd className="num">{fmt(p.stars_per_hour, 1)}</dd></div>
+        <div><dt>Work done / left</dt><dd className="num">{work.done ?? 0} / {(work.pending ?? 0) + (work.leased ?? 0)}</dd></div>
+        <div><dt>Failed items</dt><dd className={`num ${work.failed ? "bad" : ""}`}>{work.failed ?? 0}</dd></div>
+      </dl>
       <div className="form live-controls">
         <label>
           Sector
-          <input type="number" value={sector} onChange={(event) => setSector(event.target.value)} />
+          <input type="number" min="1" value={sector} onChange={(event) => setSector(event.target.value)} />
         </label>
         <label>
-          Best N
+          Stars per sector
           <input type="number" min="1" value={limit} onChange={(event) => setLimit(event.target.value)} />
         </label>
         <label>
           SDE gate
           <input type="number" step="0.1" value={sde} onChange={(event) => setSde(event.target.value)} />
         </label>
+        <label>
+          Profile
+          <select value={profile} onChange={(event) => setProfile(event.target.value)}>
+            <option value="balanced">balanced</option>
+            <option value="ultra_short_period">ultra short period</option>
+            <option value="single_transit_long_period">single transit / long period</option>
+            <option value="low_snr_m_dwarf">low SNR M dwarf</option>
+          </select>
+        </label>
+        <label className="wide">
+          Local curve directory (optional)
+          <input value={curveDir} onChange={(event) => setCurveDir(event.target.value)} placeholder="/path/curves" />
+        </label>
         <div className="actions">
-          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={keepSearching}>
+          <button type="button" disabled={runBusy} onClick={() => control("/api/continuous/start", {
+            local_dir: curveDir.trim() || null, sector: Number(sector), limit: Number(limit),
+            sde_threshold: Number(sde), period_min: 0.5, period_max: 15,
+            nperiods: curveDir.trim() ? 400 : 2000, strategy_profile: profile,
+          })}>
             {status === "paused" || status === "stopped" ? "Resume" : "Start"}
           </button>
-          <button type="button" disabled={status !== "running"} onClick={pauseSearching}>Pause</button>
-          <button type="button" disabled={status !== "running" && status !== "paused"} onClick={stopSearching}>Stop</button>
+          <button type="button" disabled={status !== "running"} onClick={() => control("/api/continuous/pause")}>Pause</button>
+          <button type="button" disabled={status !== "running" && status !== "paused"} onClick={() => control("/api/continuous/stop")}>Stop</button>
         </div>
       </div>
-      <ol className="log" ref={logRef} aria-live="polite">
+      <div className="log-head">
+        <h2>Log</h2>
+        <button type="button" className="text-button" onClick={() => live.loadOlder().catch(() => {})} disabled={!lines.length}>
+          Load older
+        </button>
+      </div>
+      <ol
+        className="log"
+        ref={logRef}
+        onScroll={(event) => {
+          const node = event.currentTarget;
+          stick.current = node.scrollHeight - node.scrollTop - node.clientHeight < 24;
+        }}
+        tabIndex={0}
+        aria-label="Search log"
+      >
         {lines.length === 0 ? (
-          <li className="quiet">The log is empty. When MAST is missing, the loop stays honest and invents no stars.</li>
-        ) : lines.map((line, index) => (
-          <li key={`${line.ts}-${index}`} className={`log-line ${line.error ? "error" : line.candidate ? "candidate" : ""}`}>
+          <li className="quiet">The log is empty. When MAST is missing, the loop says so and invents no stars.</li>
+        ) : lines.map((line) => (
+          <li key={line.id ?? `${line.ts}-${line.message}`} className={`log-line ${line.error ? "error" : line.candidate ? "candidate" : ""}`}>
             <time dateTime={line.ts}>{line.ts}</time>
             <span>{line.message}</span>
           </li>
         ))}
       </ol>
+      <p className="sr-only" aria-live="polite">{p.last_log_line || ""}</p>
       <details className="one-off">
-        <summary>One-off sector / local curve</summary>
-        <p className="quiet">A directory of time, flux CSVs is searched as given. Otherwise a ranked queue is walked, and if there is no queue the sectors advance.</p>
+        <summary>One-off sector or local light curve</summary>
         <div className="form">
-          <label className="wide">
-            Local curve directory
-            <input
-              value={curveDir}
-              onChange={(event) => setCurveDir(event.target.value)}
-              placeholder="/path/curves"
-            />
-          </label>
-          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("sector")}>
-            Start sector search once
-          </button>
+          <button type="button" disabled={runBusy} onClick={() => startRun("sector")}>Search sector {sector} once</button>
         </div>
         <RunState run={run} />
         <div className="split">
@@ -557,15 +504,16 @@ function LiveView({
             </label>
             <label className="wide">
               File
-              <input type="file" accept=".csv,.txt" onChange={(event) => onFile(event, setCurveText)} />
+              <input type="file" accept=".csv,.txt" onChange={async (event) => {
+                const file = event.target.files && event.target.files[0];
+                if (file) setCurveText(await file.text());
+              }} />
             </label>
             <label className="wide">
-              Path on this machine
+              Path on the desk machine
               <input value={curvePath} onChange={(event) => setCurvePath(event.target.value)} placeholder="/path/curve.csv" />
             </label>
-            <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("local")}>
-              Search this curve
-            </button>
+            <button type="button" disabled={runBusy} onClick={() => startRun("local")}>Search this curve</button>
           </div>
         </div>
       </details>
@@ -574,125 +522,334 @@ function LiveView({
 }
 
 function RunState({ run }) {
-  if (!run) {
-    return <p className="empty">No one-off search has been started.</p>;
-  }
-  if (run.status === "running") {
-    return <p className="state running">Running. {run.message}</p>;
-  }
+  if (!run) return <p className="empty">No one-off search has been started.</p>;
+  if (run.status === "running") return <p className="state running">Running. {run.message}</p>;
   if (run.status === "failed") {
     return (
-      <div className="state failed">
+      <div className="state failed" role="status">
         <p className="state-title">{run.needs_mast ? "MAST required" : "Search failed"}</p>
         <p>{run.error}</p>
       </div>
     );
   }
-  return (
-    <p className="state done">
-      Finished. {run.message}
-      {run.candidate_ids && run.candidate_ids.length === 0 ? " The inbox was not changed." : ""}
-    </p>
-  );
+  return <p className="state done">Finished. {run.message}</p>;
 }
 
-function InboxView({ candidates, onOpen, showModel }) {
+function InboxView({ params, go, report, showModel, refreshKey }) {
+  const filters = { ...INBOX_DEFAULTS, ...params };
+  const [data, setData] = useState({ candidates: [], total: 0 });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const query = inboxQuery(filters, PAGE_SIZE);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    api(`/api/candidates?${query}`)
+      .then((body) => {
+        if (!cancelled) {
+          setData(body);
+          setError("");
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err.message);
+        report(err);
+      })
+      .finally(() => !cancelled && setLoading(false));
+    return () => { cancelled = true; };
+  }, [query, refreshKey, report]);
+
+  const set = (patch) => go("inbox", { params: { ...filters, page: "0", ...patch } });
+  const page = Number(filters.page) || 0;
+  const pages = Math.max(1, Math.ceil(data.total / PAGE_SIZE));
+
   return (
     <section>
       <h1>Inbox</h1>
-      <p className="lede">SDE-pass stars, sorted by SDE. Known TOI versus new is a label, not the order.</p>
-      {candidates.length === 0 ? (
-        <p className="empty">No candidates yet. Continuous search has not found an SDE pass. This list stays empty when a search fails or nothing clears the gate.</p>
-      ) : (
-        <table>
+      <p className="lede">Sorted by score: detection strength (and the classifier when loaded) times graded vetting penalties. Known planets are labelled, not hidden.</p>
+      <form className="filters" onSubmit={(event) => event.preventDefault()} role="search">
+        <label>
+          Search
+          <input value={filters.q} onChange={(event) => set({ q: event.target.value })} placeholder="TIC id" />
+        </label>
+        <label>
+          Label
+          <select value={filters.label} onChange={(event) => set({ label: event.target.value })}>
+            <option value="">All</option>
+            <option value="new">New</option>
+            <option value="new_on_known_host">New on known host</option>
+            <option value="known">Known</option>
+            <option value="unreviewed">Unreviewed</option>
+            <option value="planet">Reviewed: planet</option>
+            <option value="false_positive">Reviewed: false positive</option>
+            <option value="unsure">Reviewed: unsure</option>
+          </select>
+        </label>
+        <label>
+          Flags
+          <select value={filters.flags} onChange={(event) => set({ flags: event.target.value })}>
+            <option value="">Any</option>
+            <option value="none">No hard flags</option>
+            <option value="any">Has a flag</option>
+          </select>
+        </label>
+        <label>
+          Min SDE
+          <input type="number" step="0.5" value={filters.min_sde} onChange={(event) => set({ min_sde: event.target.value })} />
+        </label>
+        <label>
+          Sort
+          <select value={filters.sort} onChange={(event) => set({ sort: event.target.value })}>
+            <option value="score">Score</option>
+            <option value="sde">SDE</option>
+            <option value="period_days">Period</option>
+            <option value="depth_ppm">Depth</option>
+            <option value="updated">Newest</option>
+          </select>
+        </label>
+        <label>
+          Order
+          <select value={filters.order} onChange={(event) => set({ order: event.target.value })}>
+            <option value="desc">High first</option>
+            <option value="asc">Low first</option>
+          </select>
+        </label>
+      </form>
+      {error ? <p className="state failed" role="alert">Could not load candidates: {error}</p> : null}
+      {!error && !loading && data.total === 0 ? (
+        <p className="empty">No candidates match. Nothing has cleared the SDE gate yet, or the filters are too tight.</p>
+      ) : null}
+      {data.candidates.length ? (
+        <table aria-busy={loading}>
           <thead>
             <tr>
-              <th>TIC</th>
-              <th>Period</th>
-              <th>Epoch</th>
-              <th>Depth</th>
-              <th>SDE</th>
-              {showModel ? <th>Model</th> : null}
-              <th>Flags</th>
-              <th>Label</th>
+              <th scope="col">TIC</th><th scope="col">Score</th><th scope="col">Period</th><th scope="col">Depth</th>
+              <th scope="col">SDE</th>{showModel ? <th scope="col">Model</th> : null}<th scope="col">Flags</th>
+              <th scope="col">Label</th><th scope="col">Review</th>
             </tr>
           </thead>
           <tbody>
-            {candidates.map((row) => (
-              <tr key={row.id} className={row.sde != null && row.sde >= 7 ? "hit" : ""}>
-                <td>
-                  <button type="button" className="link" onClick={() => onOpen(row.id)}>{row.tic_id}</button>
-                </td>
-                <td className="num">{fmt(row.period_days, 4)} d</td>
-                <td className="num">{fmt(row.epoch_btjd, 4)}</td>
-                <td className="num">{row.depth_ppm === null ? "—" : `${fmt(row.depth_ppm, 0)} ppm`}</td>
+            {data.candidates.map((row) => (
+              <tr key={row.id} className={row.hard_flags.length === 0 ? "hit" : ""}>
+                <td><a className="link" href={formatHash("review", { id: row.id })}>{row.tic_id}</a></td>
+                <td className="num">{fmt(row.score, 3)}</td>
+                <td className="num">{row.kind === "monotransit" ? "single" : `${fmt(row.period_days, 4)} d`}</td>
+                <td className="num">{row.depth_ppm == null ? "—" : `${fmt(row.depth_ppm, 0)} ppm`}</td>
                 <td className="num">{fmt(row.sde, 1)}</td>
-                {showModel ? (
-                  <td className="num">{row.model_score == null && row.prob_planet == null ? "—" : fmt(row.model_score ?? row.prob_planet, 3)}</td>
-                ) : null}
+                {showModel ? <td className="num">{fmt(row.prob_planet, 3)}</td> : null}
                 <td>{row.hard_flags.length ? row.hard_flags.map((flag) => FLAG_LABEL[flag] || flag).join(", ") : "None"}</td>
                 <td>{row.label}</td>
+                <td>{row.review_label ? row.review_label.replace("_", " ") : "—"}</td>
               </tr>
             ))}
           </tbody>
         </table>
-      )}
+      ) : null}
+      {pages > 1 ? (
+        <nav className="pager" aria-label="Pages">
+          <button type="button" disabled={page <= 0} onClick={() => go("inbox", { params: { ...filters, page: String(page - 1) } })}>Previous</button>
+          <span className="num">Page {page + 1} of {pages} · {data.total} candidates</span>
+          <button type="button" disabled={page + 1 >= pages} onClick={() => go("inbox", { params: { ...filters, page: String(page + 1) } })}>Next</button>
+        </nav>
+      ) : null}
     </section>
   );
 }
 
-function ReviewView({ detail, onExport, exportResult, showModel }) {
-  if (!detail) {
+function ReviewView({ id, report, go }) {
+  const [detail, setDetail] = useState(null);
+  const [error, setError] = useState("");
+  const [note, setNote] = useState("");
+  const [exportResult, setExportResult] = useState(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (!id) return undefined;
+    let cancelled = false;
+    setDetail(null);
+    setError("");
+    setExportResult(null);
+    api(`/api/candidates/${encodeURIComponent(id)}`)
+      .then((body) => {
+        if (cancelled) return;
+        setDetail(body);
+        setNote((body.review && body.review.note) || "");
+      })
+      .catch((err) => !cancelled && setError(err.message));
+    return () => { cancelled = true; };
+  }, [id]);
+
+  if (!id) {
     return (
       <section>
         <h1>Review</h1>
-        <p className="empty">Select a candidate from the inbox.</p>
+        <p className="empty">Open a candidate from the <a className="link" href="#/inbox">inbox</a>. Each candidate has its own link you can share.</p>
       </section>
     );
   }
+  if (error) {
+    return (
+      <section>
+        <h1>Review</h1>
+        <p className="state failed" role="alert">{error}</p>
+        <button type="button" className="text-button" onClick={() => go("inbox")}>Back to inbox</button>
+      </section>
+    );
+  }
+  if (!detail) return <section><h1>Review</h1><p className="quiet">Loading…</p></section>;
+
+  const v = detail.vetting || {};
   const flags = new Set(detail.hard_flags || []);
+  const oe = detail.odd_even_curve || {};
+  const lc = detail.light_curve || {};
+  const pg = detail.periodogram || {};
+
+  async function label(value) {
+    setSaving(true);
+    try {
+      await api(`/api/candidates/${encodeURIComponent(detail.id)}/label`, { method: "POST", json: { label: value, note } });
+      setDetail({ ...detail, review: { label: value, note } });
+    } catch (err) {
+      report(err);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function onExport() {
+    try {
+      setExportResult(await api(`/api/candidates/${encodeURIComponent(detail.id)}/export`, { method: "POST" }));
+    } catch (err) {
+      setExportResult(null);
+      report(err);
+    }
+  }
+
   return (
     <section>
+      <p className="crumb"><a className="link" href="#/inbox">Inbox</a> / TIC {detail.tic_id}</p>
       <h1>TIC {detail.tic_id}</h1>
       <p className="lede">
         {detail.label}
-        {detail.status === "CANDIDATE_SDE" ? " · SDE pass, no classifier score" : ""}
-        {showModel && detail.model_score != null ? ` · model ${fmt(detail.model_score, 3)}` : ""}
+        {detail.kind === "monotransit" ? " · single transit" : ""}
+        {detail.known_match ? ` · matches TOI ${detail.known_match.toi || ""}` : ""}
+        {detail.prob_planet != null ? ` · model ${fmt(detail.prob_planet, 3)}` : " · no classifier score"}
       </p>
       <dl className="metrics">
-        <div><dt>Period</dt><dd>{fmt(detail.period_days, 4)} d</dd></div>
-        <div><dt>Epoch</dt><dd>{fmt(detail.epoch_btjd, 4)}</dd></div>
-        <div><dt>Depth</dt><dd>{detail.depth_ppm === null ? "—" : `${fmt(detail.depth_ppm, 0)} ppm`}</dd></div>
+        <div><dt>Score</dt><dd>{fmt(detail.score, 3)}</dd></div>
+        <div><dt>Period</dt><dd>{detail.kind === "monotransit" ? "—" : `${fmt(detail.period_days, 5)} d`}</dd></div>
+        <div><dt>Epoch (BTJD)</dt><dd>{fmt(detail.epoch_btjd, 4)}</dd></div>
+        <div><dt>Depth</dt><dd>{detail.depth_ppm == null ? "—" : `${fmt(detail.depth_ppm, 0)} ppm`}</dd></div>
+        <div><dt>Duration</dt><dd>{fmt(detail.duration_hours, 2)} h</dd></div>
         <div><dt>SDE</dt><dd>{fmt(detail.sde, 2)}</dd></div>
+        <div><dt>Transits</dt><dd>{detail.n_transits ?? "—"}</dd></div>
+        <div><dt>FPP</dt><dd>{fmt(detail.fpp, 3)}</dd></div>
       </dl>
+
+      <h2>Light curve</h2>
+      <Chart
+        label="Detrended light curve with predicted transit times"
+        series={[{ x: lc.time || [], y: lc.flux || [], kind: "points" }]}
+        markers={lc.transits || []}
+        xLabel="BTJD" yLabel="flux"
+      />
+      <h2>BLS periodogram</h2>
+      <Chart
+        label="BLS periodogram"
+        series={[{ x: pg.period || [], y: pg.power || [], kind: "line" }]}
+        markers={detail.period_days ? [detail.period_days] : []}
+        xLabel="period (d)" yLabel="power" logX
+      />
       <h2>Phase fold</h2>
-      <PhaseChart curve={detail.phase_curve} />
-      {detail.has_plot ? (
-        <img className="plot" alt="Pipeline phase plot" src={`/api/candidates/${detail.id}/plot`} />
-      ) : null}
+      <Chart
+        label="Phase-folded light curve"
+        series={[{ x: (detail.phase_curve || {}).phase || [], y: (detail.phase_curve || {}).flux || [], kind: "line" }]}
+        markers={[0]} xLabel="phase" yLabel="flux"
+      />
+      <div className="pair">
+        <div>
+          <h2>Odd vs even transits</h2>
+          <Chart
+            label="Odd and even transits overlaid"
+            series={[
+              { x: (oe.odd || {}).hours || [], y: (oe.odd || {}).flux || [], kind: "line", tone: "ember", label: "odd" },
+              { x: (oe.even || {}).hours || [], y: (oe.even || {}).flux || [], kind: "line", tone: "moss", label: "even" },
+            ]}
+            xLabel="hours from mid-transit" yLabel="flux" height={180}
+          />
+        </div>
+        <div>
+          <h2>Secondary eclipse window</h2>
+          <Chart
+            label="Flux around phase 0.5"
+            series={[{ x: (detail.secondary_curve || {}).hours || [], y: (detail.secondary_curve || {}).flux || [], kind: "line" }]}
+            markers={[0]} xLabel="hours from phase 0.5" yLabel="flux" height={180}
+          />
+        </div>
+      </div>
+      {detail.has_plot ? <img className="plot" alt="Pipeline phase plot" src={authed(`/api/candidates/${encodeURIComponent(detail.id)}/plot`)} /> : null}
       {detail.has_difference_image ? (
         <>
           <h2>Difference image</h2>
-          <img className="plot" alt="Difference image" src={`/api/candidates/${detail.id}/difference-image`} />
+          <img className="plot" alt="Difference image" src={authed(`/api/candidates/${encodeURIComponent(detail.id)}/difference-image`)} />
         </>
       ) : null}
-      <h2>Hard flags</h2>
+
+      <h2>Vetting</h2>
       <table>
         <tbody>
-          <FlagRow name="Odd/even" on={flags.has("odd_even")} value={fmt(detail.odd_even_ratio, 2)} />
-          <FlagRow name="Secondary" on={flags.has("secondary")} value={fmt(detail.secondary_significance, 2)} />
-          <FlagRow name="Centroid" on={flags.has("centroid")} value={fmt(detail.centroid_offset_px, 2)} />
-          <FlagRow name="n transits" on={flags.has("n_transits")} value={detail.n_transits ?? "—"} />
+          <FlagRow name="Odd/even depth ratio" on={flags.has("odd_even")} value={fmt(detail.odd_even_ratio, 2)} />
+          <FlagRow name="Secondary significance (σ)" on={flags.has("secondary")} value={fmt(detail.secondary_significance, 2)} />
+          <FlagRow name="Centroid offset (px)" on={flags.has("centroid")} value={fmt(detail.centroid_offset_px, 2)} />
+          <FlagRow name="Transits observed" on={flags.has("n_transits")} value={detail.n_transits ?? "—"} />
+          <FlagRow name="Gaia neighbour flux ratio" on={Number(v.gaia_flux_ratio) > 0.5} value={fmt(v.gaia_flux_ratio, 2)} />
+          <FlagRow name="Gaia neighbours within 30″" on={false} value={v.gaia_neighbors_within_30arcsec ?? "—"} />
+          <FlagRow name="TRICERATOPS FPP / NFPP" on={Number(v.fpp) > 0.5} value={`${fmt(v.fpp, 3)} / ${fmt(v.nfpp, 4)}`} />
         </tbody>
       </table>
+      {detail.demotion && detail.demotion.reasons && detail.demotion.reasons.length ? (
+        <p className="quiet">Score multiplied by {fmt(detail.demotion.factor, 2)}: {demotionText(detail.demotion)}.</p>
+      ) : null}
+
+      <h2>Your verdict</h2>
+      <div className="verdict">
+        <label className="wide">
+          Note
+          <input value={note} onChange={(event) => setNote(event.target.value)} placeholder="Why (optional)" />
+        </label>
+        <div className="actions" role="group" aria-label="Label this candidate">
+          {[
+            ["planet", "Planet"],
+            ["false_positive", "False positive"],
+            ["unsure", "Unsure"],
+          ].map(([value, text]) => (
+            <button
+              key={value}
+              type="button"
+              disabled={saving}
+              aria-pressed={detail.review && detail.review.label === value}
+              className={detail.review && detail.review.label === value ? "chosen" : ""}
+              onClick={() => label(value)}
+            >
+              {text}
+            </button>
+          ))}
+        </div>
+        <p className="quiet">Labels are saved in the desk state and used to fine-tune the classifier (<code>python train_classifier.py --labels</code>).</p>
+      </div>
+
       <div className="export">
-        {detail.epoch_btjd === null ? (
+        {detail.epoch_btjd == null ? (
           <p className="state failed">No epoch on this candidate. Export is refused so the packet cannot say t0 = 0.</p>
         ) : (
           <button type="button" onClick={onExport}>Export TFOP packet</button>
         )}
         {exportResult ? (
-          <p className="state done">Wrote epoch {fmt(exportResult.epoch_btjd, 4)} BTJD.</p>
+          <p className="state done">
+            Wrote epoch {fmt(exportResult.epoch_btjd, 4)} BTJD.{" "}
+            <a className="link" href={authed(exportResult.download_url)} download>Download JSON</a>
+          </p>
         ) : null}
       </div>
     </section>
@@ -702,9 +859,136 @@ function ReviewView({ detail, onExport, exportResult, showModel }) {
 function FlagRow({ name, on, value }) {
   return (
     <tr>
-      <th>{name}</th>
+      <th scope="row">{name}</th>
       <td className="num">{value}</td>
       <td>{on ? <span className="flag">Flag</span> : <span className="quiet">Clear</span>}</td>
     </tr>
+  );
+}
+
+function StatsView({ report, action }) {
+  const [stats, setStats] = useState(null);
+  const [error, setError] = useState("");
+  const load = useCallback(() => {
+    api("/api/stats").then((body) => { setStats(body); setError(""); }).catch((err) => { setError(err.message); report(err); });
+  }, [report]);
+  useEffect(() => {
+    load();
+    const timer = setInterval(load, 20000);
+    return () => clearInterval(timer);
+  }, [load]);
+
+  if (error && !stats) return <section><h1>Throughput</h1><p className="state failed" role="alert">{error}</p></section>;
+  if (!stats) return <section><h1>Throughput</h1><p className="quiet">Loading…</p></section>;
+  const work = stats.work || {};
+  const p = stats.progress || {};
+
+  async function retry(itemId) {
+    const ok = await action(() => api(itemId ? `/api/work/${itemId}/retry` : "/api/work/retry-failed", { method: "POST" }));
+    if (ok) load();
+  }
+
+  return (
+    <section>
+      <h1>Throughput</h1>
+      <dl className="live-metrics">
+        <div><dt>Stars / hour</dt><dd className="num">{fmt(p.stars_per_hour, 1)}</dd></div>
+        <div><dt>Running for</dt><dd className="num">{fmtDuration(p.elapsed_seconds)}</dd></div>
+        <div><dt>ETA (plan)</dt><dd className="num">{fmtDuration(p.eta_seconds)}</dd></div>
+        <div><dt>Reviewed</dt><dd className="num">{stats.reviewed}</dd></div>
+        <div><dt>Work pending</dt><dd className="num">{work.pending ?? 0}</dd></div>
+        <div><dt>In flight</dt><dd className="num">{work.leased ?? 0}</dd></div>
+        <div><dt>Done</dt><dd className="num">{work.done ?? 0}</dd></div>
+        <div><dt>Failed</dt><dd className={`num ${work.failed ? "bad" : ""}`}>{work.failed ?? 0}</dd></div>
+      </dl>
+      <h2>Stars searched per hour (24 h)</h2>
+      <Bars rows={stats.hourly} valueKey="stars" label="Stars searched per hour over the last 24 hours" />
+      <h2>Candidates per hour</h2>
+      <Bars rows={stats.hourly} valueKey="candidates" tone="moss" label="Candidates per hour over the last 24 hours" />
+      <h2>Inbox by label</h2>
+      <p className="num">
+        {Object.keys(stats.candidates_by_label || {}).length
+          ? Object.entries(stats.candidates_by_label).map(([k, n]) => `${k}: ${n}`).join(" · ")
+          : "No candidates yet."}
+      </p>
+      <div className="log-head">
+        <h2>Failed work items</h2>
+        {stats.failed_items && stats.failed_items.length ? (
+          <button type="button" className="text-button" onClick={() => retry(null)}>Retry all</button>
+        ) : null}
+      </div>
+      {stats.failed_items && stats.failed_items.length ? (
+        <table>
+          <thead><tr><th scope="col">Item</th><th scope="col">Attempts</th><th scope="col">Last error</th><th scope="col" /></tr></thead>
+          <tbody>
+            {stats.failed_items.map((item) => (
+              <tr key={item.id}>
+                <td>{item.target}{item.sector ? ` (sector ${item.sector})` : ""}</td>
+                <td className="num">{item.attempts}/{item.max_attempts}</td>
+                <td className="error-text">{item.last_error || "—"}</td>
+                <td><button type="button" className="text-button" onClick={() => retry(item.id)}>Retry</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : <p className="quiet">No failed items. Errors are retried automatically up to three times.</p>}
+      <CompletenessMap />
+    </section>
+  );
+}
+
+export function CompletenessMap() {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    api("/api/completeness").then(setData).catch(() => setData({ available: false }));
+  }, []);
+  if (!data) return null;
+  return (
+    <>
+      <h2>Search completeness</h2>
+      {!data.available ? (
+        <p className="quiet">{data.hint || "No completeness map yet."}</p>
+      ) : (
+        <>
+          <p className="quiet">
+            Share of injected planets this pipeline recovers ({data.frame}; {data.trials} trials,
+            generated {data.generated_at}). Target ranking uses this map.
+          </p>
+          <div className="completeness-grid">
+            {data.tmags.map((tmag, ti) => (
+              <table key={tmag} className="completeness">
+                <caption>Tmag {tmag}</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">P (d) \ R (R⊕)</th>
+                    {data.radii.map((r) => <th scope="col" key={r} className="num">{r}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.periods.map((period, pi) => (
+                    <tr key={period}>
+                      <th scope="row" className="num">{period}</th>
+                      {data.radii.map((r, ri) => {
+                        const v = data.recovery[ti][pi][ri];
+                        return (
+                          <td
+                            key={r}
+                            className="num"
+                            style={v == null ? undefined : { background: `rgba(74, 124, 89, ${0.12 + 0.75 * v})` }}
+                            aria-label={`P ${period} d, ${r} Earth radii: ${v == null ? "not run" : Math.round(v * 100) + "%"}`}
+                          >
+                            {v == null ? "·" : `${Math.round(v * 100)}`}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ))}
+          </div>
+        </>
+      )}
+    </>
   );
 }

@@ -1,0 +1,48 @@
+# Always-on desk + continuous search on Fly.io (copy to fly.toml).
+#
+#   fly launch --no-deploy --copy-config
+#   fly volumes create hunt_data --size 10
+#   fly secrets set DESK_TOKEN=$(openssl rand -hex 24)
+#   # optional off-machine backups (R2/B2/S3):
+#   fly secrets set STATE_BUCKET=s3://bucket/hunt STATE_ENDPOINT_URL=https://<acct>.r2.cloudflarestorage.com \
+#                   AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+#   fly deploy
+#
+# The volume keeps state.db across deploys; the desk resumes the running plan
+# on boot. With STATE_BUCKET set it also pulls on boot and pushes every
+# DESK_CHECKPOINT_MINUTES, so a lost volume costs at most that much work.
+
+app = "transit-hunt"
+primary_region = "iad"
+kill_signal = "SIGTERM"
+kill_timeout = "300s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DESK_DATA = "/app/var/desk"
+  AUTO_START = "1"
+  DESK_CHECKPOINT_MINUTES = "15"
+
+[mounts]
+  source = "hunt_data"
+  destination = "/app/var"
+
+[http_service]
+  internal_port = 8765
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+[[http_service.checks]]
+  grace_period = "30s"
+  interval = "30s"
+  method = "GET"
+  path = "/api/health"
+  timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "4gb"

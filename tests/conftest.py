@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -11,6 +12,8 @@ import pytest
 # Make repo root importable.
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+os.environ.setdefault("HUNT_SECTOR_WATCH", "0")
+os.environ.setdefault("HUNT_COMPLETENESS_HOURS", "0")
 
 
 @pytest.fixture

@@ -1,0 +1,94 @@
+name: Hunt
+
+# Free always-on hunting: every 6 hours a runner restores the last checkpoint,
+# searches for ~5.5 hours, checkpoints every 15 minutes and on the way out,
+# and publishes a static status page. Each run resumes exactly where the
+# previous one stopped.
+#
+# State goes to an S3-compatible bucket when the STATE_BUCKET secret is set
+# (with AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY and, for R2/B2,
+# STATE_ENDPOINT_URL), otherwise to the orphan branch `hunt-state`.
+# Pages: Settings -> Pages -> Source: GitHub Actions.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: "Search budget in minutes"
+        default: "330"
+      start_sector:
+        description: "First sector when there is no saved state"
+        default: "1"
+      profile:
+        description: "Strategy profile (fast, balanced, deep)"
+        default: "balanced"
+
+concurrency:
+  group: hunt
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      DESK_DATA: var/desk
+      HUNT_BUDGET_MINUTES: ${{ inputs.budget_minutes || '330' }}
+      HUNT_START_SECTOR: ${{ inputs.start_sector || vars.HUNT_START_SECTOR || '1' }}
+      HUNT_END_SECTOR: ${{ vars.HUNT_END_SECTOR }}
+      HUNT_PROFILE: ${{ inputs.profile || vars.HUNT_PROFILE || 'balanced' }}
+      HUNT_LIMIT: ${{ vars.HUNT_LIMIT || '200' }}
+      STATE_BUCKET: ${{ secrets.STATE_BUCKET }}
+      STATE_ENDPOINT_URL: ${{ secrets.STATE_ENDPOINT_URL }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION || 'auto' }}
+      STATE_GIT_BRANCH: hunt-state
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt boto3
+
+      - name: Restore light-curve cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: hunt-cache-${{ github.run_id }}
+          restore-keys: hunt-cache-
+
+      - name: Hunt (resumes from the last checkpoint)
+        run: python -m tool.worker --data "$DESK_DATA" --dashboard site
+
+      - name: Upload status page
+        if: always()
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  pages:
+    needs: hunt
+    if: always() && needs.hunt.result != 'cancelled'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

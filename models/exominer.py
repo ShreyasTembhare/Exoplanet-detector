@@ -47,15 +47,30 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 
+class _ResBlock1D(nn.Module if TORCH_AVAILABLE else object):
+    """Two convs with an identity (or 1x1 projection) skip around them."""
+
+    def __init__(self, in_ch, out_ch, kernel=5):
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv1d(in_ch, out_ch, kernel, padding=kernel // 2),
+            nn.BatchNorm1d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(out_ch, out_ch, kernel, padding=kernel // 2),
+            nn.BatchNorm1d(out_ch),
+        )
+        self.skip = (
+            nn.Identity() if in_ch == out_ch
+            else nn.Sequential(nn.Conv1d(in_ch, out_ch, 1), nn.BatchNorm1d(out_ch))
+        )
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.act(self.body(x) + self.skip(x))
+
+
 def _resblock_1d(in_ch, out_ch, kernel=5):
-    return nn.Sequential(
-        nn.Conv1d(in_ch, out_ch, kernel, padding=kernel // 2),
-        nn.BatchNorm1d(out_ch),
-        nn.ReLU(inplace=True),
-        nn.Conv1d(out_ch, out_ch, kernel, padding=kernel // 2),
-        nn.BatchNorm1d(out_ch),
-        nn.ReLU(inplace=True),
-    )
+    return _ResBlock1D(in_ch, out_ch, kernel)
 
 
 class _Conv1DTower(nn.Module if TORCH_AVAILABLE else object):
@@ -218,11 +233,24 @@ def make_exominer_inputs(
         if img.ndim == 2:
             img = img[None, :, :]
         di = img
-    scalars = np.array(
-        [float((scalars_dict or {}).get(name, 0.0) or 0.0) for name in SCALAR_FEATURE_NAMES],
-        dtype=np.float32,
-    )
+    scalars = scalar_vector(scalars_dict)
     return g, l, lc, pg, di, scalars
+
+
+def _finite_or_zero(value) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return v if np.isfinite(v) else 0.0
+
+
+def scalar_vector(scalars_dict: Optional[dict]) -> np.ndarray:
+    """NaN-safe scalar features, signed-log compressed so depth (1e-4) and
+    period (1e2) share a range before the BatchNorm."""
+    raw = np.array([_finite_or_zero((scalars_dict or {}).get(n)) for n in SCALAR_FEATURE_NAMES],
+                   dtype=np.float64)
+    return (np.sign(raw) * np.log1p(np.abs(raw) * 1e3) / np.log(1e3)).astype(np.float32)
 
 
 def count_parameters(model) -> int:

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import json
 import logging
 import os
 import sys
@@ -95,6 +94,22 @@ def _append_log(
             f.write(line)
 
 
+def sky_coords(target, meta) -> tuple:
+    """(ra, dec) in degrees: catalog target record first, then light-curve header."""
+    def _num(value):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return float("nan")
+        return number
+
+    ra = _num(getattr(target, "ra", float("nan")))
+    dec = _num(getattr(target, "dec", float("nan")))
+    if not (ra == ra and dec == dec) and isinstance(meta, dict):
+        ra, dec = _num(meta.get("ra")), _num(meta.get("dec"))
+    return ra, dec
+
+
 def _is_nan(val):
     if val is None:
         return True
@@ -117,7 +132,12 @@ def _load_progress(log_file: str) -> dict:
         progress = {}
         for _, row in df.iterrows():
             tic = _normalize_tic(str(row["TIC_ID"]))
+            status = str(row.get("STATUS", ""))
+            attempts = progress.get(tic, {}).get("error_attempts", 0)
+            if status.startswith("ERROR"):
+                attempts += 1
             progress[tic] = {
+                "error_attempts": attempts,
                 "last_stage": str(row.get("LAST_STAGE", "")),
                 "status": str(row.get("STATUS", "")),
                 "best_period": float(row["BEST_PERIOD"]) if "BEST_PERIOD" in row and not _is_nan(row.get("BEST_PERIOD")) else None,
@@ -170,34 +190,44 @@ def _fetch_sector_records(sector: int, cap: int):
     try:
         from astroquery.mast import Observations
         logger.info("Querying MAST for sector %d timeseries observations...", sector)
-        obs = Observations.query_criteria(
-            obs_collection="TESS",
-            sequence_number=sector,
-            dataproduct_type="timeseries",
-        )
-        if obs is not None and len(obs) > 0:
-            rows = []
-            take = min(len(obs), cap)
-            for i in range(take):
+        # 2-min SPOC targets first, then FFI high-level science products
+        # (TESS-SPOC, QLP), which cover far more stars per sector.
+        sources = [
+            {"obs_collection": "TESS"},
+            {"obs_collection": "HLSP", "provenance_name": ["TESS-SPOC", "QLP"]},
+        ]
+        if os.environ.get("HUNT_SKIP_FFI") == "1":
+            sources = sources[:1]
+        unique_rows = []
+        seen = set()
+        for source in sources:
+            if len(unique_rows) >= cap:
+                break
+            try:
+                obs = Observations.query_criteria(
+                    sequence_number=sector, dataproduct_type="timeseries", **source,
+                )
+            except Exception as exc:
+                logger.info("MAST %s query failed: %s", source["obs_collection"], exc)
+                continue
+            if obs is None or len(obs) == 0:
+                continue
+            for i in range(len(obs)):
+                if len(unique_rows) >= cap:
+                    break
                 row = {name: obs[name][i] for name in obs.colnames}
                 name = row.get("target_name", row.get(obs.colnames[0]))
                 tic = _normalize_tic(str(name))
-                if not tic or not tic.isdigit():
+                if not tic or not tic.isdigit() or tic in seen:
                     continue
-                rows.append({
+                seen.add(tic)
+                unique_rows.append({
                     "tic_id": tic,
                     "ra": row.get("s_ra", float("nan")),
                     "dec": row.get("s_dec", float("nan")),
                     "tmag": row.get("t_mag", row.get("tess_mag", float("nan"))),
                 })
-            # Unique, preserving pull order for ties.
-            seen = set()
-            unique_rows = []
-            for row in rows:
-                if row["tic_id"] in seen:
-                    continue
-                seen.add(row["tic_id"])
-                unique_rows.append(row)
+        if unique_rows:
             logger.info("MAST returned %d numeric TICs for sector %d", len(unique_rows), sector)
             return records_from_rows(unique_rows)
     except Exception as e:
@@ -279,7 +309,8 @@ def _get_ranked_queue(
     period_min: float = 0.5, period_max: float = 15.0,
 ):
     """Best-N primary targets, then a masked second pass for known CP/KP hosts."""
-    from pipeline.target_rank import rank_targets
+    from pipeline.completeness import load_map as load_completeness
+    from pipeline.target_rank import default_objective, rank_targets
     from pipeline.tic_enrich import enrich_records
 
     if tic_list_path and os.path.exists(tic_list_path):
@@ -296,6 +327,7 @@ def _get_ranked_queue(
     enrich_records(records)
     return rank_targets(
         records, limit=limit, period_min=period_min, period_max=period_max,
+        objective=default_objective(), completeness=load_completeness(),
     )
 
 
@@ -369,12 +401,18 @@ def _save_candidate_evidence(
     candidate_dir: str, tic_id: str, best_period: float, prob_planet: float,
     bls_power: float, sde: float, centroid_offset: float,
     plot_path: str, vetting: dict, peaks: list, strategy_profile: str,
-    epoch: float = None,
+    epoch: float = None, evidence: dict = None, views: dict = None,
 ):
+    """Write the candidate JSON; ``views`` (global/local fold) go to a sidecar
+    ``.views.npz`` so desk labels can later fine-tune the classifier."""
     safe_tic = str(tic_id).replace(" ", "_").replace("/", "_")
+    from pipeline.hard_flags import demotion
+
     vetting = dict(vetting or {})
     if epoch is not None and epoch == epoch:
         vetting.setdefault("transit_center_btjd", float(epoch))
+    if not isinstance(vetting.get("demotion"), dict):
+        vetting["demotion"] = demotion(vetting)
     meta = {
         "tic_id": tic_id,
         "best_period": best_period,
@@ -390,14 +428,57 @@ def _save_candidate_evidence(
         "plot": plot_path,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    json_path = os.path.join(candidate_dir, f"TIC_{safe_tic}_p{best_period:.2f}.json")
-    with open(json_path, "w") as f:
-        json.dump(meta, f, indent=2, default=str)
+    if evidence:
+        meta.update(evidence)
+    from strategy_profiles import DEFAULT_PROFILE, PROFILES, compute_candidate_score
+
+    profile = strategy_profile if strategy_profile in PROFILES else DEFAULT_PROFILE
+    meta["score"] = compute_candidate_score(
+        prob_planet, bls_power, centroid_offset, profile, vetting=vetting, sde=sde,
+    )
+    meta["demotion"] = vetting.get("demotion")
+    if vetting.get("discovery_status"):
+        meta["discovery_status"] = vetting["discovery_status"]
+        if vetting.get("known_match"):
+            meta["known_match"] = vetting["known_match"]
+    from pipeline.atomic import atomic_write_json
+
+    period_tag = best_period if best_period == best_period else 0.0
+    json_path = os.path.join(candidate_dir, f"TIC_{safe_tic}_p{period_tag:.2f}.json")
+    views = views or {}
+    if views.get("global_view") is not None and views.get("local_view") is not None:
+        views_path = json_path[:-5] + ".views.npz"
+        co = views.get("centroid_offset")
+        np.savez_compressed(
+            views_path,
+            global_view=np.asarray(views["global_view"], dtype=np.float32),
+            local_view=np.asarray(views["local_view"], dtype=np.float32),
+            centroid_offset=np.float32(co if co is not None and co == co else np.nan),
+        )
+        meta["views_path"] = views_path
+    atomic_write_json(json_path, meta)
+    return json_path
 
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
+
+
+def _evidence_for(time_arr, flux_arr, signal: dict, bls_result) -> dict:
+    """Plot data for the desk panels; never fails the star."""
+    try:
+        from pipeline.evidence import evidence_curves
+
+        hours = (signal.get("vetting") or {}).get("duration_hours")
+        return evidence_curves(
+            time_arr, flux_arr, signal.get("period"), signal.get("epoch"),
+            duration_days=float(hours) / 24.0 if hours and hours == hours else None,
+            periods=getattr(bls_result, "periods", None), power=getattr(bls_result, "power", None),
+        )
+    except Exception as exc:
+        logger.debug("Evidence curves skipped: %s", exc)
+        return {}
 
 
 def _load_model(checkpoint_path: str):
@@ -429,6 +510,10 @@ def _predict_batch(model, device, items):
     """
     if model is None or not items:
         return [None] * len(items)
+    if any(item.get("skip_classifier") for item in items):
+        scored = [item for item in items if not item.get("skip_classifier")]
+        probs = iter(_predict_batch(model, device, scored)) if scored else iter(())
+        return [None if item.get("skip_classifier") else next(probs) for item in items]
     try:
         import torch
 
@@ -437,6 +522,7 @@ def _predict_batch(model, device, items):
         return [None] * len(items)
 
     two_tower = isinstance(model, TwoTowerResNet1D) or hasattr(model, "global_tower")
+    temperature = max(float(getattr(model, "temperature", 1.0) or 1.0), 1e-3)
     cos = []
     if two_tower:
         globals_, locals_ = [], []
@@ -451,7 +537,7 @@ def _predict_batch(model, device, items):
         co_t = torch.tensor(cos, device=device, dtype=torch.float32)
         with torch.inference_mode():
             logits = model(global_t, local_t, centroid_offset=co_t)
-            probs = torch.softmax(logits, dim=1)
+            probs = torch.softmax(logits / temperature, dim=1)
         return [probs[i, 1].item() for i in range(len(items))]
 
     xs = []
@@ -463,14 +549,21 @@ def _predict_batch(model, device, items):
     co_t = torch.tensor(cos, device=device, dtype=torch.float32)
     with torch.inference_mode():
         logits = model(stacked, centroid_offset=co_t)
-        probs = torch.softmax(logits, dim=1)
+        probs = torch.softmax(logits / temperature, dim=1)
     return [probs[i, 1].item() for i in range(len(items))]
 
 
+MAX_ERROR_ATTEMPTS = 3
+
+
 def _should_skip_stage(progress: dict, tic_norm: str, stage: str) -> bool:
+    """Skip finished stars. Errors are retried up to ``MAX_ERROR_ATTEMPTS`` times."""
     if tic_norm not in progress:
         return False
-    last = progress[tic_norm].get("last_stage", "")
+    entry = progress[tic_norm]
+    if str(entry.get("status", "")).startswith("ERROR"):
+        return int(entry.get("error_attempts", 1)) >= MAX_ERROR_ATTEMPTS
+    last = entry.get("last_stage", "")
     if last == STAGE_DONE or last == "predict":
         return True
     try:
@@ -492,9 +585,13 @@ def run_hunt(
     checkpoint=DEFAULT_CHECKPOINT, log_file=LOG_FILE, candidate_dir=CANDIDATE_DIR,
     tic_list=None, infer_batch_size=32, period_min=0.5, period_max=15.0,
     nperiods=10000, strategy_profile=None, with_tpf=True, prefilter=True,
-    backend=None, adaptive_duration=True, use_tls=True,
+    backend=None, adaptive_duration=True, use_tls=True, shortlist_n=5,
 ):
-    """Core hunt logic, callable without CLI arg parsing."""
+    """Core hunt logic, callable without CLI arg parsing.
+
+    ``shortlist_n`` best new candidates get a TRICERATOPS fit at the end
+    (when the package is installed) instead of every peak during the search.
+    """
     candidates_found = []
     _ensure_setup(log_file, candidate_dir)
     progress = _load_progress(log_file)
@@ -504,13 +601,19 @@ def run_hunt(
     target_list = ranked.search_order()
     if not target_list:
         logger.error("No targets for sector %s.", sector)
-        return {"completed": 0, "candidates": candidates_found}
+        return {"completed": 0, "candidates": candidates_found, "no_targets": True}
     logger.info(
         "Sector %s: %d primary + %d known-host second pass (limit %d means best N)",
         sector, len(ranked.primary), len(ranked.second_pass), limit,
     )
 
+    from pipeline.known_planets import load_known_ephemerides
+
+    known_table = load_known_ephemerides()
     model, device = _load_model(checkpoint)
+    from pipeline import second_stage
+
+    vetter = second_stage.load_vetter()
     if model is None:
         logger.warning(
             "No checkpoint at %s. SDE-pass stars will be saved as CANDIDATE_SDE with vetting JSON.",
@@ -527,6 +630,7 @@ def run_hunt(
     total = len(target_list)
     hunt_start = _time.time()
     completed_count = 0
+    skipped_count = 0
     timings_csv = Path("hunter_timings.csv")
     if not timings_csv.exists():
         with open(timings_csv, "w") as f:
@@ -540,6 +644,14 @@ def run_hunt(
             return
         t0 = _time.time()
         probs = _predict_batch(model, device, predict_queue)
+        if vetter is not None:
+            second = second_stage.vet(vetter, [
+                item if not item.get("skip_classifier") else {} for item in predict_queue
+            ])
+            for item, p2 in zip(predict_queue, second):
+                if p2 is not None:
+                    item.setdefault("vetting", {})["exominer_prob"] = p2
+            probs = [second_stage.combine(p, p2) for p, p2 in zip(probs, second)]
         batch_ms = (_time.time() - t0) * 1000
         per_item_ms = batch_ms / len(predict_queue) if predict_queue else 0
 
@@ -560,7 +672,7 @@ def run_hunt(
                     item["max_power"] or 0.0, item["sde"], item["centroid_offset"] or 0.0,
                     plot_path, vetting=item["vetting"], peaks=item["peaks"],
                     strategy_profile=strategy_profile or "",
-                    epoch=item["epoch"],
+                    epoch=item["epoch"], evidence=item.get("evidence"), views=item,
                 )
                 candidates_found.append({
                     "tic_id": tic_id_q, "period": best_period_q,
@@ -598,6 +710,7 @@ def run_hunt(
         tic_norm = _normalize_tic(tic_id)
 
         if _should_skip_stage(progress, tic_norm, "predict"):
+            skipped_count += 1
             continue
 
         logger.info("[%s/%s] Processing %s...", i + 1, total, tic_id)
@@ -616,8 +729,8 @@ def run_hunt(
             )
             timings["phase1"] = (_time.time() - t0) * 1000
             if time_arr is None or len(time_arr) < 50:
-                status = "ERROR: Empty or too short light curve"
-                _append_log(log_file, tic_norm, "phase1", status, error=status)
+                status = "NO_DATA (empty or too short light curve)"
+                _append_log(log_file, tic_norm, STAGE_DONE, status)
                 progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
                 continue
 
@@ -651,11 +764,13 @@ def run_hunt(
                 sde_threshold=sde_threshold,
                 use_cache=True, use_tls=use_tls, max_planets=3,
                 tpf_time=tpf_time, tpf_flux_cube=tpf_flux_cube,
-                ra=float(meta.get("ra", float("nan"))) if isinstance(meta, dict) else float("nan"),
-                dec=float(meta.get("dec", float("nan"))) if isinstance(meta, dict) else float("nan"),
+                ra=sky_coords(target, meta)[0],
+                dec=sky_coords(target, meta)[1],
                 known_period=known_period if known_period == known_period else None,
                 known_epoch=known_epoch if known_epoch == known_epoch else None,
-                run_triceratops=True,
+                run_triceratops=False,
+                known_table=known_table,
+                trend=(meta or {}).get("trend"),
             )
             timings["phase2"] = (_time.time() - t0) * 1000
             res = found.get("bls")
@@ -681,16 +796,19 @@ def run_hunt(
                     "vetting": {
                         "depth": mono["depth"],
                         "duration_hours": mono["duration_days"] * 24.0,
-                        "n_transits": 1,
+                        "n_transits": len(mono.get("epochs") or [mono["epoch"]]),
                         "transit_center_btjd": mono["epoch"],
                         "mes": mono["mes"],
-                        "kind": "monotransit",
+                        "kind": mono.get("kind", "monotransit"),
+                        "epochs": mono.get("epochs"),
+                        "aliases": mono.get("aliases"),
                     },
-                    "hard_flags": ["n_transits"],
-                    "global_view": np.zeros(2048),
-                    "local_view": np.zeros(256),
+                    "hard_flags": [] if mono.get("kind") == "duotransit" else ["n_transits"],
+                    "global_view": mono.get("global_view"),
+                    "local_view": mono.get("local_view"),
                     "centroid_offset": float("nan"),
-                    "kind": "monotransit",
+                    "kind": mono.get("kind", "monotransit"),
+                    "skip_classifier": True,
                 })
             peaks_list = [
                 {"period": s["period"], "epoch": s["epoch"], "power": s["power"], "sde": s["sde"]}
@@ -715,7 +833,9 @@ def run_hunt(
                     "global_view": signal.get("global_view"),
                     "local_view": signal.get("local_view"),
                     "centroid_offset": signal.get("centroid_offset"),
+                    "skip_classifier": bool(signal.get("skip_classifier")),
                     "peaks": peaks_list, "vetting": vetting_dict,
+                    "evidence": _evidence_for(time_arr, flux_arr, signal, res),
                     "timings": timings, "tic_start": tic_start,
                 })
                 if len(predict_queue) >= infer_batch_size:
@@ -726,8 +846,9 @@ def run_hunt(
             logger.exception("Failed for %s", tic_id)
             total_ms = (_time.time() - tic_start) * 1000
             _append_log(log_file, tic_norm, STAGE_DONE, status,
-                        best_period=best_period, sde=sde_val)
-            progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status}
+                        best_period=best_period, sde=sde_val, error=str(e))
+            attempts = int(progress.get(tic_norm, {}).get("error_attempts", 0)) + 1
+            progress[tic_norm] = {"last_stage": STAGE_DONE, "status": status, "error_attempts": attempts}
             logger.info("  -> %s [%.0f ms]", status, total_ms)
             with open(timings_csv, "a") as f:
                 f.write(f"{tic_norm},{timings['phase1']:.0f},{timings['phase2']:.0f},"
@@ -735,28 +856,37 @@ def run_hunt(
             completed_count += 1
 
     _flush_predict_queue()
-    logger.info("Hunter run complete. Processed %d stars.", completed_count)
-    return {"completed": completed_count, "candidates": candidates_found}
+    if shortlist_n:
+        try:
+            from pipeline.shortlist import validate_shortlist
+
+            validate_shortlist(candidate_dir, n=shortlist_n)
+        except Exception as exc:
+            logger.warning("Shortlist validation skipped: %s", exc)
+    logger.info("Hunter run complete. Processed %d stars (%d already done).", completed_count, skipped_count)
+    return {"completed": completed_count, "skipped": skipped_count, "candidates": candidates_found}
 
 
 def main():
     parser = argparse.ArgumentParser(description="TESS Hunter: autonomous sector pipeline")
     parser.add_argument("--sector", type=int, default=SECTOR_TO_HUNT)
     parser.add_argument("--limit", type=int, default=TARGET_LIMIT)
-    parser.add_argument("--threshold", type=float, default=PROBABILITY_THRESHOLD)
-    parser.add_argument("--bls-threshold", type=float, default=BLS_POWER_THRESHOLD,
+    parser.add_argument("--threshold", type=float, default=None,
+                        help=f"Classifier probability cut (default {PROBABILITY_THRESHOLD} or the profile's).")
+    parser.add_argument("--bls-threshold", type=float, default=None,
                         help="Legacy raw-power gate (default 0 = disabled). Use --sde-threshold instead.")
-    parser.add_argument("--sde-threshold", type=float, default=SDE_THRESHOLD,
-                        help="Signal Detection Efficiency gate (default 7).")
+    parser.add_argument("--sde-threshold", type=float, default=None,
+                        help=f"Signal Detection Efficiency gate (default {SDE_THRESHOLD} or the profile's).")
     parser.add_argument("--checkpoint", type=str, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--log-file", type=str, default=LOG_FILE)
     parser.add_argument("--candidate-dir", type=str, default=CANDIDATE_DIR)
     parser.add_argument("--tic-list", type=str, default=None)
     parser.add_argument("--infer-batch-size", type=int, default=32)
-    parser.add_argument("--period-min", type=float, default=0.5)
-    parser.add_argument("--period-max", type=float, default=15.0)
-    parser.add_argument("--nperiods", type=int, default=10000)
-    parser.add_argument("--strategy-profile", type=str, default=None)
+    parser.add_argument("--period-min", type=float, default=None)
+    parser.add_argument("--period-max", type=float, default=None)
+    parser.add_argument("--nperiods", type=int, default=None)
+    parser.add_argument("--strategy-profile", type=str, default=None,
+                        help="balanced | ultra_short_period | single_transit_long_period | low_snr_m_dwarf")
     parser.add_argument("--no-tpf", action="store_true", help="Skip TPF download (faster but disables centroid vetting)")
     parser.add_argument("--no-prefilter", action="store_true", help="Skip cheap prefilter (CDPP/mag/contam)")
     parser.add_argument("--backend", type=str, default=None,
@@ -769,14 +899,19 @@ def main():
     parser.add_argument("--no-tls", action="store_true",
                         help="Do not run TLS, even on SDE-pass peaks.")
     args = parser.parse_args()
+    from strategy_profiles import DEFAULT_PROFILE, apply_profile_to_hunt_kwargs
+
+    search = apply_profile_to_hunt_kwargs(args.strategy_profile or DEFAULT_PROFILE, {
+        "threshold": args.threshold, "bls_threshold": args.bls_threshold,
+        "sde_threshold": args.sde_threshold, "period_min": args.period_min,
+        "period_max": args.period_max, "nperiods": args.nperiods,
+    })
     return run_hunt(
-        sector=args.sector, limit=args.limit, threshold=args.threshold,
-        bls_threshold=args.bls_threshold, sde_threshold=args.sde_threshold,
+        sector=args.sector, limit=args.limit,
         checkpoint=args.checkpoint, log_file=args.log_file,
         candidate_dir=args.candidate_dir, tic_list=args.tic_list,
         infer_batch_size=args.infer_batch_size,
-        period_min=args.period_min, period_max=args.period_max,
-        nperiods=args.nperiods, strategy_profile=args.strategy_profile,
+        strategy_profile=args.strategy_profile, **search,
         with_tpf=not args.no_tpf, prefilter=not args.no_prefilter,
         backend=args.backend, adaptive_duration=not args.no_adaptive_duration,
         use_tls=not args.no_tls,

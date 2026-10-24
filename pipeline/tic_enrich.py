@@ -134,36 +134,106 @@ def fetch_tic_row(tic: str) -> Optional[dict]:
     return out or None
 
 
+BATCH_SIZE = 500
+
+
+def _row_entry(row) -> dict:
+    out = {}
+    for src, dst in (("rad", "radius"), ("Tmag", "tmag"), ("contratio", "crowdsap")):
+        if src not in row.colnames:
+            continue
+        try:
+            value = float(row[src])
+        except (TypeError, ValueError):
+            continue
+        if value != value:
+            continue
+        if dst == "crowdsap":
+            if value > 1.5:
+                continue
+            value = float(max(0.0, min(1.0, 1.0 - value)))
+        out[dst] = value
+    return out
+
+
+def fetch_tic_rows(tics: Sequence[str], batch_size: int = BATCH_SIZE) -> Optional[dict]:
+    """Look up many TICs with one MAST query per ``batch_size`` ids.
+
+    Returns ``{tic: entry}`` (TICs with no row are absent) or ``None`` when
+    astroquery is unavailable or every batch failed.
+    """
+    try:
+        from astroquery.mast import Catalogs
+    except ImportError:
+        return None
+    found: dict = {}
+    ok = False
+    tics = [str(t) for t in tics if str(t).strip()]
+    for start in range(0, len(tics), batch_size):
+        chunk = tics[start:start + batch_size]
+        try:
+            table = Catalogs.query_criteria(catalog="TIC", ID=[int(t) for t in chunk if t.isdigit()])
+        except Exception as exc:
+            logger.info("TIC batch lookup failed (%d ids): %s", len(chunk), exc)
+            continue
+        ok = True
+        for row in table or []:
+            entry = _row_entry(row)
+            if entry:
+                found[str(row["ID"]).strip()] = entry
+    return found if ok else None
+
+
 def enrich_records(
     records: Sequence,
     *,
     cache_path: Optional[Path] = None,
     fetcher: Optional[Callable[[str], Optional[dict]]] = None,
+    batch_fetcher: Optional[Callable[[Sequence[str]], Optional[dict]]] = None,
     persist: bool = True,
 ) -> List:
-    """Fill missing ranking fields from cache, then optional catalog fetcher.
+    """Fill missing ranking fields from cache, then the TIC catalog.
 
-    ``fetcher`` defaults to :func:`fetch_tic_row`. Pass a stub in tests.
-    Records are mutated in place and also returned.
+    By default all missing TICs are looked up in batches with
+    :func:`fetch_tic_rows`. ``fetcher`` (one TIC at a time) is kept for tests
+    and custom catalogs. A TIC the catalog has nothing for is remembered so it
+    is not queried again on every run. Records are mutated in place and also
+    returned.
     """
     path = Path(cache_path) if cache_path is not None else DEFAULT_CACHE
     cache = load_cache(path)
-    lookup = fetcher if fetcher is not None else fetch_tic_row
     dirty = False
+    pending = []
     for record in records:
         tic = _tic_key(record)
         if not tic:
             continue
         if tic in cache:
             apply_cached(record, cache[tic])
-        if not _needs_enrichment(record):
-            continue
-        entry = lookup(tic)
-        if not entry:
-            continue
-        cache[tic] = {**cache.get(tic, {}), **{k: entry[k] for k in entry if k in _ENRICH_KEYS or k == "n_sectors"}}
-        apply_cached(record, cache[tic])
-        dirty = True
+        if _needs_enrichment(record) and not cache.get(tic, {}).get("_missing"):
+            pending.append((tic, record))
+
+    if pending and fetcher is None:
+        batch = (batch_fetcher or fetch_tic_rows)(sorted({tic for tic, _ in pending}))
+        if batch is not None:
+            lookup = batch.get
+        else:
+            lookup = None
+    else:
+        lookup = fetcher
+
+    if lookup is not None:
+        for tic, record in pending:
+            entry = lookup(tic)
+            if not entry:
+                if fetcher is None:
+                    cache[tic] = {**cache.get(tic, {}), "_missing": True}
+                    dirty = True
+                continue
+            keep = {k: entry[k] for k in entry if k in _ENRICH_KEYS}
+            cache[tic] = {**cache.get(tic, {}), **keep}
+            apply_cached(record, cache[tic])
+            dirty = True
     if dirty and persist:
         save_cache(path, cache)
     return list(records)

@@ -142,7 +142,7 @@ def load_csv_data(csv_path: str):
             global_views.append(data["global_view"])
             local_views.append(data["local_view"])
             cos.append(float(data.get("centroid_offset", np.nan)))
-            labels.append(int(data["label"]))
+            labels.append(int(row["label"]) if "label" in df.columns else int(data["label"]))
             sectors.append(int(row.get("sector", -1)))
         return global_views, local_views, cos, labels, sectors
     g_cols = [c for c in df.columns if c.startswith("global_")]
@@ -396,6 +396,92 @@ def compute_metrics(probs, labels, preds):
     return metrics
 
 
+def collect_logits(model, loader, device):
+    model.eval()
+    logits, labels = [], []
+    with torch.inference_mode():
+        for g, l, co, y in loader:
+            logits.append(model(g.to(device), l.to(device), centroid_offset=co.to(device)).float().cpu().numpy())
+            labels.append(y.numpy())
+    if not logits:
+        return np.zeros((0, 2)), np.zeros(0, dtype=np.int64)
+    return np.concatenate(logits), np.concatenate(labels)
+
+
+def calibrate_checkpoint(path: str, val_loader, device) -> dict:
+    """Fit temperature on validation logits of the saved best model and store it."""
+    from models.calibration import calibrated_probs, expected_calibration_error, fit_temperature
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model = load_checkpoint(path, device=device, strict=False)
+    logits, labels = collect_logits(model, val_loader, device)
+    temperature = fit_temperature(logits, labels)
+    ckpt["temperature"] = temperature
+    torch.save(ckpt, path)
+    out = {"temperature": temperature}
+    if len(labels):
+        out["ece_raw"] = expected_calibration_error(calibrated_probs(logits, 1.0), labels)
+        out["ece_calibrated"] = expected_calibration_error(calibrated_probs(logits, temperature), labels)
+    logger.info("Calibration: T=%.3f %s", temperature, out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Active learning: desk labels -> fine-tune set
+# ---------------------------------------------------------------------------
+
+DESK_LABELS = {"planet": 1, "false_positive": 0}
+
+
+def desk_label_manifest(labels_source: str, out_dir: Optional[str] = None) -> Optional[str]:
+    """Manifest of desk-labelled candidates (``planet`` / ``false_positive``).
+
+    ``labels_source`` is a desk data directory or its ``state.db``. Each label
+    row's snapshot points at the candidate's ``.views.npz`` sidecar; rows
+    without one (older candidates) are skipped. ``unsure`` is not a label.
+    """
+    import pandas as pd
+
+    from tool.state import StateStore
+
+    src = Path(labels_source)
+    db = src / "state.db" if src.is_dir() else src
+    if not db.is_file():
+        logger.error("No desk state at %s", db)
+        return None
+    out_rows = []
+    for row in StateStore(db).label_rows():
+        target = DESK_LABELS.get(row["label"])
+        if target is None:
+            continue
+        snap = row["payload"]
+        views = snap.get("views_path")
+        if not views and snap.get("json_path"):
+            guess = Path(str(snap["json_path"])[:-5] + ".views.npz")
+            views = str(guess) if guess.is_file() else None
+        if not views or not Path(views).is_file():
+            continue
+        out_rows.append({"path": views, "label": target, "sector": -1, "candidate_id": row["candidate_id"]})
+    if not out_rows:
+        logger.warning("No desk labels with saved views in %s.", db)
+        return None
+    out = Path(out_dir) if out_dir else db.parent / "training"
+    out.mkdir(parents=True, exist_ok=True)
+    manifest = out / "desk_labels.csv"
+    pd.DataFrame(out_rows).to_csv(manifest, index=False)
+    logger.info("Desk labels: %d usable (%d planet)", len(out_rows),
+                sum(r["label"] == 1 for r in out_rows))
+    return str(manifest)
+
+
+def merge_manifests(paths: List[str], out_path: str) -> str:
+    import pandas as pd
+
+    frames = [pd.read_csv(p) for p in paths if p]
+    pd.concat(frames, ignore_index=True).to_csv(out_path, index=False)
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Sector-disjoint split helper
 # ---------------------------------------------------------------------------
@@ -419,8 +505,14 @@ def sector_disjoint_split(
     n_total: int, sectors: list, val_holdout: Optional[List[int]],
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Return (train_idx, val_idx). If val_holdout is given, validation is
-    exactly the samples whose sector is in the holdout list; otherwise a
-    random 80/20."""
+    exactly the samples whose sector is in the holdout list. Otherwise, when
+    sectors are known, the latest ~20% of sectors are held out whole (the
+    model is judged on sectors it never saw, like a fresh release); a random
+    80/20 is the last resort for data without sectors."""
+    if not val_holdout and sectors is not None:
+        known = sorted({int(s) for s in sectors if s is not None and int(s) > 0})
+        if len(known) >= 3:
+            val_holdout = known[-max(1, round(len(known) * 0.2)):]
     if val_holdout and sectors is not None:
         sectors_arr = np.asarray(sectors)
         val_mask = np.isin(sectors_arr, val_holdout)
@@ -450,7 +542,29 @@ def run_train(
     use_focal: bool = True, use_injection_recovery: bool = True,
     val_holdout_sectors: Optional[str] = None,
     model_arch: str = "resnet1d",
+    labels: Optional[str] = None,
 ):
+    """``labels`` (desk dir or state.db) adds desk-labelled candidates. With
+    labels and no ``data`` it fine-tunes the existing ``out`` checkpoint at
+    ``finetune_lr`` (active learning from the review inbox)."""
+    if labels:
+        label_manifest = desk_label_manifest(labels, out_dir=str(Path(out).parent / "desk_labels"))
+        if label_manifest is None and not data:
+            return {"refused": True, "reason": "no_labels", "checkpoint_written": False}
+        if label_manifest and data and data not in ("auto", "triage"):
+            data = merge_manifests([data, label_manifest], str(Path(label_manifest).with_name("merged.csv")))
+        elif label_manifest and not data:
+            data = label_manifest
+            if pretrained is None and Path(out).is_file():
+                pretrained = out
+                lr = finetune_lr
+                logger.info("Fine-tuning %s on desk labels at lr=%g", out, lr)
+    if data == "triage":
+        from pipeline.catalog_labels import try_remote_catalog_subset
+
+        data = try_remote_catalog_subset(out_dir="data/triage_v2", limit=max_per_class * 2)
+        if data is None:
+            return {"refused": True, "reason": "no_catalog_data", "checkpoint_written": False}
     if not TORCH_AVAILABLE:
         logger.error("PyTorch is required. Install with: pip install torch")
         return None
@@ -570,6 +684,7 @@ def run_train(
                 break
 
     if final_m is not None:
+        final_m.update(calibrate_checkpoint(out, val_loader, device))
         metrics_path = Path(out).with_suffix(".metrics.json")
         with open(metrics_path, "w") as f:
             json.dump(final_m, f, indent=2)
@@ -585,7 +700,8 @@ def run_train(
 def main():
     parser = argparse.ArgumentParser(description="Train / fine-tune ResNet-1D exoplanet classifier")
     parser.add_argument("--data", type=str, default=None,
-                        help="CSV with features, or 'auto' to build from NASA TOI table")
+                        help="Manifest CSV, 'triage' (Triage-v2 labels + BLS-recovered folds + injections), "
+                             "or 'auto' to build from the NASA TOI table")
     parser.add_argument("--pretrained", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -604,6 +720,9 @@ def main():
     parser.add_argument("--val-holdout-sectors", type=str, default=None,
                         help="e.g. '21-26' to validate on sectors 21..26 only")
     parser.add_argument("--arch", type=str, default="resnet1d", choices=["resnet1d", "single"])
+    parser.add_argument("--labels", type=str, default=None,
+                        help="Desk data dir or state.db: add planet/false_positive review labels "
+                             "(alone: fine-tune the existing --out checkpoint)")
     args = parser.parse_args()
     return run_train(
         data=args.data, pretrained=args.pretrained, epochs=args.epochs,
@@ -614,6 +733,7 @@ def main():
         use_focal=not args.no_focal, use_injection_recovery=not args.no_injection_recovery,
         val_holdout_sectors=args.val_holdout_sectors,
         model_arch="single" if args.arch == "single" else "resnet1d",
+        labels=args.labels,
     )
 
 

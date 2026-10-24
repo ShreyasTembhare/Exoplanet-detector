@@ -73,6 +73,80 @@ def cadence_aware_window(cadence_minutes: float, target_hours: float = 12.0) -> 
     return n
 
 
+FLUX_COLUMNS = {
+    "SPOC": "pdcsap_flux",
+    "TESS-SPOC": "pdcsap_flux",
+    "QLP": "kspsap_flux",
+}
+
+
+def _column(table, name, n):
+    try:
+        return list(table[name])
+    except Exception:
+        return [None] * n
+
+
+def select_products(table, sector: Optional[int] = None, max_sectors: Optional[int] = None) -> Tuple[list, str]:
+    """Pick which rows of a ``search_lightcurve`` table to download.
+
+    * One author for the whole stitch (mixing pipelines leaves steps at sector
+      boundaries). The author covering the most sectors wins, so a star with
+      two SPOC 2-min sectors and ten QLP/TESS-SPOC FFI sectors is searched on
+      the long baseline; ties go to ``PREFERRED_AUTHORS`` order.
+    * One product per sector, the shortest cadence (20 s < 120 s < FFI).
+    * Sectors in ascending order; ``max_sectors=None`` keeps them all.
+
+    Returns ``(row_indices, author)``.
+    """
+    n = len(table)
+    if n == 0:
+        return [], ""
+    authors = [str(a or "").strip() for a in _column(table, "author", n)]
+    exptimes = []
+    for value in _column(table, "exptime", n):
+        try:
+            exptimes.append(float(getattr(value, "value", value)))
+        except (TypeError, ValueError):
+            exptimes.append(float("inf"))
+    sectors = []
+    for i, value in enumerate(_column(table, "sequence_number", n)):
+        try:
+            sectors.append(int(value))
+        except (TypeError, ValueError):
+            sectors.append(-1 - i)
+
+    def rank(author: str) -> int:
+        return PREFERRED_AUTHORS.index(author) if author in PREFERRED_AUTHORS else len(PREFERRED_AUTHORS)
+
+    rows = [i for i in range(n) if sector is None or sectors[i] == int(sector)] or list(range(n))
+    coverage: dict = {}
+    for i in rows:
+        coverage.setdefault(authors[i], set()).add(sectors[i])
+    best_author = min(coverage, key=lambda a: (-len(coverage[a]), rank(a)))
+    best_per_sector: dict = {}
+    for i in rows:
+        if authors[i] != best_author:
+            continue
+        current = best_per_sector.get(sectors[i])
+        if current is None or exptimes[i] < exptimes[current]:
+            best_per_sector[sectors[i]] = i
+    chosen = [best_per_sector[s] for s in sorted(best_per_sector)]
+    if max_sectors:
+        chosen = chosen[:max_sectors]
+    return chosen, best_author
+
+
+def _download(product, quality_bitmask: str, author: str):
+    column = FLUX_COLUMNS.get(author)
+    if column:
+        try:
+            return product.download(quality_bitmask=quality_bitmask, flux_column=column)
+        except Exception as exc:
+            logger.info("%s flux column %s unavailable (%s); using the default column", author, column, exc)
+    return product.download(quality_bitmask=quality_bitmask)
+
+
 def _filter_same_author(search):
     """Return a search restricted to a single preferred author, or the original
     if no preferred author is present."""
@@ -93,11 +167,14 @@ def load_tess_lightcurve(
     tic_id: str,
     sector: Optional[int] = None,
     quality_bitmask: str = "default",
-    max_sectors: int = 6,
+    max_sectors: Optional[int] = None,
 ) -> Tuple[Any, str, dict]:
     """
     Load TESS light curve(s) for a TIC. Returns (lc, sector_label, meta).
-    ``meta`` carries cadence_minutes, author, crowdsap, tmag, n_sectors.
+    ``meta`` carries cadence_minutes, author, crowdsap, tmag, n_sectors,
+    sectors and exptime_s. See :func:`select_products` for which products
+    are used; FFI high-level science products (TESS-SPOC, QLP) count, so
+    stars without 2-min data are searched too.
     """
     import lightkurve as lk
 
@@ -108,29 +185,42 @@ def load_tess_lightcurve(
     search = lk.search_lightcurve(tic_str, mission="TESS", sector=sector)
     if len(search) == 0:
         raise ValueError(f"No TESS light curve found for {tic_str}")
-    search = _filter_same_author(search)
+    chosen, author = select_products(search.table, sector=sector, max_sectors=max_sectors)
+    if not chosen:
+        raise ValueError(f"No usable TESS light curve product for {tic_str}")
 
-    meta: dict = {}
-    if sector is not None:
-        lc = search[0].download(quality_bitmask=quality_bitmask)
-        meta["n_sectors"] = 1
-        sector_label = str(lc.sector) if hasattr(lc, "sector") and lc.sector is not None else str(sector)
+    meta: dict = {"author": author or "unknown"}
+    lcs = []
+    for index in chosen:
+        try:
+            lcs.append(_download(search[index], quality_bitmask, author))
+        except Exception as exc:
+            logger.warning("Download failed for %s row %d: %s", tic_str, index, exc)
+    if not lcs:
+        raise ValueError(f"Every light-curve download failed for {tic_str}")
+    if len(lcs) == 1:
+        lc = lcs[0].normalize()
     else:
-        lcs = search[:max_sectors].download_all(quality_bitmask=quality_bitmask)
-        lc = lcs.stitch()
-        meta["n_sectors"] = len(lcs)
-        sector_label = "all"
-
+        lc = lk.LightCurveCollection(lcs).stitch()
+    meta["n_sectors"] = len(lcs)
+    meta["sectors"] = [int(getattr(item, "sector", 0) or 0) for item in lcs]
     try:
-        meta["author"] = str(getattr(lc, "author", search.table["author"][0]))
+        meta["exptime_s"] = float(getattr(search.table["exptime"][chosen[0]], "value",
+                                          search.table["exptime"][chosen[0]]))
     except Exception:
-        meta["author"] = "unknown"
+        meta["exptime_s"] = float("nan")
+    if sector is not None:
+        sector_label = str(meta["sectors"][0] or sector)
+    else:
+        sector_label = "all"
     for header_key, meta_key in [
         ("CROWDSAP", "crowdsap"),
         ("TESSMAG", "tmag"),
         ("TEFF", "teff"),
         ("LOGG", "logg"),
         ("RADIUS", "radius"),
+        ("RA_OBJ", "ra"),
+        ("DEC_OBJ", "dec"),
     ]:
         try:
             meta[meta_key] = float(lc.meta.get(header_key, lc.meta.get(header_key.lower(), float("nan"))))
@@ -140,10 +230,16 @@ def load_tess_lightcurve(
     return lc, sector_label, meta
 
 
+DETREND_METHOD = "biweight"
+
+
 def preprocess_lightcurve(lc, cadence_minutes: Optional[float] = None):
     """
     Drop NaN cadences, flatten with cadence-aware Savitzky-Golay window,
-    and remove 3-sigma outliers.
+    and clip upward outliers. Transits are downward, so a symmetric 3-sigma
+    clip would delete the in-transit cadences of any dip deeper than 3x the
+    noise; only flares/cosmic rays above the trend and gross negative
+    glitches are removed.
     """
     lc = lc.remove_nans()
     if cadence_minutes is None:
@@ -154,7 +250,30 @@ def preprocess_lightcurve(lc, cadence_minutes: Optional[float] = None):
     except Exception as exc:
         logger.warning("flatten(window=%d) failed (%s); retrying with 101", window, exc)
         lc_flat = lc.flatten(window_length=101)
-    return lc_flat.remove_outliers(sigma=3)
+    return lc_flat.remove_outliers(sigma_upper=3, sigma_lower=20)
+
+
+def detrend_arrays(time: np.ndarray, flux: np.ndarray, flux_err: np.ndarray, window_days: float = 0.75):
+    """Biweight-detrend normalised arrays; returns ``(time, flat, err, trend)``.
+
+    Upward 3-sigma outliers are dropped (flares, cosmic rays); downward ones
+    are kept unless absurd, so transits survive.
+    """
+    from .detrend import biweight_detrend
+
+    keep = np.isfinite(time) & np.isfinite(flux)
+    time, flux, flux_err = time[keep], flux[keep], flux_err[keep]
+    median = np.nanmedian(flux)
+    if median and np.isfinite(median):
+        flux = flux / median
+        flux_err = flux_err / median
+    flat, trend = biweight_detrend(time, flux, window_days=window_days)
+    resid = flat - np.nanmedian(flat)
+    sigma = 1.4826 * np.nanmedian(np.abs(resid))
+    good = np.isfinite(flat)
+    if sigma > 0:
+        good &= (resid < 3.0 * sigma) & (resid > -20.0 * sigma)
+    return time[good], flat[good], flux_err[good], trend[good]
 
 
 def _maybe_download_tpf(tic_id: str, sector: Optional[int]):  # pragma: no cover - network
@@ -206,17 +325,24 @@ def run_phase1(
     use_cache: bool = True,
     quality_bitmask: str = "default",
     with_tpf: bool = False,
+    detrend: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, str, dict]:
     """
     Run Phase 1 and return ``(time, flux, flux_err, sector_label, meta)``.
+
+    ``detrend`` is ``"biweight"`` (default; ``meta["trend"]`` keeps the fitted
+    trend so a candidate can be re-flattened with its transits masked) or
+    ``"savgol"`` for the old lightkurve flatten.
 
     ``meta`` includes ``cadence_minutes``, ``crowdsap``, ``tmag``, ``author``,
     ``n_sectors``, and ``with_tpf`` (bool indicating cache had TPF).
     """
     sector_label = "all" if sector is None else str(sector)
+    method = detrend or DETREND_METHOD
+    cache_label = sector_label if method == "savgol" else f"{sector_label}@{method}"
 
     if use_cache:
-        cached = get_phase1(tic_id, sector_label)
+        cached = get_phase1(tic_id, cache_label)
         if cached is not None:
             time, flux, flux_err, meta = cached
             if with_tpf:
@@ -229,18 +355,27 @@ def run_phase1(
     time_full = _time_to_array(lc.time)
     cadence_min = _cadence_minutes(time_full)
     meta["cadence_minutes"] = cadence_min
+    meta["detrend"] = method
 
-    lc_clean = preprocess_lightcurve(lc, cadence_minutes=cadence_min)
-
-    time = _time_to_array(lc_clean.time)
-    flux = _flux_to_array(lc_clean.flux)
-    if lc_clean.flux_err is not None:
-        flux_err = _flux_to_array(lc_clean.flux_err)
+    if method == "biweight":
+        lc_nan = lc.remove_nans()
+        raw_err = lc_nan.flux_err
+        time, flux, flux_err, trend = detrend_arrays(
+            _time_to_array(lc_nan.time), _flux_to_array(lc_nan.flux),
+            _flux_to_array(raw_err) if raw_err is not None else np.full(len(lc_nan.time), np.nan),
+        )
+        meta["trend"] = trend.astype(np.float32)
     else:
-        flux_err = np.full_like(flux, np.nan)
+        lc_clean = preprocess_lightcurve(lc, cadence_minutes=cadence_min)
+        time = _time_to_array(lc_clean.time)
+        flux = _flux_to_array(lc_clean.flux)
+        if lc_clean.flux_err is not None:
+            flux_err = _flux_to_array(lc_clean.flux_err)
+        else:
+            flux_err = np.full_like(flux, np.nan)
 
     if use_cache:
-        set_phase1(tic_id, sector_label, time, flux, flux_err, meta=meta)
+        set_phase1(tic_id, cache_label, time, flux, flux_err, meta=meta)
 
     if with_tpf:
         try:

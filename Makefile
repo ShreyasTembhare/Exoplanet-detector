@@ -1,4 +1,4 @@
-.PHONY: bootstrap test lint hunt phunt scan train pretrain autopilot clean smoke tool desk dev
+.PHONY: bootstrap test lint web-test ci hunt phunt scan train pretrain autopilot clean smoke tool desk run dev completeness
 
 PY := .venv/bin/python
 PIP := .venv/bin/pip
@@ -11,8 +11,16 @@ test:
 	$(PY) -m pytest -q
 
 lint:
-	$(PY) -m ruff check . || true
-	$(PY) -m ruff format --check . || true
+	$(PY) -m ruff check .
+
+web-test:
+	cd web && npm test && npm run build
+
+# Everything CI runs.
+ci: lint test web-test
+
+completeness:
+	$(PY) -m pipeline.completeness --out var/desk/completeness.json
 
 scan:
 	$(PY) run.py scan "TIC 441462736" --predict
@@ -24,7 +32,10 @@ phunt:
 	$(PY) run.py phunt --sector 15 --limit 1000 --download-workers 8 --cpu-workers 4
 
 train:
-	$(PY) run.py train --data auto --epochs 30 --max-per-class 2500 --val-holdout-sectors 21-26
+	$(PY) train_triage_v2.py --fetch --limit 2000 --injections 500 --epochs 30
+
+train-labels:
+	$(PY) train_classifier.py --labels var/desk
 
 pretrain-mlm:
 	$(PY) run.py pretrain mlm --epochs 10
@@ -39,15 +50,13 @@ smoke:
 	$(PY) -m pytest tests/test_cache.py tests/test_bls.py tests/test_vetting.py -q
 
 # Default local run: one process, built UI, continuous search auto-starts.
-desk: bootstrap
-	cd web && npm install && npm run build
-	$(PY) -m tool --host 127.0.0.1 --port 8765
-
-tool: desk
+# Prefer: ./run
+run desk tool:
+	./run
 
 dev: bootstrap
 	cd web && npm install
-	$(PY) -m tool --host 127.0.0.1 --port 8765 &
+	$(PY) -m tool --host 127.0.0.1 --port 8765 --auto-start &
 	cd web && npm run dev
 
 clean:

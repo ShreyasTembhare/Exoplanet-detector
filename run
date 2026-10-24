@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# One-command local desk: UI + API + continuous search.
+# Usage: ./run
+set -euo pipefail
+cd "$(dirname "$0")"
+
+HOST="${DESK_HOST:-127.0.0.1}"
+PORT="${DESK_PORT:-8765}"
+DATA="${DESK_DATA:-var/desk}"
+PY="${PY:-.venv/bin/python}"
+PIP="${PIP:-.venv/bin/pip}"
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+need_cmd python3
+
+if [[ ! -x "$PY" ]]; then
+  echo "Creating virtualenv…"
+  python3 -m venv .venv
+fi
+
+if ! "$PY" -c "import fastapi, uvicorn, numpy, astropy" 2>/dev/null; then
+  echo "Installing Python dependencies…"
+  "$PIP" install -q -r requirements.txt
+fi
+
+# Prefer the committed build; rebuild only when the UI source is newer.
+need_ui_build() {
+  [[ ! -f tool/static/index.html ]] && return 0
+  [[ ! -d web/node_modules ]] && return 0
+  local newest
+  newest=$(find web/src web/index.html web/package.json -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)
+  local built
+  built=$(stat -c '%Y' tool/static/index.html 2>/dev/null || echo 0)
+  [[ -n "$newest" ]] && awk -v n="$newest" -v b="$built" 'BEGIN { exit !(n > b) }'
+}
+
+if need_ui_build; then
+  need_cmd npm
+  echo "Building UI…"
+  (cd web && npm install --silent && npm run build)
+fi
+
+mkdir -p "$DATA"
+URL="http://${HOST}:${PORT}"
+echo
+echo "Transit desk → ${URL}"
+echo "  data: ${DATA}"
+echo "  Ctrl+C stops. Progress is kept in ${DATA}/state.db"
+echo
+
+exec "$PY" -m tool --host "$HOST" --port "$PORT" --data "$DATA" --auto-start "$@"

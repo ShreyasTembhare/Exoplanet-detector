@@ -10,6 +10,10 @@ Small stars, long continuous-viewing-zone baselines, and quiet uncrowded
 stars rise to the top because those terms are in the score. ``limit`` is
 the best N, not the first N a catalog happened to return.
 
+The default hunt objective is :func:`expected_yield` instead: occurrence
+prior × transit probability × detection probability summed over a period
+and radius grid, counting only the gain over sectors already searched.
+
 Known CP/KP hosts are not searched blindly for the same signal. They go to
 a second-pass queue whose known ephemeris is masked. FP/FA dispositions are
 deprioritized so a repeat of that signal is not the first thing downloaded.
@@ -20,6 +24,7 @@ planets is where surveys stared, not where planets clump.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence
 
@@ -155,6 +160,127 @@ def expected_snr(
     return float(snr)
 
 
+# Approximate occurrence per (ln P, ln Rp) cell, after Kepler FGK results
+# (Hsu et al. 2019; Fulton & Petigura 2018): small planets dominate and the
+# rate rises as P^~1 below ~10 d then flattens. M dwarfs host roughly 2x as
+# many small planets (Dressing & Charbonneau 2015). Only relative values
+# matter for ranking, so the normalisation is loose.
+OCCURRENCE_RADIUS_BINS = (  # (Rp_lo, Rp_hi, rate per unit ln P per unit ln R at P >= 10 d)
+    (0.8, 1.4, 0.18),
+    (1.4, 2.0, 0.22),
+    (2.0, 2.8, 0.20),
+    (2.8, 4.0, 0.10),
+    (4.0, 8.0, 0.02),
+    (8.0, 16.0, 0.01),
+)
+DETECTION_SNR = 7.1
+DETECTION_WIDTH = 1.0
+
+
+def occurrence_rate(period: float, rp_rearth: float, stellar_radius: float = 1.0) -> float:
+    rate = 0.0
+    for lo, hi, value in OCCURRENCE_RADIUS_BINS:
+        if lo <= rp_rearth < hi:
+            rate = value
+            break
+    rate *= min((float(period) / 10.0), 1.0) ** 1.0
+    if stellar_radius < 0.6 and rp_rearth < 4.0:
+        rate *= 2.0
+    return float(rate)
+
+
+def default_objective() -> str:
+    """``HUNT_RANK_OBJECTIVE`` (``yield`` or ``snr``); yield by default."""
+    value = os.environ.get("HUNT_RANK_OBJECTIVE", "yield").strip().lower()
+    return value if value in {"yield", "snr"} else "yield"
+
+
+def detection_probability(snr: float) -> float:
+    """Logistic recovery curve centred on the usual 7.1-sigma TESS threshold."""
+    return float(1.0 / (1.0 + np.exp(-(float(snr) - DETECTION_SNR) / DETECTION_WIDTH)))
+
+
+def _stellar_terms(record: TargetRecord):
+    radius = float(record.radius) if _finite(record.radius) and float(record.radius) > 0 else 1.0
+    rho = float(record.rho) if _finite(record.rho) and float(record.rho) > 0 else 1.0 / radius ** 2
+    cdpp = float(record.cdpp_ppm) if _finite(record.cdpp_ppm) and float(record.cdpp_ppm) > 0 else cdpp_ppm_from_tmag(record.tmag)
+    dilution = float(np.clip(float(record.crowdsap), 0.05, 1.0)) if _finite(record.crowdsap) else 1.0
+    return radius, rho, max(cdpp, 1.0), dilution
+
+
+def _detect_grid(record: TargetRecord, periods: np.ndarray, radii: np.ndarray, n_sectors: float,
+                 completeness: Optional[dict] = None) -> np.ndarray:
+    """Detection probability on a (period, radius) grid for ``n_sectors`` of data.
+
+    With a measured ``completeness`` map (``pipeline.completeness``) and a
+    known Tmag the injection-recovery fraction is used; otherwise a logistic
+    in analytic SNR.
+    """
+    if n_sectors <= 0:
+        return np.zeros((len(periods), len(radii)))
+    radius, rho, cdpp, dilution = _stellar_terms(record)
+    baseline = n_sectors * SECTOR_DAYS
+    n_tr = baseline / periods
+    if completeness is not None and _finite(record.tmag):
+        from pipeline.completeness import detection_probability as measured
+
+        grid = np.array([
+            [measured(completeness, p, r * np.sqrt(dilution), float(record.tmag), radius, n_sectors)
+             for r in radii] for p in periods
+        ], dtype=object)
+        if all(v is not None for v in grid.ravel()):
+            return np.where((n_tr >= 2.0)[:, None], grid.astype(float), 0.0)
+    # Central-transit duration in hours for this stellar density.
+    dur_h = 13.0 * (periods / 365.25) ** (1.0 / 3.0) * rho ** (-1.0 / 3.0)
+    depth_ppm = (radii[None, :] * R_EARTH_OVER_R_SUN / radius) ** 2 * 1e6 * dilution
+    snr = depth_ppm / cdpp * np.sqrt(np.maximum(n_tr * dur_h, 0.0))[:, None]
+    p = 1.0 / (1.0 + np.exp(-(snr - DETECTION_SNR) / DETECTION_WIDTH))
+    # A periodic search needs two transits; the window function cuts long P.
+    return np.where((n_tr >= 2.0)[:, None], p, 0.0)
+
+
+def expected_yield(
+    record: TargetRecord,
+    *,
+    period_min: float = 0.5,
+    period_max: float = 15.0,
+    prior_sectors: Optional[float] = None,
+    n_period: int = 24,
+    completeness: Optional[dict] = None,
+) -> float:
+    """Expected number of *new* detectable planets this target adds.
+
+    Sums occurrence × transit probability × detection probability over a
+    log (P, Rp) grid. When the star was already searched with
+    ``prior_sectors`` of data (default ``record.extra['searched_sectors']``),
+    only the gain in detection probability counts, so stars whose added
+    baseline unlocks longer periods or smaller planets rise and fully
+    exhausted ones fall.
+    """
+    radius, rho, _, _ = _stellar_terms(record)
+    n_sectors = float(record.n_sectors) if record.n_sectors and int(record.n_sectors) > 0 else 1.0
+    if prior_sectors is None:
+        prior_sectors = float((record.extra or {}).get("searched_sectors") or 0.0)
+    log_p = np.linspace(np.log(max(period_min, 1e-3)), np.log(max(period_max, period_min * 1.01)), n_period)
+    periods = np.exp(log_p)
+    dlnp = log_p[1] - log_p[0] if n_period > 1 else 1.0
+    radii, dlnr = [], []
+    for lo, hi, _ in OCCURRENCE_RADIUS_BINS:
+        radii.append(np.sqrt(lo * hi))
+        dlnr.append(np.log(hi / lo))
+    radii = np.asarray(radii)
+    dlnr = np.asarray(dlnr)
+
+    a_over_r = (periods / 365.25) ** (2.0 / 3.0) * rho ** (1.0 / 3.0) * A_OVER_RSTAR_1AU
+    p_transit = np.clip(1.0 / a_over_r, 0.0, 1.0)
+    occ = np.array([[occurrence_rate(p, r, radius) for r in radii] for p in periods])
+    gain = _detect_grid(record, periods, radii, n_sectors, completeness) - _detect_grid(
+        record, periods, radii, min(prior_sectors, n_sectors), completeness
+    )
+    cell = occ * p_transit[:, None] * np.clip(gain, 0.0, 1.0) * dlnp * dlnr[None, :]
+    return float(np.sum(cell))
+
+
 def rank_targets(
     records: Sequence[TargetRecord],
     *,
@@ -165,9 +291,13 @@ def rank_targets(
     max_tmag: float = DEFAULT_MAX_TMAG,
     min_crowdsap: float = DEFAULT_MIN_CROWDSAP,
     second_pass_limit: Optional[int] = None,
+    objective: str = "snr",
+    completeness: Optional[dict] = None,
 ) -> RankedQueue:
     """Rank before download. ``limit`` keeps the best N primary targets.
 
+    ``objective="snr"`` sorts by :func:`expected_snr`; ``"yield"`` sorts by
+    :func:`expected_yield`, the marginal number of detectable planets.
     Sky position is not an input. Confirmed hosts are removed from the
     primary queue and returned in ``second_pass`` for a masked re-search.
     """
@@ -177,9 +307,13 @@ def rank_targets(
         record.source_index = index
         if not passes_tic_cuts(record, max_tmag=max_tmag, min_crowdsap=min_crowdsap):
             continue
-        record.score = expected_snr(
-            record, period_min=period_min, period_max=period_max, rp_rearth=rp_rearth,
-        )
+        if objective == "yield":
+            record.score = expected_yield(record, period_min=period_min, period_max=period_max,
+                                          completeness=completeness)
+        else:
+            record.score = expected_snr(
+                record, period_min=period_min, period_max=period_max, rp_rearth=rp_rearth,
+            )
         disposition = (record.disposition or "").strip().upper()
         record.disposition = disposition
         if disposition in CONFIRMED_DISPOSITIONS:

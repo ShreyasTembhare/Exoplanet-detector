@@ -169,41 +169,33 @@ def _lookup_lc(light_curves: dict, tic: str):
     return None
 
 
-def try_remote_catalog_subset(out_dir: str = "data/triage_v2", timeout: float = 15.0) -> Optional[str]:
-    """Download a small real subset when Zenodo or MAST answers.
+def try_remote_catalog_subset(
+    out_dir: str = "data/triage_v2",
+    timeout: float = 60.0,
+    limit: Optional[int] = 300,
+    n_injections: int = 100,
+    load_lc=None,
+) -> Optional[str]:
+    """Build a real training manifest from the Triage-v2 label table.
 
-    Returns a manifest path, or None when the network or the record is
-    unreachable. Never fabricates a Gaussian training set.
+    Downloads only the 3 MB labelled TCE table, fetches each TIC's light
+    curve through Phase 1 (``load_lc`` overrides that, e.g. for tests), and
+    folds at BLS-recovered ephemerides. Returns None when Zenodo is
+    unreachable or nothing could be folded. Never fabricates data.
     """
-    try:
-        import json
-        import urllib.request
+    from pipeline import training_data
 
-        url = f"https://zenodo.org/api/records/{TRIAGE_V2_RECORD}"
-        req = urllib.request.Request(url, headers={"User-Agent": "tess-exoplanet-detector"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
-        logger.info("Triage-v2 record not reachable (%s).", exc)
+    table_path = training_data.download_triage_table(out_dir, timeout=timeout)
+    if table_path is None:
         return None
+    table = training_data.load_triage_table(table_path)
+    if limit:
+        # Keep the class balance workable for a small subset.
+        pos = table[table["label"] == 1].head(limit // 2)
+        neg = table[table["label"] == 0].head(limit - len(pos))
+        import pandas as pd
 
-    files = (payload.get("files") or []) if isinstance(payload, dict) else []
-    # Prefer a small csv/npz. Skip multi-GB light-curve bundles.
-    small = []
-    for item in files:
-        size = int(item.get("size") or 0)
-        key = str(item.get("key") or "")
-        if size and size < 50_000_000 and key.lower().endswith((".csv", ".parquet", ".npz")):
-            small.append(item)
-    if not small:
-        logger.info(
-            "Triage-v2 is reachable but has no small labeled table to fold locally. "
-            "A full light-curve bundle is not downloaded into the training path.",
-        )
-        return None
-    # A table without the light curves still cannot be folded here.
-    logger.info(
-        "Triage-v2 listed %d small file(s); folding still needs light curves. Skipping partial download.",
-        len(small),
+        table = pd.concat([pos, neg], ignore_index=True)
+    return training_data.build_training_set(
+        table, load_lc or training_data.phase1_loader, out_dir, n_injections=n_injections,
     )
-    return None
