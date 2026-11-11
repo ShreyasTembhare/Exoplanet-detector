@@ -56,20 +56,31 @@ function statusBadgeVariant(status) {
   return "neutral";
 }
 
+const API_DOWN = "The desk API is not running on port 8765. From the repo root, run python -m tool.";
+
 async function api(path, options) {
-  const response = await fetch(path, options);
+  let response;
+  try {
+    response = await fetch(path, options);
+  } catch {
+    throw new Error(API_DOWN);
+  }
   const text = await response.text();
   let body = null;
   if (text) {
     try {
       body = JSON.parse(text);
     } catch {
-      body = { detail: text.slice(0, 240) };
+      body = null;
     }
   }
   if (!response.ok) {
-    const detail = body && body.detail ? body.detail : response.statusText;
-    throw new Error(typeof detail === "string" ? detail : "Request failed");
+    const detail = body && typeof body.detail === "string" ? body.detail : null;
+    if (detail) throw new Error(detail);
+    if (response.status === 502 || response.status === 503 || response.status === 500) {
+      throw new Error(API_DOWN);
+    }
+    throw new Error(response.statusText || "Request failed");
   }
   return body;
 }
