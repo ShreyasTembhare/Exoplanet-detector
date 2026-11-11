@@ -1,11 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-
-const STEPS = [
-  { id: "live", title: "Live" },
-  { id: "queue", title: "Queue" },
-  { id: "inbox", title: "Inbox" },
-  { id: "review", title: "Review" },
-];
+import { AppShell } from "@astryxdesign/core/AppShell";
+import { Badge } from "@astryxdesign/core/Badge";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Button } from "@astryxdesign/core/Button";
+import { Collapsible } from "@astryxdesign/core/Collapsible";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { FileInput } from "@astryxdesign/core/FileInput";
+import { FormLayout } from "@astryxdesign/core/FormLayout";
+import { Heading } from "@astryxdesign/core/Heading";
+import { HStack } from "@astryxdesign/core/HStack";
+import { Layout, LayoutContent, LayoutHeader, LayoutPanel } from "@astryxdesign/core/Layout";
+import { List, ListItem } from "@astryxdesign/core/List";
+import { MetadataList, MetadataListItem } from "@astryxdesign/core/MetadataList";
+import { NumberInput } from "@astryxdesign/core/NumberInput";
+import { Section } from "@astryxdesign/core/Section";
+import { SideNav, SideNavItem } from "@astryxdesign/core/SideNav";
+import { StackItem } from "@astryxdesign/core/Stack";
+import { StatusDot } from "@astryxdesign/core/StatusDot";
+import { Table, proportional } from "@astryxdesign/core/Table";
+import { Text } from "@astryxdesign/core/Text";
+import { TextArea } from "@astryxdesign/core/TextArea";
+import { TextInput } from "@astryxdesign/core/TextInput";
+import { TopNav, TopNavHeading } from "@astryxdesign/core/TopNav";
+import { VStack } from "@astryxdesign/core/VStack";
+import { useTheme } from "@astryxdesign/core/theme";
 
 const FLAG_LABEL = {
   odd_even: "Odd/even",
@@ -21,12 +39,21 @@ function fmt(value, digits) {
 
 function statusLabel(status) {
   const raw = (status || "idle").toLowerCase();
-  if (raw === "running") return "RUNNING";
-  if (raw === "paused") return "PAUSED";
-  if (raw === "stopped") return "STOPPED";
-  if (raw === "failed") return "FAILED";
-  if (raw === "done") return "DONE";
-  return "IDLE";
+  if (raw === "running") return "Running";
+  if (raw === "paused") return "Paused";
+  if (raw === "stopped") return "Stopped";
+  if (raw === "failed") return "Failed";
+  if (raw === "done") return "Done";
+  return "Idle";
+}
+
+function statusBadgeVariant(status) {
+  const raw = (status || "idle").toLowerCase();
+  if (raw === "running") return "info";
+  if (raw === "paused") return "warning";
+  if (raw === "failed") return "error";
+  if (raw === "done" || raw === "stopped") return "success";
+  return "neutral";
 }
 
 async function api(path, options) {
@@ -47,11 +74,17 @@ async function api(path, options) {
   return body;
 }
 
+function flagsText(flags) {
+  if (!flags || flags.length === 0) return "None";
+  return flags.map((flag) => FLAG_LABEL[flag] || flag).join(", ");
+}
+
 function PhaseChart({ curve }) {
+  const { token } = useTheme();
   const phase = (curve && curve.phase) || [];
   const flux = (curve && curve.flux) || [];
   if (phase.length < 2) {
-    return <p className="quiet">No phase curve was saved with this candidate.</p>;
+    return <Text type="supporting">No phase curve was saved with this candidate.</Text>;
   }
   const width = 720;
   const height = 220;
@@ -62,37 +95,52 @@ function PhaseChart({ curve }) {
   const x = (p) => pad.l + p * (width - pad.l - pad.r);
   const y = (f) => pad.t + ((max - f) / span) * (height - pad.t - pad.b);
   const d = phase.map((p, i) => `${i === 0 ? "M" : "L"}${x(p).toFixed(1)},${y(flux[i]).toFixed(1)}`).join(" ");
+  const axis = token("--color-data-neutral");
+  const series = token("--color-data-categorical-blue");
+  const label = token("--color-text-secondary");
   return (
-    <svg className="fold" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Phase-folded light curve">
-      <line x1={pad.l} y1={height - pad.b} x2={width - pad.r} y2={height - pad.b} />
-      <line x1={pad.l} y1={pad.t} x2={pad.l} y2={height - pad.b} />
-      <path d={d} />
-      <text x={pad.l} y={height - 8}>0</text>
-      <text x={width - pad.r - 8} y={height - 8}>1</text>
-      <text x={8} y={pad.t + 8}>flux</text>
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Phase-folded light curve" width="100%" height="auto">
+      <line x1={pad.l} y1={height - pad.b} x2={width - pad.r} y2={height - pad.b} stroke={axis} />
+      <line x1={pad.l} y1={pad.t} x2={pad.l} y2={height - pad.b} stroke={axis} />
+      <path d={d} fill="none" stroke={series} strokeWidth="1.6" />
+      <text x={pad.l} y={height - 8} fill={label} fontSize="11">0</text>
+      <text x={width - pad.r - 8} y={height - 8} fill={label} fontSize="11">1</text>
+      <text x={8} y={pad.t + 8} fill={label} fontSize="11">flux</text>
     </svg>
   );
 }
 
-function ProgressStrip({ continuous, candidates }) {
+function PlotImage({ alt, src }) {
+  return (
+    <Section variant="muted" padding={2}>
+      <img alt={alt} src={src} width="100%" height="auto" style={{ display: "block", width: "100%", height: "auto" }} />
+    </Section>
+  );
+}
+
+function StatusBar({ continuous, candidates }) {
   const progress = (continuous && continuous.progress) || continuous || {};
-  const status = statusLabel(progress.status || (continuous && continuous.status) || "idle");
+  const raw = (progress.status || (continuous && continuous.status) || "idle").toLowerCase();
   const target = progress.current_target || continuous?.current_target || "—";
   const stars = progress.stars_done ?? continuous?.stars_done ?? 0;
   const found = progress.candidates_found ?? continuous?.candidates_found ?? candidates.length;
   const last = progress.last_log_line || continuous?.last_log_line || continuous?.message || "Waiting for the first log line.";
   const rate = progress.stars_per_hour;
   return (
-    <header className={`strip status-${(progress.status || continuous?.status || "idle").toLowerCase()}`}>
-      <p className={`pill ${(progress.status || continuous?.status || "idle").toLowerCase()}`}>{status}</p>
-      <div className="strip-metrics">
-        <span><em>Target</em> {target || "—"}</span>
-        <span><em>Stars</em> {stars}</span>
-        <span><em>Candidates</em> {found}</span>
-        {rate != null && rate > 0 ? <span><em>Rate</em> {fmt(rate, 1)}/h</span> : null}
-      </div>
-      <p className="strip-log" title={last}>{last}</p>
-    </header>
+    <LayoutHeader hasDivider>
+      <HStack gap={3} vAlign="center" wrap="wrap">
+        <Badge variant={statusBadgeVariant(raw)} label={statusLabel(raw)} />
+        <Text type="supporting">{target}</Text>
+        <Text type="supporting" hasTabularNumbers>{stars} stars</Text>
+        <Text type="supporting" hasTabularNumbers>{found} candidates</Text>
+        {rate != null && rate > 0 ? (
+          <Text type="supporting" hasTabularNumbers>{fmt(rate, 1)}/h</Text>
+        ) : null}
+        <StackItem size="fill">
+          <Text type="supporting" maxLines={1}>{last}</Text>
+        </StackItem>
+      </HStack>
+    </LayoutHeader>
   );
 }
 
@@ -107,10 +155,12 @@ export default function App() {
   const [limit, setLimit] = useState(10);
   const [tableText, setTableText] = useState("");
   const [tablePath, setTablePath] = useState("");
+  const [tableFile, setTableFile] = useState(null);
   const [sector, setSector] = useState(1);
   const [sde, setSde] = useState(7);
   const [curveText, setCurveText] = useState("");
   const [curvePath, setCurvePath] = useState("");
+  const [curveFile, setCurveFile] = useState(null);
   const [ticId, setTicId] = useState("local");
   const [notice, setNotice] = useState("");
   const [exportResult, setExportResult] = useState(null);
@@ -197,10 +247,13 @@ export default function App() {
     }
   }
 
-  async function onFile(event, setter) {
-    const file = event.target.files && event.target.files[0];
-    if (!file) return;
-    setter(await file.text());
+  async function onPickFile(file, setFile, setText) {
+    setFile(file);
+    if (!file) {
+      setText("");
+      return;
+    }
+    setText(await file.text());
   }
 
   async function start(mode) {
@@ -283,7 +336,7 @@ export default function App() {
   function openCandidate(id) {
     setSelected(id);
     setExportResult(null);
-    setStep("review");
+    setStep("inbox");
   }
 
   async function onExport() {
@@ -300,411 +353,590 @@ export default function App() {
 
   const checkpoint = health && health.checkpoint;
   const showModel = checkpoint || candidates.some((row) => row.model_score != null || row.prob_planet != null);
+  const searching = continuousStatus === "running";
 
   return (
-    <div className="shell">
-      <aside>
-        <p className="brand">Transit desk</p>
-        <p className="brand-sub">Always-on search</p>
-        <nav>
-          {STEPS.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              className={step === item.id ? "step on" : "step"}
-              onClick={() => setStep(item.id)}
-            >
-              {item.title}
-              {item.id === "inbox" ? <em>{candidates.length}</em> : null}
-              {item.id === "live" && continuousStatus === "running" ? <em className="pulse">●</em> : null}
-            </button>
-          ))}
-        </nav>
-        <p className="rail-note">
-          {checkpoint
-            ? "Classifier checkpoint loaded. Inbox shows model scores when present."
-            : "No classifier checkpoint. An SDE pass is kept as a candidate."}
-        </p>
-        <details>
-          <summary>Command line</summary>
-          <p>
-            Training, autopilot, and SSL pretrain stay on <code>python run.py</code>.
-            Catalog train path: <code>python train_triage_v2.py</code>.
-          </p>
-        </details>
-      </aside>
-      <main>
-        <ProgressStrip continuous={continuous} candidates={candidates} />
-        {notice ? <p className="banner">{notice}</p> : null}
-        {step === "live" ? (
-          <LiveView
-            sector={sector}
-            setSector={setSector}
-            limit={limit}
-            setLimit={setLimit}
-            sde={sde}
-            setSde={setSde}
-            curveText={curveText}
-            setCurveText={setCurveText}
-            curvePath={curvePath}
-            setCurvePath={setCurvePath}
-            ticId={ticId}
-            setTicId={setTicId}
-            onFile={onFile}
-            start={start}
-            run={run}
-            busy={busy}
-            curveDir={curveDir}
-            setCurveDir={setCurveDir}
-            continuous={continuous}
-            keepSearching={keepSearching}
-            pauseSearching={pauseSearching}
-            stopSearching={stopSearching}
+    <AppShell
+      height="fill"
+      contentPadding={0}
+      variant="elevated"
+      banner={
+        notice ? (
+          <Banner
+            status="error"
+            title={notice}
+            container="section"
+            isDismissable
+            onDismiss={() => setNotice("")}
           />
-        ) : null}
-        {step === "queue" ? (
-          <QueueView
-            queue={queue}
-            limit={limit}
-            setLimit={setLimit}
-            tableText={tableText}
-            setTableText={setTableText}
-            tablePath={tablePath}
-            setTablePath={setTablePath}
-            onFile={onFile}
-            onRank={onRank}
-            busy={busy}
+        ) : null
+      }
+      topNav={
+        <TopNav heading={<TopNavHeading heading="Transit desk" />} label="App" />
+      }
+      sideNav={
+        <SideNav>
+          <SideNavItem
+            label="Live"
+            icon="clock"
+            isSelected={step === "live"}
+            onClick={() => setStep("live")}
+            endContent={searching ? <StatusDot variant="success" isPulsing label="Searching" /> : null}
           />
-        ) : null}
-        {step === "inbox" ? (
-          <InboxView candidates={candidates} onOpen={openCandidate} showModel={showModel} />
-        ) : null}
-        {step === "review" ? (
-          <ReviewView
-            detail={detail}
-            onExport={onExport}
-            exportResult={exportResult}
-            showModel={showModel}
+          <SideNavItem
+            label="Queue"
+            icon="funnel"
+            isSelected={step === "queue"}
+            onClick={() => setStep("queue")}
           />
-        ) : null}
-      </main>
-    </div>
+          <SideNavItem
+            label="Inbox"
+            icon="search"
+            isSelected={step === "inbox"}
+            onClick={() => setStep("inbox")}
+            endContent={candidates.length > 0 ? <Badge variant="neutral" label={candidates.length} /> : null}
+          />
+        </SideNav>
+      }
+    >
+      <Layout
+        height="fill"
+        header={<StatusBar continuous={continuous} candidates={candidates} />}
+        content={
+          step === "inbox" ? (
+            <InboxView
+              candidates={candidates}
+              selected={selected}
+              onOpen={openCandidate}
+              showModel={showModel}
+              detail={detail}
+              onExport={onExport}
+              exportResult={exportResult}
+            />
+          ) : (
+            <LayoutContent padding={5} isScrollable={step !== "live"}>
+              {step === "live" ? (
+                <LiveView
+                  sector={sector}
+                  setSector={setSector}
+                  limit={limit}
+                  setLimit={setLimit}
+                  sde={sde}
+                  setSde={setSde}
+                  curveText={curveText}
+                  setCurveText={setCurveText}
+                  curvePath={curvePath}
+                  setCurvePath={setCurvePath}
+                  curveFile={curveFile}
+                  setCurveFile={setCurveFile}
+                  onPickFile={onPickFile}
+                  ticId={ticId}
+                  setTicId={setTicId}
+                  start={start}
+                  run={run}
+                  busy={busy}
+                  curveDir={curveDir}
+                  setCurveDir={setCurveDir}
+                  continuous={continuous}
+                  keepSearching={keepSearching}
+                  pauseSearching={pauseSearching}
+                  stopSearching={stopSearching}
+                />
+              ) : null}
+              {step === "queue" ? (
+                <QueueView
+                  queue={queue}
+                  limit={limit}
+                  setLimit={setLimit}
+                  tableText={tableText}
+                  setTableText={setTableText}
+                  tablePath={tablePath}
+                  setTablePath={setTablePath}
+                  tableFile={tableFile}
+                  setTableFile={setTableFile}
+                  onPickFile={onPickFile}
+                  onRank={onRank}
+                  busy={busy}
+                />
+              ) : null}
+            </LayoutContent>
+          )
+        }
+      />
+    </AppShell>
   );
 }
 
-function QueueView({ queue, limit, setLimit, tableText, setTableText, tablePath, setTablePath, onFile, onRank, busy }) {
+function QueueView({
+  queue, limit, setLimit, tableText, setTableText, tablePath, setTablePath,
+  tableFile, setTableFile, onPickFile, onRank, busy,
+}) {
+  const empty = !queue || ((queue.primary || []).length === 0 && (queue.second_pass || []).length === 0);
   return (
-    <section>
-      <h1>Queue</h1>
-      <p className="lede">Rank who is next before any light curve is downloaded. Bare TIC lists are enriched for radius, sectors, CROWDSAP, and Tmag when the cache or catalog can fill them.</p>
-      <form onSubmit={onRank} className="form">
-        <label>
-          Best N
-          <input type="number" min="1" value={limit} onChange={(event) => setLimit(event.target.value)} />
-        </label>
-        <label className="wide">
-          TIC table
-          <textarea
-            rows={4}
-            value={tableText}
-            onChange={(event) => setTableText(event.target.value)}
-            placeholder="tic,radius,n_sectors,crowdsap,tmag,disposition"
-          />
-        </label>
-        <label className="wide">
-          File
-          <input type="file" accept=".csv,.txt" onChange={(event) => onFile(event, setTableText)} />
-        </label>
-        <label className="wide">
-          Path on this machine
-          <input value={tablePath} onChange={(event) => setTablePath(event.target.value)} placeholder="/path/targets.csv" />
-        </label>
-        <button type="submit" disabled={busy}>Rank</button>
+    <VStack gap={5} maxWidth={880}>
+      <VStack gap={1}>
+        <Heading level={1}>Queue</Heading>
+        <Text type="body" color="secondary">
+          Rank who is next before any light curve is downloaded.
+        </Text>
+      </VStack>
+      <form onSubmit={onRank}>
+        <VStack gap={4}>
+          <FormLayout direction="horizontal">
+            <NumberInput
+              label="Best N"
+              value={limit}
+              onChange={setLimit}
+              min={1}
+              isIntegerOnly
+              isWheelEnabled={false}
+            />
+            <FileInput
+              label="TIC table"
+              value={tableFile}
+              onChange={(file) => onPickFile(file, setTableFile, setTableText)}
+              accept=".csv,.txt"
+              mode="input"
+              isOptional
+            />
+            <TextInput
+              label="Path on this machine"
+              value={tablePath}
+              onChange={setTablePath}
+              placeholder="/path/targets.csv"
+              isOptional
+            />
+          </FormLayout>
+          <Button type="submit" variant="primary" label="Rank" isLoading={busy} />
+          <Collapsible trigger="Paste CSV" defaultIsOpen={false}>
+            <TextArea
+              label="TIC table"
+              value={tableText}
+              onChange={setTableText}
+              placeholder="tic,radius,n_sectors,crowdsap,tmag,disposition"
+            />
+          </Collapsible>
+        </VStack>
       </form>
-      {!queue || ((queue.primary || []).length === 0 && (queue.second_pass || []).length === 0) ? (
-        <p className="empty">No target table yet. Rank a TIC file before download. The best N come first. Sky position is not a factor.</p>
+      {empty ? (
+        <EmptyState
+          title="No target table yet"
+          description="Rank a TIC file before download. The best N come first. Sky position is not a factor."
+          headingLevel={2}
+        />
       ) : (
-        <>
-          <p className="quiet">{queue.note}</p>
+        <VStack gap={5}>
+          {queue.note ? <Text type="supporting">{queue.note}</Text> : null}
           <TargetTable title="Primary" rows={queue.primary} />
           <TargetTable title="Known hosts, masked second pass" rows={queue.second_pass} />
-        </>
+        </VStack>
       )}
-    </section>
+    </VStack>
   );
 }
 
 function TargetTable({ title, rows }) {
   if (!rows || rows.length === 0) return null;
   return (
-    <div className="block">
-      <h2>{title}</h2>
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>TIC</th>
-            <th>Why this star is next</th>
-            <th>SNR</th>
-            <th>Disposition</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, index) => (
-            <tr key={row.tic_id}>
-              <td className="num">{index + 1}</td>
-              <td className="num">{row.tic_id}</td>
-              <td>{row.why}</td>
-              <td className="num">{fmt(row.expected_snr, 1)}</td>
-              <td>{row.disposition || "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <VStack gap={2}>
+      <Heading level={2}>{title}</Heading>
+      <Table
+        data={rows}
+        idKey="tic_id"
+        density="compact"
+        columns={[
+          { key: "tic_id", header: "TIC", width: proportional(1, { minWidth: 80 }) },
+          { key: "why", header: "Why this star is next", width: proportional(3, { minWidth: 160 }) },
+          {
+            key: "expected_snr",
+            header: "SNR",
+            align: "end",
+            renderCell: (row) => (
+              <Text type="code" hasTabularNumbers>{fmt(row.expected_snr, 1)}</Text>
+            ),
+          },
+          {
+            key: "disposition",
+            header: "Disposition",
+            renderCell: (row) => row.disposition || "—",
+          },
+        ]}
+      />
+    </VStack>
   );
 }
 
 function LiveView({
   sector, setSector, limit, setLimit, sde, setSde,
-  curveText, setCurveText, curvePath, setCurvePath, ticId, setTicId,
-  onFile, start, run, busy,
+  curveText, setCurveText, curvePath, setCurvePath, curveFile, setCurveFile,
+  onPickFile, ticId, setTicId, start, run, busy,
   curveDir, setCurveDir, continuous, keepSearching, pauseSearching, stopSearching,
 }) {
   const logRef = useRef(null);
   const lines = (continuous && continuous.lines) || [];
   const status = continuous ? continuous.status : "idle";
-  const progress = (continuous && continuous.progress) || {};
   useEffect(() => {
     const node = logRef.current;
     if (node) node.scrollTop = node.scrollHeight;
   }, [lines.length]);
+  const startLabel = status === "paused" || status === "stopped" ? "Resume" : "Start";
+  const oneOffRunning = run && run.status === "running";
   return (
-    <section className="live">
-      <h1>Live Run</h1>
-      <p className="lede">
-        Continuous search starts with the desk. Closing this page does not stop it.
-        {continuous?.auto_start === false ? " Auto-start is off until Start or Resume." : ""}
-      </p>
-      <div className="live-metrics">
-        <div><dt>Status</dt><dd className={status}>{statusLabel(status)}</dd></div>
-        <div><dt>Target</dt><dd>{progress.current_target || continuous?.current_target || "—"}</dd></div>
-        <div><dt>Sector / cursor</dt><dd className="num">{continuous?.sector ?? "—"} / {continuous?.cursor ?? 0}</dd></div>
-        <div><dt>Stars done</dt><dd className="num">{progress.stars_done ?? continuous?.stars_done ?? 0}</dd></div>
-        <div><dt>Candidates</dt><dd className="num">{progress.candidates_found ?? continuous?.candidates_found ?? 0}</dd></div>
-        <div><dt>Last SDE</dt><dd className="num">{fmt(progress.last_sde ?? continuous?.last_sde, 2)}</dd></div>
-        <div><dt>Stars / hour</dt><dd className="num">{fmt(progress.stars_per_hour, 1)}</dd></div>
-        <div><dt>Elapsed</dt><dd className="num">{fmt(progress.elapsed_seconds, 0)} s</dd></div>
-      </div>
-      <div className="form live-controls">
-        <label>
-          Sector
-          <input type="number" value={sector} onChange={(event) => setSector(event.target.value)} />
-        </label>
-        <label>
-          Best N
-          <input type="number" min="1" value={limit} onChange={(event) => setLimit(event.target.value)} />
-        </label>
-        <label>
-          SDE gate
-          <input type="number" step="0.1" value={sde} onChange={(event) => setSde(event.target.value)} />
-        </label>
-        <div className="actions">
-          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={keepSearching}>
-            {status === "paused" || status === "stopped" ? "Resume" : "Start"}
-          </button>
-          <button type="button" disabled={status !== "running"} onClick={pauseSearching}>Pause</button>
-          <button type="button" disabled={status !== "running" && status !== "paused"} onClick={stopSearching}>Stop</button>
-        </div>
-      </div>
-      <ol className="log" ref={logRef} aria-live="polite">
+    <VStack gap={4} height="100%">
+      <VStack gap={1}>
+        <Heading level={1}>Live</Heading>
+        <Text type="body" color="secondary">
+          Continuous search starts with the desk. Closing this page does not stop it.
+          {continuous?.auto_start === false ? " Auto-start is off until Start or Resume." : ""}
+        </Text>
+      </VStack>
+      <HStack gap={2} wrap="wrap">
+        <Button
+          variant="primary"
+          label={startLabel}
+          onClick={keepSearching}
+          isDisabled={busy || status === "running" || oneOffRunning}
+          isLoading={busy}
+        />
+        <Button label="Pause" onClick={pauseSearching} isDisabled={status !== "running"} />
+        <Button
+          label="Stop"
+          onClick={stopSearching}
+          isDisabled={status !== "running" && status !== "paused"}
+        />
+      </HStack>
+      <StackItem size="fill" isScrollable ref={logRef}>
         {lines.length === 0 ? (
-          <li className="quiet">The log is empty. When MAST is missing, the loop stays honest and invents no stars.</li>
-        ) : lines.map((line, index) => (
-          <li key={`${line.ts}-${index}`} className={`log-line ${line.error ? "error" : line.candidate ? "candidate" : ""}`}>
-            <time dateTime={line.ts}>{line.ts}</time>
-            <span>{line.message}</span>
-          </li>
-        ))}
-      </ol>
-      <details className="one-off">
-        <summary>One-off sector / local curve</summary>
-        <p className="quiet">A directory of time, flux CSVs is searched as given. Otherwise a ranked queue is walked, and if there is no queue the sectors advance.</p>
-        <div className="form">
-          <label className="wide">
-            Local curve directory
-            <input
-              value={curveDir}
-              onChange={(event) => setCurveDir(event.target.value)}
-              placeholder="/path/curves"
+          <EmptyState
+            title="The log is empty"
+            description="When MAST is missing, the loop stays honest and invents no stars."
+            headingLevel={2}
+            isCompact
+          />
+        ) : (
+          <List header={<Heading level={2}>Log</Heading>} density="compact" hasDividers>
+            {lines.map((line, index) => (
+              <ListItem
+                key={`${line.ts}-${index}`}
+                itemKey={`${line.ts}-${index}`}
+                label={line.message}
+                description={line.ts}
+                align="start"
+                startContent={
+                  line.error ? (
+                    <StatusDot variant="error" label="Error" />
+                  ) : line.candidate ? (
+                    <StatusDot variant="success" label="Candidate" />
+                  ) : (
+                    <StatusDot variant="neutral" label="Log" />
+                  )
+                }
+              />
+            ))}
+          </List>
+        )}
+      </StackItem>
+      <Collapsible trigger="Advanced" defaultIsOpen={false}>
+        <VStack gap={5}>
+          <FormLayout direction="horizontal">
+            <NumberInput
+              label="Sector"
+              value={sector}
+              onChange={setSector}
+              isIntegerOnly
+              isWheelEnabled={false}
             />
-          </label>
-          <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("sector")}>
-            Start sector search once
-          </button>
-        </div>
-        <RunState run={run} />
-        <div className="split">
-          <h2>Local light curve</h2>
-          <div className="form">
-            <label>
-              TIC label
-              <input value={ticId} onChange={(event) => setTicId(event.target.value)} />
-            </label>
-            <label className="wide">
-              Curve
-              <textarea rows={4} value={curveText} onChange={(event) => setCurveText(event.target.value)} placeholder="time,flux" />
-            </label>
-            <label className="wide">
-              File
-              <input type="file" accept=".csv,.txt" onChange={(event) => onFile(event, setCurveText)} />
-            </label>
-            <label className="wide">
-              Path on this machine
-              <input value={curvePath} onChange={(event) => setCurvePath(event.target.value)} placeholder="/path/curve.csv" />
-            </label>
-            <button type="button" disabled={busy || status === "running" || (run && run.status === "running")} onClick={() => start("local")}>
-              Search this curve
-            </button>
-          </div>
-        </div>
-      </details>
-    </section>
+            <NumberInput
+              label="Best N"
+              value={limit}
+              onChange={setLimit}
+              min={1}
+              isIntegerOnly
+              isWheelEnabled={false}
+            />
+            <NumberInput
+              label="SDE gate"
+              value={sde}
+              onChange={setSde}
+              step={0.1}
+              isWheelEnabled={false}
+            />
+          </FormLayout>
+          <TextInput
+            label="Local curve directory"
+            value={curveDir}
+            onChange={setCurveDir}
+            placeholder="/path/curves"
+            isOptional
+          />
+          <Text type="supporting">
+            Training, autopilot, and SSL pretrain stay on python run.py.
+          </Text>
+          <VStack gap={3}>
+            <Heading level={2}>One-off search</Heading>
+            <Text type="supporting">
+              A directory of time, flux CSVs is searched as given. Otherwise a ranked queue is walked, and if there is no queue the sectors advance.
+            </Text>
+            <Button
+              label="Start sector search once"
+              onClick={() => start("sector")}
+              isDisabled={busy || status === "running" || oneOffRunning}
+            />
+            <RunState run={run} />
+          </VStack>
+          <VStack gap={3}>
+            <Heading level={2}>Local light curve</Heading>
+            <FormLayout>
+              <TextInput label="TIC label" value={ticId} onChange={setTicId} />
+              <FileInput
+                label="Curve file"
+                value={curveFile}
+                onChange={(file) => onPickFile(file, setCurveFile, setCurveText)}
+                accept=".csv,.txt"
+                mode="input"
+                isOptional
+              />
+              <TextInput
+                label="Path on this machine"
+                value={curvePath}
+                onChange={setCurvePath}
+                placeholder="/path/curve.csv"
+                isOptional
+              />
+            </FormLayout>
+            <Collapsible trigger="Paste curve CSV" defaultIsOpen={false}>
+              <TextArea
+                label="Curve"
+                value={curveText}
+                onChange={setCurveText}
+                placeholder="time,flux"
+              />
+            </Collapsible>
+            <Button
+              label="Search this curve"
+              onClick={() => start("local")}
+              isDisabled={busy || status === "running" || oneOffRunning}
+            />
+          </VStack>
+        </VStack>
+      </Collapsible>
+    </VStack>
   );
 }
 
 function RunState({ run }) {
   if (!run) {
-    return <p className="empty">No one-off search has been started.</p>;
+    return <Text type="supporting">No one-off search has been started.</Text>;
   }
   if (run.status === "running") {
-    return <p className="state running">Running. {run.message}</p>;
+    return (
+      <Banner status="info" title="Running" description={run.message} collapsible={false} />
+    );
   }
   if (run.status === "failed") {
     return (
-      <div className="state failed">
-        <p className="state-title">{run.needs_mast ? "MAST required" : "Search failed"}</p>
-        <p>{run.error}</p>
-      </div>
+      <Banner
+        status="error"
+        title={run.needs_mast ? "MAST required" : "Search failed"}
+        description={run.error}
+        collapsible={false}
+      />
     );
   }
   return (
-    <p className="state done">
-      Finished. {run.message}
-      {run.candidate_ids && run.candidate_ids.length === 0 ? " The inbox was not changed." : ""}
-    </p>
+    <Banner
+      status="success"
+      title="Finished"
+      description={
+        run.candidate_ids && run.candidate_ids.length === 0
+          ? `${run.message} The inbox was not changed.`
+          : run.message
+      }
+      collapsible={false}
+    />
   );
 }
 
-function InboxView({ candidates, onOpen, showModel }) {
+function InboxView({ candidates, selected, onOpen, showModel, detail, onExport, exportResult }) {
+  const columns = [
+    {
+      key: "tic_id",
+      header: "TIC",
+      width: proportional(1, { minWidth: 88 }),
+      renderCell: (row) => (
+        <Button label={String(row.tic_id)} variant="ghost" size="sm" onClick={() => onOpen(row.id)} />
+      ),
+    },
+    {
+      key: "period_days",
+      header: "Period",
+      align: "end",
+      renderCell: (row) => (
+        <Text type="code" hasTabularNumbers>{fmt(row.period_days, 4)} d</Text>
+      ),
+    },
+    {
+      key: "epoch_btjd",
+      header: "Epoch",
+      align: "end",
+      renderCell: (row) => (
+        <Text type="code" hasTabularNumbers>{fmt(row.epoch_btjd, 4)}</Text>
+      ),
+    },
+    {
+      key: "depth_ppm",
+      header: "Depth",
+      align: "end",
+      renderCell: (row) => (
+        <Text type="code" hasTabularNumbers>
+          {row.depth_ppm === null ? "—" : `${fmt(row.depth_ppm, 0)} ppm`}
+        </Text>
+      ),
+    },
+    {
+      key: "sde",
+      header: "SDE",
+      align: "end",
+      renderCell: (row) => (
+        <Text type="code" hasTabularNumbers>{fmt(row.sde, 1)}</Text>
+      ),
+    },
+  ];
+  if (showModel) {
+    columns.push({
+      key: "model_score",
+      header: "Model",
+      align: "end",
+      renderCell: (row) => (
+        <Text type="code" hasTabularNumbers>
+          {row.model_score == null && row.prob_planet == null ? "—" : fmt(row.model_score ?? row.prob_planet, 3)}
+        </Text>
+      ),
+    });
+  }
+  columns.push(
+    {
+      key: "hard_flags",
+      header: "Flags",
+      renderCell: (row) => flagsText(row.hard_flags),
+    },
+    { key: "label", header: "Label" },
+  );
+
   return (
-    <section>
-      <h1>Inbox</h1>
-      <p className="lede">SDE-pass stars, sorted by SDE. Known TOI versus new is a label, not the order.</p>
-      {candidates.length === 0 ? (
-        <p className="empty">No candidates yet. Continuous search has not found an SDE pass. This list stays empty when a search fails or nothing clears the gate.</p>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>TIC</th>
-              <th>Period</th>
-              <th>Epoch</th>
-              <th>Depth</th>
-              <th>SDE</th>
-              {showModel ? <th>Model</th> : null}
-              <th>Flags</th>
-              <th>Label</th>
-            </tr>
-          </thead>
-          <tbody>
-            {candidates.map((row) => (
-              <tr key={row.id} className={row.sde != null && row.sde >= 7 ? "hit" : ""}>
-                <td>
-                  <button type="button" className="link" onClick={() => onOpen(row.id)}>{row.tic_id}</button>
-                </td>
-                <td className="num">{fmt(row.period_days, 4)} d</td>
-                <td className="num">{fmt(row.epoch_btjd, 4)}</td>
-                <td className="num">{row.depth_ppm === null ? "—" : `${fmt(row.depth_ppm, 0)} ppm`}</td>
-                <td className="num">{fmt(row.sde, 1)}</td>
-                {showModel ? (
-                  <td className="num">{row.model_score == null && row.prob_planet == null ? "—" : fmt(row.model_score ?? row.prob_planet, 3)}</td>
-                ) : null}
-                <td>{row.hard_flags.length ? row.hard_flags.map((flag) => FLAG_LABEL[flag] || flag).join(", ") : "None"}</td>
-                <td>{row.label}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </section>
+    <Layout
+      height="fill"
+      header={
+        <LayoutHeader hasDivider>
+          <Heading level={1}>Inbox</Heading>
+        </LayoutHeader>
+      }
+      content={
+        <LayoutContent padding={0} isScrollable>
+          {candidates.length === 0 ? (
+            <EmptyState
+              title="No candidates yet"
+              description="Continuous search has not found an SDE pass. This list stays empty when a search fails or nothing clears the gate."
+              headingLevel={2}
+            />
+          ) : (
+            <Table
+              data={candidates}
+              idKey="id"
+              density="compact"
+              hasHover
+              columns={columns}
+            />
+          )}
+        </LayoutContent>
+      }
+      end={
+        <LayoutPanel width={380} hasDivider isScrollable label="Candidate" role="complementary">
+          <ReviewPanel detail={selected ? detail : null} onExport={onExport} exportResult={exportResult} showModel={showModel} />
+        </LayoutPanel>
+      }
+    />
   );
 }
 
-function ReviewView({ detail, onExport, exportResult, showModel }) {
+function ReviewPanel({ detail, onExport, exportResult, showModel }) {
   if (!detail) {
     return (
-      <section>
-        <h1>Review</h1>
-        <p className="empty">Select a candidate from the inbox.</p>
-      </section>
+      <EmptyState
+        title="Select a candidate"
+        description="Open a TIC from the inbox to inspect the fold, flags, and export."
+        headingLevel={2}
+        isCompact
+      />
     );
   }
   const flags = new Set(detail.hard_flags || []);
   return (
-    <section>
-      <h1>TIC {detail.tic_id}</h1>
-      <p className="lede">
-        {detail.label}
-        {detail.status === "CANDIDATE_SDE" ? " · SDE pass, no classifier score" : ""}
-        {showModel && detail.model_score != null ? ` · model ${fmt(detail.model_score, 3)}` : ""}
-      </p>
-      <dl className="metrics">
-        <div><dt>Period</dt><dd>{fmt(detail.period_days, 4)} d</dd></div>
-        <div><dt>Epoch</dt><dd>{fmt(detail.epoch_btjd, 4)}</dd></div>
-        <div><dt>Depth</dt><dd>{detail.depth_ppm === null ? "—" : `${fmt(detail.depth_ppm, 0)} ppm`}</dd></div>
-        <div><dt>SDE</dt><dd>{fmt(detail.sde, 2)}</dd></div>
-      </dl>
-      <h2>Phase fold</h2>
-      <PhaseChart curve={detail.phase_curve} />
+    <VStack gap={4}>
+      <VStack gap={1}>
+        <Heading level={2}>TIC {detail.tic_id}</Heading>
+        <Text type="supporting">
+          {detail.label}
+          {detail.status === "CANDIDATE_SDE" ? " · SDE pass, no classifier score" : ""}
+          {showModel && detail.model_score != null ? ` · model ${fmt(detail.model_score, 3)}` : ""}
+        </Text>
+      </VStack>
+      <MetadataList columns={2} label={{ position: "top" }}>
+        <MetadataListItem label="Period">{fmt(detail.period_days, 4)} d</MetadataListItem>
+        <MetadataListItem label="Epoch">{fmt(detail.epoch_btjd, 4)}</MetadataListItem>
+        <MetadataListItem label="Depth">
+          {detail.depth_ppm === null ? "—" : `${fmt(detail.depth_ppm, 0)} ppm`}
+        </MetadataListItem>
+        <MetadataListItem label="SDE">{fmt(detail.sde, 2)}</MetadataListItem>
+      </MetadataList>
+      <VStack gap={2}>
+        <Heading level={3}>Phase fold</Heading>
+        <PhaseChart curve={detail.phase_curve} />
+      </VStack>
       {detail.has_plot ? (
-        <img className="plot" alt="Pipeline phase plot" src={`/api/candidates/${detail.id}/plot`} />
+        <PlotImage alt="Pipeline phase plot" src={`/api/candidates/${detail.id}/plot`} />
       ) : null}
       {detail.has_difference_image ? (
-        <>
-          <h2>Difference image</h2>
-          <img className="plot" alt="Difference image" src={`/api/candidates/${detail.id}/difference-image`} />
-        </>
+        <VStack gap={2}>
+          <Heading level={3}>Difference image</Heading>
+          <PlotImage alt="Difference image" src={`/api/candidates/${detail.id}/difference-image`} />
+        </VStack>
       ) : null}
-      <h2>Hard flags</h2>
-      <table>
-        <tbody>
-          <FlagRow name="Odd/even" on={flags.has("odd_even")} value={fmt(detail.odd_even_ratio, 2)} />
-          <FlagRow name="Secondary" on={flags.has("secondary")} value={fmt(detail.secondary_significance, 2)} />
-          <FlagRow name="Centroid" on={flags.has("centroid")} value={fmt(detail.centroid_offset_px, 2)} />
-          <FlagRow name="n transits" on={flags.has("n_transits")} value={detail.n_transits ?? "—"} />
-        </tbody>
-      </table>
-      <div className="export">
-        {detail.epoch_btjd === null ? (
-          <p className="state failed">No epoch on this candidate. Export is refused so the packet cannot say t0 = 0.</p>
-        ) : (
-          <button type="button" onClick={onExport}>Export TFOP packet</button>
-        )}
-        {exportResult ? (
-          <p className="state done">Wrote epoch {fmt(exportResult.epoch_btjd, 4)} BTJD.</p>
-        ) : null}
-      </div>
-    </section>
-  );
-}
-
-function FlagRow({ name, on, value }) {
-  return (
-    <tr>
-      <th>{name}</th>
-      <td className="num">{value}</td>
-      <td>{on ? <span className="flag">Flag</span> : <span className="quiet">Clear</span>}</td>
-    </tr>
+      <VStack gap={2}>
+        <Heading level={3}>Hard flags</Heading>
+        <MetadataList>
+          <MetadataListItem label="Odd/even">
+            {fmt(detail.odd_even_ratio, 2)} · {flags.has("odd_even") ? "Flag" : "Clear"}
+          </MetadataListItem>
+          <MetadataListItem label="Secondary">
+            {fmt(detail.secondary_significance, 2)} · {flags.has("secondary") ? "Flag" : "Clear"}
+          </MetadataListItem>
+          <MetadataListItem label="Centroid">
+            {fmt(detail.centroid_offset_px, 2)} · {flags.has("centroid") ? "Flag" : "Clear"}
+          </MetadataListItem>
+          <MetadataListItem label="n transits">
+            {detail.n_transits ?? "—"} · {flags.has("n_transits") ? "Flag" : "Clear"}
+          </MetadataListItem>
+        </MetadataList>
+      </VStack>
+      {detail.epoch_btjd === null ? (
+        <Banner
+          status="error"
+          title="No epoch on this candidate"
+          description="Export is refused so the packet cannot say t0 = 0."
+          collapsible={false}
+        />
+      ) : (
+        <Button label="Export TFOP packet" variant="primary" onClick={onExport} />
+      )}
+      {exportResult ? (
+        <Banner
+          status="success"
+          title="Packet written"
+          description={`Wrote epoch ${fmt(exportResult.epoch_btjd, 4)} BTJD.`}
+          collapsible={false}
+        />
+      ) : null}
+    </VStack>
   );
 }
