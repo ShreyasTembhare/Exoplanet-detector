@@ -144,6 +144,12 @@ function StatusBar({ continuous, candidates }) {
         <Text type="supporting">{target}</Text>
         <Text type="supporting" hasTabularNumbers>{stars} stars</Text>
         <Text type="supporting" hasTabularNumbers>{found} candidates</Text>
+        {continuous?.survey_pass && continuous?.mode === "sectors" ? (
+          <Text type="supporting" hasTabularNumbers>
+            pass {continuous.survey_pass}
+            {continuous.sector_max ? ` · sector ${continuous.sector ?? "—"}/${continuous.sector_max}` : ""}
+          </Text>
+        ) : null}
         {rate != null && rate > 0 ? (
           <Text type="supporting" hasTabularNumbers>{fmt(rate, 1)}/h</Text>
         ) : null}
@@ -597,7 +603,8 @@ function LiveView({
       <VStack gap={1}>
         <Heading level={1}>Live</Heading>
         <Text type="body" color="secondary">
-          Continuous search starts with the desk. Closing this page does not stop it.
+          Start surveys TESS sectors from MAST, ranks the stars, skips any already searched, and keeps going after you close this page.
+          A TIC table or local curves still take over when you set them.
           {continuous?.auto_start === false ? " Auto-start is off until Start or Resume." : ""}
         </Text>
       </VStack>

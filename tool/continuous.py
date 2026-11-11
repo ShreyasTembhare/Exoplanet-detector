@@ -7,10 +7,12 @@ import csv
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from services import HuntConfig, mast_requirement, run_hunt, run_local_lightcurve
+from tool import mast_setup
 
 
 def _now() -> str:
@@ -71,6 +73,7 @@ class ContinuousSearch:
         self.progress_path = desk.root / "continuous_progress.json"
         self.lock = threading.Lock()
         self.thread: threading.Thread | None = None
+        self.idle_wait = 15 * 60
         self.state = self._load()
         if "auto_start" not in self.state:
             self.state["auto_start"] = True
@@ -98,6 +101,10 @@ class ContinuousSearch:
             "current_target": "",
             "last_sde": None,
             "last_log_line": "",
+            "sector_max": None,
+            "survey_pass": 1,
+            "pass_new_stars": 0,
+            "idle_until": 0,
         }
 
     def _load(self) -> dict:
@@ -137,6 +144,8 @@ class ContinuousSearch:
             "last_log_line": self.state.get("last_log_line") or "",
             "message": self.state.get("message") or "",
             "auto_start": bool(self.state.get("auto_start", True)),
+            "sector_max": self.state.get("sector_max"),
+            "survey_pass": int(self.state.get("survey_pass") or 1),
             "started_at": self.state.get("started_at"),
             "updated_at": self.state.get("updated_at") or _now(),
             "elapsed_seconds": round(elapsed, 1),
@@ -269,6 +278,10 @@ class ContinuousSearch:
                         "current_target": "",
                         "last_sde": None,
                         "last_log_line": plan["message"],
+                        "sector_max": None if plan["mode"] == "sectors" else self.state.get("sector_max"),
+                        "survey_pass": 1 if plan["mode"] == "sectors" else int(self.state.get("survey_pass") or 1),
+                        "pass_new_stars": 0,
+                        "idle_until": 0,
                     }
                     self.log_path.write_text("")
                     self._persist()
@@ -343,7 +356,13 @@ class ContinuousSearch:
                 "message": f"Walking {len(ids)} ranked targets.",
             }
         sector = int(config.get("sector") or 1)
-        return {"mode": "sectors", "message": f"Walking sectors from {sector}."}
+        return {
+            "mode": "sectors",
+            "message": (
+                f"MAST survey from sector {sector}. "
+                "Sectors are listed from the archive, ranked, and searched again only for stars not seen yet."
+            ),
+        }
 
     def _ensure_thread(self):
         if self.thread and self.thread.is_alive():
@@ -354,6 +373,21 @@ class ContinuousSearch:
     def _loop(self):
         try:
             while True:
+                with self.lock:
+                    if self.state.get("status") != "running":
+                        return
+                    idle_until = float(self.state.get("idle_until") or 0)
+                now = time.time()
+                if idle_until > now:
+                    time.sleep(min(2.0, idle_until - now))
+                    continue
+                if idle_until:
+                    with self.lock:
+                        if self.state.get("status") != "running":
+                            return
+                        self.state["idle_until"] = 0
+                        self._persist()
+                    self._refresh_sector_max()
                 with self.lock:
                     if self.state.get("status") != "running":
                         return
@@ -451,6 +485,21 @@ class ContinuousSearch:
                 "sector": sector,
                 "advance": False,
             }
+        sector_max = self.state.get("sector_max")
+        if not sector_max:
+            return {
+                "kind": "sector_setup",
+                "target": "MAST",
+                "sector": sector,
+                "advance": False,
+            }
+        if sector > int(sector_max):
+            return {
+                "kind": "sector_wrap",
+                "target": f"sector {sector}",
+                "sector": sector,
+                "advance": False,
+            }
         return {"kind": "sector", "target": f"sector {sector}", "sector": sector, "advance": True}
 
     def _advance(self, item: dict):
@@ -468,7 +517,108 @@ class ContinuousSearch:
         if kind in {"queue_blocked", "sector_blocked"}:
             self._log_mast_block(item)
             return
+        if kind == "sector_setup":
+            self._setup_mast()
+            return
+        if kind == "sector_wrap":
+            self._wrap_survey()
+            return
         self._search_hunt(item)
+
+    def _setup_mast(self):
+        try:
+            sector_max = mast_setup.cached_sector_max(self.desk.root)
+        except Exception as exc:
+            self._pause_for(f"MAST sector list failed. {exc}")
+            return
+        with self.lock:
+            self.state["sector_max"] = int(sector_max)
+            self.state["survey_pass"] = int(self.state.get("survey_pass") or 1)
+            message = (
+                f"MAST sectors 1–{sector_max} are ready. "
+                "Searching the best stars that have not been searched yet."
+            )
+            self.state["message"] = message
+            self._append_unlocked({
+                "target": "MAST",
+                "sector": self.state.get("sector"),
+                "sde": None,
+                "candidate": False,
+                "error": None,
+                "phase": "note",
+                "message": message,
+            })
+            self._persist()
+
+    def _refresh_sector_max(self):
+        try:
+            sector_max = mast_setup.cached_sector_max(self.desk.root, force=True)
+        except Exception as exc:
+            self._append(
+                target="MAST",
+                sector=self.state.get("sector"),
+                sde=None,
+                candidate=False,
+                error=str(exc),
+                phase="note",
+                message=f"Could not refresh the MAST sector list. {exc}",
+            )
+            return
+        with self.lock:
+            self.state["sector_max"] = int(sector_max)
+            self._persist()
+
+    def _wrap_survey(self):
+        try:
+            sector_max = mast_setup.cached_sector_max(self.desk.root, force=True)
+        except Exception:
+            sector_max = None
+        with self.lock:
+            if sector_max:
+                self.state["sector_max"] = int(sector_max)
+            added = int(self.state.get("pass_new_stars") or 0)
+            finished = int(self.state.get("survey_pass") or 1)
+            self.state["pass_new_stars"] = 0
+            self.state["survey_pass"] = finished + 1
+            self.state["sector"] = 1
+            if added == 0:
+                self.state["idle_until"] = time.time() + float(self.idle_wait)
+                message = (
+                    f"Pass {finished} found no new stars in sectors 1–{self.state.get('sector_max')}. "
+                    "Waiting before the next MAST check."
+                )
+            else:
+                message = (
+                    f"Pass {finished} searched {added} new stars. "
+                    f"Starting pass {finished + 1} from sector 1. Stars already searched stay skipped."
+                )
+            self.state["message"] = message
+            self._append_unlocked({
+                "target": "",
+                "sector": 1,
+                "sde": None,
+                "candidate": False,
+                "error": None,
+                "phase": "note",
+                "message": message,
+            })
+            self._persist()
+
+    def _pause_for(self, message: str):
+        with self.lock:
+            if self.state.get("status") == "running":
+                self.state["status"] = "paused"
+            self.state["message"] = "Paused. " + message
+            self._append_unlocked({
+                "target": "",
+                "sector": self.state.get("sector"),
+                "sde": None,
+                "candidate": False,
+                "error": message,
+                "phase": "result",
+                "message": message,
+            })
+            self._persist()
 
     def _log_mast_block(self, item: dict):
         mast = mast_requirement()
@@ -538,6 +688,33 @@ class ContinuousSearch:
     def _search_hunt(self, item: dict):
         target = str(item.get("target") or "")
         sector = int(item.get("sector") or 1)
+        cfg = self.state.get("config") or {}
+        log_file = self.desk.root / "continuous_hunt.csv"
+        if log_file.exists():
+            log_file.unlink()
+        tic_list = None
+        limit = int(cfg.get("limit") or 20)
+        batch = None
+        if item.get("kind") == "sector":
+            seen = mast_setup.read_seen(self.desk.root, sector)
+            survey_pass = int(self.state.get("survey_pass") or 1)
+            batch = mast_setup.next_unseen_batch(sector, limit, seen, survey_pass)
+            if not batch:
+                self._append(
+                    target=f"sector {sector}",
+                    sector=sector,
+                    sde=None,
+                    candidate=False,
+                    error=None,
+                    phase="note",
+                    message=f"Sector {sector} has no unseen stars in this catalog pull.",
+                )
+                return
+            tic_path = self.desk.root / "continuous_tic.csv"
+            tic_path.write_text("tic_id\n" + "\n".join(batch) + "\n")
+            tic_list = str(tic_path)
+            limit = len(batch)
+            target = ", ".join(batch)
         if item.get("kind") == "sector":
             start_message = f"Searching sector {sector}."
         else:
@@ -551,12 +728,6 @@ class ContinuousSearch:
             phase="start",
             message=start_message,
         )
-        cfg = self.state.get("config") or {}
-        log_file = self.desk.root / "continuous_hunt.csv"
-        if log_file.exists():
-            log_file.unlink()
-        tic_list = None
-        limit = int(cfg.get("limit") or 20)
         if item.get("kind") == "queue":
             tic_path = self.desk.root / "continuous_tic.csv"
             tic_path.write_text(f"tic_id\n{target}\n")
@@ -579,6 +750,11 @@ class ContinuousSearch:
             prefilter=True,
             sequential=False,
         ))
+        if batch:
+            mast_setup.remember_seen(self.desk.root, sector, batch)
+            with self.lock:
+                self.state["pass_new_stars"] = int(self.state.get("pass_new_stars") or 0) + len(batch)
+                self._persist()
         rows = _read_hunt_log(log_file)
         if rows:
             for row in rows:

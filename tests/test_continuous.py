@@ -247,3 +247,50 @@ def test_start_after_stop_turns_auto_start_back_on(tmp_path):
     body = _wait(client, lambda item: item["status"] == "stopped")
     assert body["auto_start"] is True
     assert body["progress"]["stars_done"] >= 1
+
+
+def test_mast_survey_covers_each_sector_then_waits(tmp_path, monkeypatch):
+    import tool.continuous as continuous
+    from tool import mast_setup
+
+    def cached(root, force=False, **kwargs):
+        return 2
+
+    def batch(sector, limit, seen, survey_pass=1):
+        if sector == 1 and "11" not in seen:
+            return ["11"]
+        if sector == 2 and "22" not in seen:
+            return ["22"]
+        return []
+
+    def hunt(config):
+        from pathlib import Path
+        tic = "11" if int(config.sector) == 1 else "22"
+        Path(config.log_file).write_text(
+            "TIC_ID,STATUS,SDE,ERROR\n" + f"{tic},CANDIDATE_SDE,8.1,\n"
+        )
+        return {"candidates": []}
+
+    monkeypatch.setattr(mast_setup, "cached_sector_max", cached)
+    monkeypatch.setattr(mast_setup, "next_unseen_batch", batch)
+    monkeypatch.setattr(continuous, "run_hunt", hunt)
+    monkeypatch.setattr(
+        continuous,
+        "mast_requirement",
+        lambda: {"available": True, "missing": [], "message": "ok"},
+    )
+
+    desk_dir = tmp_path / "desk"
+    app = _app(desk_dir, auto=False)
+    app.state.desk.continuous.idle_wait = 30
+    client = TestClient(app)
+    started = client.post("/api/continuous/start", json={"sector": 1, "limit": 1, "nperiods": 64})
+    assert started.status_code == 200
+    body = _wait(client, lambda item: int(item.get("survey_pass") or 1) >= 2 and item.get("idle_until"))
+    messages = [line["message"] for line in body["lines"]]
+    assert any("MAST sectors 1–2" in message for message in messages)
+    assert any("sector 1" in message.lower() and "SDE" in message for message in messages)
+    assert any("sector 2" in message.lower() and "SDE" in message for message in messages)
+    assert mast_setup.read_seen(desk_dir, 1) == {"11"}
+    assert mast_setup.read_seen(desk_dir, 2) == {"22"}
+    client.post("/api/continuous/stop")
