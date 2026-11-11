@@ -10,9 +10,6 @@
     "@astryxdesign/cli": "^0.7.13",
     "@astryxdesign/core": "^0.7.13",
     "@astryxdesign/theme-neutral": "^0.7.13",
-    "@fontsource/ibm-plex-mono": "^5.2.5",
-    "@fontsource/ibm-plex-sans": "^5.2.5",
-    "@fontsource/newsreader": "^5.2.5",
     "@stylexjs/stylex": "^0.19.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"

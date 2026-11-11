@@ -1,11 +1,24 @@
-import "@fontsource/ibm-plex-sans/400.css";
-import "@fontsource/ibm-plex-sans/500.css";
-import "@fontsource/ibm-plex-sans/600.css";
-import "@fontsource/ibm-plex-mono/400.css";
-import "@fontsource/ibm-plex-mono/500.css";
-import "@fontsource/newsreader/500.css";
+import "@astryxdesign/core/reset.css";
+import "@astryxdesign/core/astryx.css";
 import { createRoot } from "react-dom/client";
+import { Theme, defineTheme } from "@astryxdesign/core/theme";
+import { themes, defaultThemeSlug } from "./astryx-themes";
 import App from "./App.jsx";
-import "./styles.css";
 
-createRoot(document.getElementById("root")).render(<App />);
+const importedTheme = themes[defaultThemeSlug];
+
+const deskTheme = defineTheme({
+  name: "transit-desk",
+  extends: importedTheme,
+  tokens: {
+    "--radius-element": "10px",
+    "--radius-container": "14px",
+  },
+  motion: { character: "crisp" },
+});
+
+createRoot(document.getElementById("root")).render(
+  <Theme theme={deskTheme} mode="light">
+    <App />
+  </Theme>,
+);
